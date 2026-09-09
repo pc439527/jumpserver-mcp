@@ -1,0 +1,10 @@
+node_modules/
+lib/
+config.json
+data/
+*.log
+
+# Local preview server state (contains internal bastion host/username)
+.preview-config.json
+*.tsbuildinfo
+.DS_Store

@@ -1,0 +1,16 @@
+{
+  "host": "203.0.113.10",
+  "port": 2222,
+  "username": "your-jumpserver-user",
+  "passwordEnv": "JUMPSERVER_PASSWORD",
+  "permissionMode": "READ_ONLY",
+  "assetGroups": {
+    "OA": { "keywords": ["OA", "portal", "workflow", "办公"] }
+  },
+  "auditViewer": {
+    "enabled": true,
+    "port": 8765,
+    "autoOpen": true,
+    "portFallback": true
+  }
+}

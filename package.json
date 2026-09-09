@@ -1,0 +1,33 @@
+{
+  "name": "jumpserver-mcp",
+  "version": "0.2.0",
+  "description": "JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server: persistent SSH/PTY session with explicit state machine, asset discovery via KoKo menu, permission-gated audited commands, target-affinity batch execution, embedded local ops console (live terminal mirror, audit log with JSONL/CSV export, stats, session control). Ported from dsh-jumpserver (core modules reused verbatim).",
+  "type": "module",
+  "main": "lib/server.js",
+  "bin": {
+    "jumpserver-mcp": "lib/server.js"
+  },
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json",
+    "start": "node lib/server.js",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "ssh2": "^1.16.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ssh2": "^1.15.4",
+    "typescript": "^5.6.0"
+  }
+}
