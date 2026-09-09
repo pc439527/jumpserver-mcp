@@ -34,7 +34,7 @@ JumpServer (KoKo) 堡垒机连接器，以 **MCP stdio Server** 形式接入 Wor
     "jumpserver": {
       "type": "stdio",
       "command": "node",
-      "args": ["C:/Users/114976/WorkBuddy/jumpserver-mcp/lib/server.js"],
+      "args": ["C:/Users/****/WorkBuddy/jumpserver-mcp/lib/server.js"],
       "env": { "JUMPSERVER_PASSWORD": "..." },
       "description": "JumpServer 堡垒机连接器：持久会话、资产发现、权限闸门、命令审计"
     }
