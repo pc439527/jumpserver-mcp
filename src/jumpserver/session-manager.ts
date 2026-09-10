@@ -260,6 +260,16 @@ export class SessionManager {
    * streaming job's output would corrupt both.
    */
   private activeJob: string | null = null
+  /**
+   * V0.4.4: job that has been asked to stop but has not finished verifying
+   * the shell yet. The PTY is still in the middle of recovering (Ctrl+C
+   * sent + probe in flight) and MUST NOT be touched by another command.
+   * `activeJob` stays set for the duration so the existing "another job
+   * owns this shell" guard still fires; once verifyShell resolves we
+   * release BOTH fields together. This kills the V0.4.3 race where the
+   * manager cleared activeJob BEFORE the probe was even scheduled.
+   */
+  private stoppingJob: string | null = null
 
   constructor(private readonly options: SessionManagerOptions) {}
 
@@ -312,6 +322,9 @@ export class SessionManager {
 
   /** Fail fast when a streaming job owns the shell instead of corrupting its output. */
   private assertNoActiveJob(): void {
+    if (this.stoppingJob !== null) {
+      throw new JumpServerError('SESSION_BUSY', 'a job (' + this.stoppingJob + ') is being stopped but the shell has not been re-verified yet')
+    }
     if (this.activeJob !== null) {
       throw new JumpServerError('SESSION_BUSY', 'a streaming job (' + this.activeJob + ') owns this shell; stop it with jumpserver_job_stop first')
     }
@@ -590,23 +603,43 @@ export class SessionManager {
    * V0.4.3: after the interrupt, PROVE the shell came back. Reporting
    * `state: 'ASSET_SHELL'` without probing let a wedged PTY masquerade as a
    * usable session, so the next command typed into a dead shell.
+   * V0.4.4: stopJob now uses session.interruptAndVerify() so exactly one
+   * Ctrl+C is sent; activeJob is released only AFTER the probe resolves,
+   * which closes the V0.4.3 race where another exec/startJob could land
+   * while the shell was still mid-recovery.
    */
   async stopJob(jobId: string): Promise<{ sent: boolean; verified: boolean; state: string }> {
     const session = this.session
     if (this.activeJob !== null && this.activeJob !== jobId) {
       throw new JumpServerError('SESSION_BUSY', 'another job (' + this.activeJob + ') owns this shell')
     }
-    this.activeJob = null
-    const sent = session?.sendInterrupt() ?? false
+    if (this.stoppingJob === jobId) {
+      throw new JumpServerError('SESSION_BUSY', 'this job is already being stopped; the previous call has not finished verifying yet')
+    }
+    // Mark the PTY as in-recovery BEFORE we touch the wire. activeJob stays
+    // set so the existing SESSION_BUSY guard still fires for any new caller.
+    this.stoppingJob = jobId
+    let sent = false
     let verified = false
-    if (sent && session !== null) {
-      verified = await session.verifyShell().catch(() => false)
-      if (verified) {
-        session.setStateForVerification?.('ASSET_SHELL')
-      } else {
-        session.setStateForVerification?.('UNKNOWN')
-        this.options.onLog?.('job stopped but the shell could not be re-verified; session collapsed to UNKNOWN')
+    try {
+      if (session !== null) {
+        // Single combined call: one ^C + one probe + state transition. No
+        // double-Ctrl+C, no probe without an explicit interrupt.
+        const result = await session.interruptAndVerify().catch(() => ({ sent: false, verified: false, state: session.state }))
+        sent = result.sent
+        verified = result.verified
+        if (verified) {
+          session.setStateForVerification?.('ASSET_SHELL')
+        } else {
+          session.setStateForVerification?.('UNKNOWN')
+          this.options.onLog?.('job stopped but the shell could not be re-verified; session collapsed to UNKNOWN')
+        }
       }
+    } finally {
+      // Release both fields together, regardless of probe outcome, so the
+      // next tool call never sees a half-cleared state.
+      this.activeJob = null
+      this.stoppingJob = null
     }
     await this.audit({
       operation: 'job-stop',

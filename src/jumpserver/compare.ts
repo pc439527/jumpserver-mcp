@@ -268,9 +268,23 @@ export async function compareTargets(
       if (batch.error !== null) {
         return { target, hostname: batch.hostname, ok: false, exitCode: null, error: batch.error, durationMs: 0, lines: [], truncated: false }
       }
-      const failed = batch.commands.find((c) => c.error !== null)
-      if (failed !== undefined && failed.error !== null) {
-        return { target, hostname: batch.hostname, ok: false, exitCode: null, error: failed.error, durationMs: 0, lines: [], truncated: false }
+      // V0.4.4: also flag a per-command failure — a probe that exits non-zero,
+      // times out, loses the connection, or returns UNKNOWN. V0.4.3 only
+      // looked at `error`; an exit-127 with no `error` field was reported as
+      // ok=true and its "command not found" text was diffed as if it were
+      // healthy output. Now the compare signals that target as failed.
+      const failed = batch.commands.find((c) => c.commandStatus !== 'SUCCESS' || c.error !== null)
+      if (failed !== undefined) {
+        return {
+          target,
+          hostname: batch.hostname,
+          ok: false,
+          exitCode: failed.exitCode ?? null,
+          error: failed.error ?? { code: 'COMMAND_EXIT_NONZERO', message: 'commandStatus=' + failed.commandStatus },
+          durationMs: 0,
+          lines: [],
+          truncated: false,
+        }
       }
       // Concatenate every probe's output into one comparable block.
       const merged = batch.commands.map((c) => c.output).join('\n')

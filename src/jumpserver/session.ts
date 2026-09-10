@@ -300,7 +300,7 @@ export class JumpServerSession {
         // Ctrl+C and re-prove the shell before the connector declares the
         // asset usable again. Note the recovery runs WITHOUT the abort signal:
         // we are already aborting, so it must not cancel itself.
-        const verified = await this.recoverShell(EXEC_RECOVERY_MS)
+        const verified = await this.interruptAndRecover(EXEC_RECOVERY_MS)
         if (verified) {
           this.setState(SessionState.ASSET_SHELL)
           this.touch()
@@ -321,7 +321,7 @@ export class JumpServerSession {
         // Interrupt the job (Ctrl+C), wait for the prompt, then re-prove the
         // shell with the lightweight probe; otherwise collapse to UNKNOWN so
         // the next navigation reconnects instead of typing into a dead PTY.
-        const verified = await this.recoverShell(EXEC_RECOVERY_MS, options.signal)
+        const verified = await this.interruptAndRecover(EXEC_RECOVERY_MS, options.signal)
         if (!verified) {
           this.setState(SessionState.UNKNOWN)
           this.callbacks.onLog?.('command timed out and the shell could not be re-verified; session collapsed to UNKNOWN')
@@ -374,12 +374,24 @@ export class JumpServerSession {
   /**
    * Interrupt whatever the remote shell is doing, then re-prove the shell.
    * The connector only returns to ASSET_SHELL when a probe actually answers.
+   * V0.4.4: a thin wrapper around interruptAndVerify() so there is exactly
+   * ONE place that combines Ctrl+C with re-probe.
    */
   async interrupt(budgetMs: number = EXEC_RECOVERY_MS): Promise<{ sent: boolean; verified: boolean; state: SessionState }> {
+    return this.interruptAndVerify(budgetMs)
+  }
+
+  /**
+   * V0.4.4: the ONLY public path that combines Ctrl+C with a probe. Stops
+   * a streaming job / out-of-band interrupt / exec recovery all funnel
+   * through here so the connector never sends ^C twice and never declares
+   * the shell usable without a fresh probe.
+   */
+  async interruptAndVerify(budgetMs: number = EXEC_RECOVERY_MS): Promise<{ sent: boolean; verified: boolean; state: SessionState }> {
     const sent = this.sendInterrupt()
     if (!sent) return { sent: false, verified: false, state: this.stateValue }
     this.callbacks.onLog?.('interrupt: Ctrl+C sent; re-verifying the remote shell')
-    const verified = await this.recoverShell(budgetMs)
+    const verified = await this.probeShellOnly(budgetMs)
     if (verified) {
       this.setState(SessionState.ASSET_SHELL)
       this.touch()
@@ -387,6 +399,16 @@ export class JumpServerSession {
       this.setState(SessionState.UNKNOWN)
     }
     return { sent, verified, state: this.stateValue }
+  }
+
+  /**
+   * V0.4.4: prove the shell is at a prompt WITHOUT sending another Ctrl+C.
+   * Use this when the caller already knows the foreground job has been
+   * interrupted (e.g. JobStore.stop -> the previous interruptAndVerify
+   * step cleared the queue; re-probing must NOT send ^C again).
+   */
+  async verifyShell(budgetMs = 3000): Promise<boolean> {
+    return this.probeShellOnly(budgetMs)
   }
 
   /**
@@ -645,12 +667,14 @@ export class JumpServerSession {
   }
 
   /**
-   * Command-timeout recovery (V0.2.5 P0): send Ctrl+C to interrupt a possibly
-   * still-running foreground job, wait for the shell prompt to reappear, then
-   * prove the shell actually answers a probe. Returns false when the shell
-   * cannot be verified — the caller must NOT restore ASSET_SHELL.
+   * V0.4.4: ^C + re-probe. The single V0.4.0→V0.4.3 entry point for exec
+   * recovery (timeout / abort) and any other path that MUST interrupt a
+   * possibly running remote job before declaring the shell usable again.
+   * Splits the V0.4.3 recoverShell() into a pure probe (probeShellOnly)
+   * plus this ^C wrapper so callers that have already interrupted can
+   * re-probe WITHOUT sending a second Ctrl+C.
    */
-  private async recoverShell(budgetMs: number, signal?: AbortSignal): Promise<boolean> {
+  private async interruptAndRecover(budgetMs: number, signal?: AbortSignal): Promise<boolean> {
     if (this.wire === null || this.wireClosed) return false
     try {
       this.wire.write('\u0003')
@@ -658,6 +682,18 @@ export class JumpServerSession {
       return false
     }
     this.callbacks.onLog?.('command timed out; sending Ctrl+C and re-verifying the remote shell')
+    return this.probeShellOnly(budgetMs, signal)
+  }
+
+  /**
+   * V0.4.4: prove the shell answers a probe WITHOUT touching the wire.
+   * Waits for the asset-shell prompt, runs the connector-internal probe,
+   * parses the H=/U=/P= answer. Returns false when the wire is gone, the
+   * prompt never arrived, the probe did not match, or the parser failed.
+   * Pure side-effect-free test of "can I trust this session again".
+   */
+  private async probeShellOnly(budgetMs: number, signal?: AbortSignal): Promise<boolean> {
+    if (this.wire === null || this.wireClosed) return false
     const promptDeadline = Date.now() + Math.min(budgetMs, 2000)
     for (;;) {
       if (signal?.aborted === true) return false
@@ -670,17 +706,6 @@ export class JumpServerSession {
     const run = await this.runOp(buildProbeScript(marker), PROBE_PREFIX + marker, Math.min(budgetMs, 3000), signal)
     if (run.aborted || run.closed || !run.matched) return false
     return parseProbeOutput(run.text, marker) !== null
-  }
-
-  /**
-   * V0.4.3: public Ctrl+C + re-verify, used after stopping a streaming job.
-   * Stopping a job sends an out-of-band Ctrl+C; without re-proving the shell
-   * the connector cannot tell "the job stopped and the prompt is back" from
-   * "the PTY is wedged / the connection dropped". Returns true when the shell
-   * answers a probe and is safe to reuse.
-   */
-  async verifyShell(budgetMs = 3000): Promise<boolean> {
-    return this.recoverShell(budgetMs)
   }
 
   /**

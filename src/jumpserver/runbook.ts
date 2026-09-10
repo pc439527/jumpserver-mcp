@@ -78,6 +78,13 @@ export interface RunbookStepResult {
   truncated: boolean
   durationMs: number
   error: { code: string; message: string } | null
+  /**
+   * V0.4.4: the error from the probes the assertion was actually judged
+   * against (i.e. `expect.probe` if set, else the whole profile). Distinct
+   * from `error` (which reports the worst probe in the entire profile) so
+   * a healthy target with an unrelated probe failure is not falsely FAILed.
+   */
+  assertionError: { code: string; message: string } | null
   /** V0.4.3: per-command detail (one entry per probe for profile steps). */
   commands: Array<{
     /** V0.4.3: probe id inside the profile (null for command steps). */
@@ -120,17 +127,32 @@ export interface RunbookCheck {
  */
 export function evaluateExpect(
   expect: RunbookExpect | undefined,
-  outcome: { output: string; exitCode: number | null; error: { code: string; message: string } | null },
+  outcome: {
+    output: string
+    exitCode: number | null
+    /**
+     * V0.4.4: error from the probe(s) the assertion was scoped to
+     * (`expect.probe` if set, else the whole profile). Distinct from the
+     * step-level `error` so an unrelated probe failure does not FAIL the
+     * assertion. Backward-compatible: callers passing the old `error`
+     * key still work because the field is just unused.
+     */
+    assertionError?: { code: string; message: string } | null
+    /** @deprecated V0.4.4 prefer `assertionError`. Still honored if set. */
+    error?: { code: string; message: string } | null
+  },
 ): RunbookCheck | null {
   if (expect === undefined) return null
   const failures: string[] = []
   const note = expect.message !== undefined && expect.message.length > 0 ? ' (' + expect.message + ')' : ''
   const output = outcome.output ?? ''
   const haystack = output.toLowerCase()
+  const assertionError = outcome.assertionError ?? outcome.error ?? null
 
-  // A step that could not run at all can never satisfy an assertion.
-  if (outcome.error !== null) {
-    return { verdict: 'fail', failures: ['step did not run: ' + outcome.error.code + ' ' + outcome.error.message + note] }
+  // A step that could not run at all (the SCOPED probe) can never satisfy
+  // an assertion. Other probes' errors are still visible on `step.error`.
+  if (assertionError !== null) {
+    return { verdict: 'fail', failures: ['step did not run: ' + assertionError.code + ' ' + assertionError.message + note] }
   }
 
   if (expect.contains !== undefined && expect.contains.length > 0) {
@@ -458,7 +480,12 @@ export async function runRunbook(
           if (m.exitCode !== 0) exitCode = m.exitCode
         }
         const error = members.find((m) => m.error !== null)?.error ?? null
-        const check = evaluateExpect(step.expect ?? undefined, { output, exitCode, error })
+        // V0.4.4: the assertion verdict must only react to the probe(s) the
+        // assertion was scoped to. An unrelated probe failure (e.g. a `df`
+        // error when the assertion is `expect.probe: 'listen'`) is reported
+        // on the step's `error` but must NOT take down `check.verdict`.
+        const assertionError = judged.find((m) => m.error !== null)?.error ?? null
+        const check = evaluateExpect(step.expect ?? undefined, { output, exitCode, assertionError })
 
         steps.push({
           id: step.id,
@@ -470,6 +497,7 @@ export async function runRunbook(
           truncated: judged.some((m) => m.truncated),
           durationMs: members.reduce((sum, m) => sum + m.durationMs, 0),
           error,
+          assertionError,
           commands: members,
           probes: step.probes,
           check,

@@ -139,8 +139,13 @@ export class JobStore {
         job.truncated = true
       }
       if (Date.now() - job.startedAt >= job.maxDurationMs) {
-        void bundle.manager.stopJob(job.id).catch(() => undefined)
-        this.finish(job, 'STOPPED', 'maxDuration reached (' + Math.round(job.maxDurationMs / 1000) + 's)')
+        // V0.4.4: go through JobStore.stop so the STOPPED/LOST decision is
+        // made by the SAME path the manual jumpserver_job_stop tool uses.
+        // V0.4.3 fire-and-forgot the manager stopJob and stamped STOPPED
+        // here regardless of whether the shell could be re-verified, which
+        // masked a wedged PTY as a clean stop. Now: maxDuration is just
+        // another caller of stop(); if verify fails the job becomes LOST.
+        void this.stop(job.id, 'maxDuration reached (' + Math.round(job.maxDurationMs / 1000) + 's)').catch(() => undefined)
       }
     }
     this.prune()
@@ -158,8 +163,10 @@ export class JobStore {
    * back. V0.4.3: the state walks RUNNING -> STOPPING -> VERIFYING ->
    * STOPPED/LOST so a wedged PTY is reported as LOST instead of being
    * silently presented as a healthy stopped job.
+   * V0.4.4: accepts an optional `reason` (e.g. "maxDuration reached") so
+   * the auto-stop pump records WHY the job ended without racing finish().
    */
-  async stop(id: string): Promise<JobRecord> {
+  async stop(id: string, reason: string | null = null): Promise<JobRecord> {
     const job = this.jobs.get(id)
     if (job === undefined) throw new Error('unknown job: ' + id)
     const bundle = this.registry.get(job.sessionId)
@@ -169,16 +176,16 @@ export class JobStore {
       try {
         const outcome = bundle !== undefined ? await bundle.manager.stopJob(id) : { sent: false, verified: false }
         if (!outcome.verified) {
-          this.finish(job, 'LOST', 'Ctrl+C sent but the remote shell could not be re-verified')
+          this.finish(job, 'LOST', reason ?? 'Ctrl+C sent but the remote shell could not be re-verified')
           return job
         }
       } catch (error) {
         // The shell may already be gone; the job is still terminal.
-        this.finish(job, 'LOST', error instanceof Error ? error.message : String(error))
+        this.finish(job, 'LOST', reason ?? (error instanceof Error ? error.message : String(error)))
         return job
       }
     }
-    this.finish(job, 'STOPPED', null)
+    this.finish(job, 'STOPPED', reason)
     return job
   }
 

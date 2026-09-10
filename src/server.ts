@@ -98,7 +98,10 @@ async function main(): Promise<void> {
           ...runtimeVersion(),
           // V0.4.3: state the conversation-isolation mode so an operator can
           // tell process-per-conversation from a multiplexed host.
-          sessionScope: runtime.sessionScope,
+          // V0.4.4: when the actual transport carried a sessionId we are
+          // talking transport-scoped; the runtime-level mode is irrelevant
+          // for THIS request — surface what the user is actually on.
+          sessionScope: sessionIdOf(exec).length > 0 ? 'transport' : runtime.sessionScope,
           sessionId: sessionIdOf(exec),
           consoleUrl: auditViewerUrl(),
           consoleTokenTtlMinutes: tokenInfo.ttlMinutes,
