@@ -78,9 +78,33 @@ test('groupBySignature: no successful targets yields zero groups', () => {
   assert.deepEqual(groups, [])
 })
 
-test('groupBySignature: duplicate lines within a target do not create a false outlier', () => {
+test('groupBySignature: duplicate COUNT drift is a real outlier (V0.4.3)', () => {
+  // The old key used a unique line set, so a host with the warning 12 times
+  // and one with it once were declared identical. That is exactly the drift a
+  // comparison exists to surface, so the multiset must separate them.
   const a = target('a', ['x', 'x', 'y'])
   const b = target('b', ['x', 'y'])
-  const { distinct } = groupBySignature([a, b])
+  const { distinct, groups } = groupBySignature([a, b])
+  assert.equal(distinct, 2, 'different duplicate counts must be different signatures')
+  const outlier = groups[0].outliers.find((o) => o.target === 'b')
+  assert.notEqual(outlier, undefined)
+  assert.deepEqual(outlier.missing, ['x'], 'b has one fewer x than the majority')
+})
+
+test('groupBySignature: equal duplicate counts stay in ONE group', () => {
+  const a = target('a', ['x', 'x', 'y'])
+  const b = target('b', ['y', 'x', 'x'])
+  const { distinct, groups } = groupBySignature([a, b])
   assert.equal(distinct, 1)
+  assert.equal(groups[0].outliers.length, 0)
+})
+
+test('groupBySignature: extra duplicates are reported as extra, not as a new line', () => {
+  const a = target('a', ['x'])
+  const b = target('b', ['x', 'x', 'x'])
+  const { groups } = groupBySignature([a, b])
+  const outlier = groups[0].outliers.find((o) => o.target === 'b')
+  assert.notEqual(outlier, undefined)
+  assert.deepEqual(outlier.missing, [])
+  assert.deepEqual(outlier.extra, ['x'])
 })

@@ -33,6 +33,8 @@ export interface RunbookStepPlan {
   source: string
   /** Resolved read-only commands this step contributes. */
   commands: string[]
+  /** V0.4.3: probe ids parallel to `commands` (profile steps only). */
+  probes: string[]
   /** Why the step is skipped (null when runnable). */
   skipped: { reason: string; risk: string; ruleId: string } | null
   timeoutMs: number | null
@@ -50,24 +52,56 @@ export interface RunbookPlan {
   asserted: number
 }
 
+/**
+ * V0.4.3: ONE logical runbook step, as it appears in the result.
+ *
+ * Before V0.4.3 a profile step expanded into one result row per probe, so a
+ * 10-probe profile produced 10 identically-named rows and — worse — the
+ * step's `expect` was re-evaluated against every unrelated probe output.
+ * Now a step is reported exactly once; the per-probe detail survives in
+ * `commands[]` / `probes[]` for anyone who needs it.
+ */
+export interface RunbookStepResult {
+  id: string
+  title: string | null
+  /** V0.4.3: which kind of step produced this row. */
+  kind: 'profile' | 'command'
+  source: string
+  /**
+   * V0.4.3: the output the assertion was actually evaluated against.
+   *  - command step / expect.probe set -> that single probe's output
+   *  - profile step without expect.probe -> all probe outputs joined by '\n'
+   */
+  output: string
+  /** Aggregate exit code: 0 only when every contributing command exited 0. */
+  exitCode: number | null
+  truncated: boolean
+  durationMs: number
+  error: { code: string; message: string } | null
+  /** V0.4.3: per-command detail (one entry per probe for profile steps). */
+  commands: Array<{
+    /** V0.4.3: probe id inside the profile (null for command steps). */
+    probe: string | null
+    command: string
+    exitCode: number | null
+    output: string
+    truncated: boolean
+    durationMs: number
+    error: { code: string; message: string } | null
+  }>
+  /** V0.4.3: probe ids this step ran (profile steps; empty for command steps). */
+  probes: string[]
+  /** V0.4.2: assertion outcome for this step (null when the step asserts nothing). */
+  check: RunbookCheck | null
+}
+
 export interface RunbookTargetResult {
   target: string
   hostname: string | null
   error: { code: string; message: string } | null
   /** V0.4.2: overall verdict for this target (null when no step asserted). */
   verdict: RunbookVerdict | null
-  steps: Array<{
-    id: string
-    title: string | null
-    source: string
-    exitCode: number | null
-    output: string
-    truncated: boolean
-    durationMs: number
-    error: { code: string; message: string } | null
-    /** V0.4.2: assertion outcome for this step (null when the step asserts nothing). */
-    check: RunbookCheck | null
-  }>
+  steps: RunbookStepResult[]
 }
 
 /** V0.4.2: 'pass' = every assertion held; 'fail' = at least one broke. */
@@ -201,6 +235,7 @@ function planStep(step: RunbookStep): RunbookStepPlan {
       kind: 'command',
       source: step.command!,
       commands: [],
+      probes: [],
       skipped: { reason: 'step defines BOTH profile and command', risk: 'UNKNOWN', ruleId: 'runbook.invalid' },
     }
   }
@@ -210,6 +245,7 @@ function planStep(step: RunbookStep): RunbookStepPlan {
       kind: 'command',
       source: '',
       commands: [],
+      probes: [],
       skipped: { reason: 'step defines neither profile nor command', risk: 'UNKNOWN', ruleId: 'runbook.invalid' },
     }
   }
@@ -225,11 +261,13 @@ function planStep(step: RunbookStep): RunbookStepPlan {
         kind: 'profile',
         source: step.profile!,
         commands: [],
+        probes: [],
         skipped: { reason: 'unknown inspect profile "' + step.profile + '"', risk: 'UNKNOWN', ruleId: 'runbook.unknown-profile' },
       }
     }
     const resolved = resolveProfile(name)
     const commands: string[] = []
+    const probes: string[] = []
     const seen = new Set<string>()
     for (const probe of resolved.steps) {
       const classification = classifyCommand(probe.command)
@@ -237,6 +275,7 @@ function planStep(step: RunbookStep): RunbookStepPlan {
       if (seen.has(probe.command)) continue
       seen.add(probe.command)
       commands.push(probe.command)
+      probes.push(probe.id)
     }
     if (commands.length === 0) {
       return {
@@ -244,10 +283,27 @@ function planStep(step: RunbookStep): RunbookStepPlan {
         kind: 'profile',
         source: step.profile!,
         commands: [],
+        probes: [],
         skipped: { reason: 'no probe of profile "' + step.profile + '" is classified READ', risk: 'UNKNOWN', ruleId: 'profile.risk-mismatch' },
       }
     }
-    return { ...base, kind: 'profile', source: step.profile!, commands, skipped: null }
+    // V0.4.3: an expect.probe that names no probe of this profile is a config
+    // error. Fail loudly at plan time instead of silently asserting nothing.
+    if (expect !== null && expect.probe !== undefined && expect.probe.length > 0 && !probes.includes(expect.probe)) {
+      return {
+        ...base,
+        kind: 'profile',
+        source: step.profile!,
+        commands: [],
+        probes: [],
+        skipped: {
+          reason: 'expect.probe "' + expect.probe + '" is not a probe of profile "' + step.profile + '" (known: ' + probes.join(', ') + ')',
+          risk: 'UNKNOWN',
+          ruleId: 'runbook.unknown-probe',
+        },
+      }
+    }
+    return { ...base, kind: 'profile', source: step.profile!, commands, probes, skipped: null }
   }
 
   const command = step.command!.trim()
@@ -258,10 +314,11 @@ function planStep(step: RunbookStep): RunbookStepPlan {
       kind: 'command',
       source: command,
       commands: [],
+      probes: [],
       skipped: { reason: classification.reason, risk: classification.risk, ruleId: classification.ruleId },
     }
   }
-  return { ...base, kind: 'command', source: command, commands: [command], skipped: null }
+  return { ...base, kind: 'command', source: command, commands: [command], probes: [], skipped: null }
 }
 
 /** Resolve the runbook by name from the configured map; unknown name errors loudly. */
@@ -314,10 +371,12 @@ export async function runRunbook(
     async (target): Promise<RunbookTargetResult> => {
       requireTargetAllowed(getConfig(), target)
       const commands: BatchCommandRequest[] = []
+      // V0.4.3: parallel arrays mapping a flat batch index back to its step.
       const indexToStep: number[] = []
+      const indexToProbe: Array<string | null> = []
       plan.steps.forEach((step, stepIndex) => {
         if (step.skipped !== null) return
-        for (const command of step.commands) {
+        step.commands.forEach((command, probeIndex) => {
           const classification = classifyCommand(command)
           commands.push({
             command,
@@ -338,7 +397,8 @@ export async function runRunbook(
             toolCallId: options.toolCallId,
           })
           indexToStep.push(stepIndex)
-        }
+          indexToProbe.push(step.kind === 'profile' ? (step.probes[probeIndex] ?? null) : null)
+        })
       })
       const batch: TargetBatchResult = await manager.runTargetBatch({
         target,
@@ -354,22 +414,67 @@ export async function runRunbook(
           : null
         return { target, hostname: batch.hostname, error: batch.error, verdict: unreachableCheck !== null ? 'fail' : null, steps: [] }
       }
-      const steps: RunbookTargetResult['steps'] = []
-      batch.commands.forEach((cmd, index) => {
-        const stepIndex = indexToStep[index]
-        const step = stepIndex !== undefined ? plan.steps[stepIndex] : undefined
+
+      // V0.4.3: fold the flat per-command batch back into ONE row per step.
+      const steps: RunbookStepResult[] = []
+      for (let stepIndex = 0; stepIndex < plan.steps.length; stepIndex += 1) {
+        const step = plan.steps[stepIndex]!
+        if (step.skipped !== null) continue
+        const members: RunbookStepResult['commands'] = []
+        for (let index = 0; index < indexToStep.length; index += 1) {
+          if (indexToStep[index] !== stepIndex) continue
+          const cmd = batch.commands[index]
+          if (cmd === undefined) continue
+          members.push({
+            probe: indexToProbe[index] ?? null,
+            command: cmd.command,
+            exitCode: cmd.exitCode,
+            output: cmd.output,
+            truncated: cmd.truncated,
+            durationMs: cmd.durationMs,
+            error: cmd.error,
+          })
+        }
+        if (members.length === 0) continue
+
+        // Pick the text the assertion is judged against:
+        //  - expect.probe -> that probe only (unknown probe already skipped at plan time)
+        //  - profile step -> all probe outputs aggregated (one logical step = one verdict)
+        //  - command step -> its single output
+        let judged = members
+        if (step.kind === 'profile' && step.expect?.probe !== undefined && step.expect.probe.length > 0) {
+          const wanted = step.expect.probe
+          judged = members.filter((m) => m.probe === wanted)
+        }
+        const output = judged.map((m) => m.output).join('\n')
+        // Aggregate exit code: 0 only when every contributing command exited 0,
+        // null when any of them has no exit code (timeout / signal lost).
+        let exitCode: number | null = 0
+        for (const m of judged) {
+          if (m.exitCode === null) {
+            exitCode = null
+            break
+          }
+          if (m.exitCode !== 0) exitCode = m.exitCode
+        }
+        const error = members.find((m) => m.error !== null)?.error ?? null
+        const check = evaluateExpect(step.expect ?? undefined, { output, exitCode, error })
+
         steps.push({
-          id: step?.id ?? 'step' + index,
-          title: step?.title ?? null,
-          source: step?.source ?? cmd.command,
-          exitCode: cmd.exitCode,
-          output: cmd.output,
-          truncated: cmd.truncated,
-          durationMs: cmd.durationMs,
-          error: cmd.error,
-          check: evaluateExpect(step?.expect ?? undefined, { output: cmd.output, exitCode: cmd.exitCode, error: cmd.error }),
+          id: step.id,
+          title: step.title,
+          kind: step.kind,
+          source: step.source,
+          output,
+          exitCode,
+          truncated: judged.some((m) => m.truncated),
+          durationMs: members.reduce((sum, m) => sum + m.durationMs, 0),
+          error,
+          commands: members,
+          probes: step.probes,
+          check,
         })
-      })
+      }
       return { target, hostname: batch.hostname, error: null, verdict: foldVerdict(steps.map((s) => s.check)), steps }
     },
     { concurrency: options.concurrency ?? 1, signal: options.signal },

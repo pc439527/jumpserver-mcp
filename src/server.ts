@@ -17,7 +17,7 @@ import { gateCommand, gateCommandForNavigation, gateCommandsForNavigation, type 
 import { JUMPSERVER_NOT_ARMED, NOT_ARMED_MESSAGE, type SessionGrant } from './security/grant.js'
 import { redactCommandSecrets } from './security/command-redaction.js'
 import { createRuntime, type Runtime } from './runtime/runtime.js'
-import { auditViewerUrl, consoleTokenInfo, readAuditEntries, rotateConsoleAccessToken } from './runtime/audit-viewer.js'
+import { auditViewerUrl, consoleTokenInfo, readAuditEntries, rotateConsoleAccessToken, stripInternalMarkers } from './runtime/audit-viewer.js'
 import { registerOpsTools } from './runtime/tools-ops.js'
 import { toolText, toolTextRaw } from './runtime/tool-host.js'
 import { formatAuditTime } from './runtime/time.js'
@@ -80,33 +80,66 @@ async function main(): Promise<void> {
     'jumpserver_status',
     {
       description:
-        'Query the current JumpServer connector state: whether a session exists, which bastion gateway it uses, which target asset is entered (verified via probe), and the current permission mode. Also returns the live ops-console URL and its token expiry. Never returns credentials. Pass rotateConsoleToken=true to invalidate the current console token and get a fresh URL (the old link stops working immediately).',
-      inputSchema: {
-        rotateConsoleToken: z
-          .boolean()
-          .optional()
-          .describe('Issue a new console access token and return the new URL; the previous link stops working. Use when the console shows "令牌已过期".'),
-      },
+        'Query the current JumpServer connector state: whether a session exists, which bastion gateway it uses, which target asset is entered (verified via probe), and the current permission mode. Also returns the live ops-console URL and its token expiry. Never returns credentials. This tool is strictly READ-ONLY — to invalidate the console token use jumpserver_console_rotate_token.',
+      inputSchema: {},
       annotations: { readOnlyHint: true },
     },
-    async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_status', callId: extra.requestId, signal: extra.signal, confirm: false }
+    async (_args, extra) => {
+      const exec: ToolRunContext = { name: 'jumpserver_status', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return text(await guardValue(exec, async () => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
         const bundle = bundleFor(exec, registry)
-        if (args.rotateConsoleToken === true) rotateConsoleAccessToken()
         // V0.4.2: surface the live console URL + token expiry so a user whose
         // console aged out can be handed a fresh link without a restart.
         const tokenInfo = consoleTokenInfo()
         return {
           ...statusToValue(bundle.manager.status()),
           ...runtimeVersion(),
+          // V0.4.3: state the conversation-isolation mode so an operator can
+          // tell process-per-conversation from a multiplexed host.
+          sessionScope: runtime.sessionScope,
+          sessionId: sessionIdOf(exec),
           consoleUrl: auditViewerUrl(),
           consoleTokenTtlMinutes: tokenInfo.ttlMinutes,
           consoleTokenExpiresAt: tokenInfo.expiresAt,
           consoleTokenExpired: tokenInfo.expired,
         }
+      }))
+    },
+  )
+
+  // V0.4.3: rotation is a SIDE EFFECT, so it must not hide inside a tool that
+  // advertises readOnlyHint:true. Separate tool, honest annotations.
+  server.registerTool(
+    'jumpserver_console_rotate_token',
+    {
+      description:
+        'Invalidate the current ops-console access token and issue a fresh one, returning the new console URL. The previous link stops working immediately, so hand the new URL to the user. Use this when the console shows "令牌已过期" and you cannot restart the MCP process. Has a side effect (the old token is revoked) — not a read-only operation.',
+      inputSchema: {},
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async (_args, extra) => {
+      const exec: ToolRunContext = { name: 'jumpserver_console_rotate_token', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
+      return text(await guardValue(exec, async () => {
+        const blocked = requireGrant(grants, runtime, exec)
+        if (blocked !== null) return blocked
+        const url = rotateConsoleAccessToken()
+        const tokenInfo = consoleTokenInfo()
+        if (url === null) {
+          return {
+            ok: false,
+            code: 'CONSOLE_NOT_RUNNING',
+            message: 'no ops console is running for this conversation (auditViewer.enabled=false or the listener failed to bind)',
+          } as unknown as import('./runtime/tools-common.js').ResultValue
+        }
+        return {
+          ok: true,
+          consoleUrl: url,
+          consoleTokenTtlMinutes: tokenInfo.ttlMinutes,
+          consoleTokenExpiresAt: tokenInfo.expiresAt,
+          message: 'console token rotated; the previous link no longer works — open the new URL via present_files.',
+        } as unknown as import('./runtime/tools-common.js').ResultValue
       }))
     },
   )
@@ -119,7 +152,7 @@ async function main(): Promise<void> {
       inputSchema: {},
     },
     async (_args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_connect', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_connect', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return text(await guardValue(exec, async () => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
@@ -141,7 +174,7 @@ async function main(): Promise<void> {
       },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_enter', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_enter', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return text(await guardValue(exec, async () => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
@@ -168,7 +201,7 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_assets', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_assets', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       const value = await guardValue(exec, async () => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
@@ -206,7 +239,7 @@ async function main(): Promise<void> {
       },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_exec', callId: extra.requestId, signal: extra.signal, confirm: args.confirm === true }
+      const exec: ToolRunContext = { name: 'jumpserver_exec', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: args.confirm === true }
       return text(await guardValue(exec, async () => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
@@ -242,7 +275,7 @@ async function main(): Promise<void> {
       },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_run', callId: extra.requestId, signal: extra.signal, confirm: args.confirm === true }
+      const exec: ToolRunContext = { name: 'jumpserver_run', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: args.confirm === true }
       return text(await guardValue(exec, async () => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
@@ -284,7 +317,7 @@ async function main(): Promise<void> {
       },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_batch', callId: extra.requestId, signal: extra.signal, confirm: args.confirm === true }
+      const exec: ToolRunContext = { name: 'jumpserver_batch', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: args.confirm === true }
       const value = await guardValue(exec, async (): Promise<ResultValue> => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
@@ -359,7 +392,7 @@ async function main(): Promise<void> {
       inputSchema: {},
     },
     async (_args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_leave', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_leave', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return text(await guardValue(exec, async () => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
@@ -377,7 +410,7 @@ async function main(): Promise<void> {
       inputSchema: {},
     },
     async (_args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_close', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_close', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return text(await guardValue(exec, async () => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
@@ -402,15 +435,16 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_snapshot', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_snapshot', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return textRaw(await guardText(exec, async (): Promise<string> => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return renderResult(blocked)
         const bundle = bundleFor(exec, registry)
         const status = bundle.manager.status()
-        const events = typeof args.sinceSeq === 'number'
+        const events = (typeof args.sinceSeq === 'number'
           ? bundle.observer.snapshotSince(Math.max(0, Math.floor(args.sinceSeq)))
           : bundle.observer.snapshot()
+        ).map(stripInternalMarkers)
         const maxChars = typeof args.maxChars === 'number' && args.maxChars > 200 ? Math.floor(args.maxChars) : 8000
         const lines: string[] = [
           'state=' + status.state + ' target=' + (status.target ?? 'none') + ' hostname=' + (status.hostname ?? '?') + ' permissionMode=' + status.permissionMode,
@@ -461,7 +495,7 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_audit', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_audit', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return textRaw(await guardText(exec, async (): Promise<string> => {
         const entries = readAuditEntries(runtime.auditPath)
         const q = typeof args.filter === 'string' && args.filter.length > 0 ? args.filter.toLowerCase() : null
@@ -495,7 +529,7 @@ async function main(): Promise<void> {
         inputSchema: {},
       },
       async (_args, extra) => {
-        const exec: ToolRunContext = { name: 'jumpserver_arm', callId: extra.requestId, signal: extra.signal, confirm: false }
+        const exec: ToolRunContext = { name: 'jumpserver_arm', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
         grants.arm(sessionIdOf(exec), 'persistent', 30 * 60 * 1000)
         return textRaw('JumpServer tools armed for 30 minutes.')
       },
@@ -507,7 +541,7 @@ async function main(): Promise<void> {
         inputSchema: {},
       },
       async (_args, extra) => {
-        const exec: ToolRunContext = { name: 'jumpserver_disarm', callId: extra.requestId, signal: extra.signal, confirm: false }
+        const exec: ToolRunContext = { name: 'jumpserver_disarm', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
         const sessionId = sessionIdOf(exec)
         grants.revoke(sessionId)
         const bundle = registry.get(sessionId)

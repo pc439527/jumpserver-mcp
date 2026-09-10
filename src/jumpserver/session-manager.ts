@@ -66,6 +66,12 @@ export interface SessionManagerOptions {
   wireFactory?: import('./session.js').WireFactory
   /** V0.2: live terminal mirror sink; every PTY input/output/state/target event lands here. */
   observer?: TerminalObserver
+  /**
+   * V0.4.3: process-wide gate on simultaneous target batches. `maxSessions`
+   * was configured but never enforced; wiring this Semaphore makes it real —
+   * with batchConcurrency>1 at most `maxSessions` targets are entered at once.
+   */
+  sessionGate?: { acquire: () => Promise<() => void> }
 }
 
 export interface ExecRequest {
@@ -141,6 +147,11 @@ export interface TargetBatchRequest {
 export interface BatchCommandResult {
   command: string
   executionState: string
+  /**
+   * V0.4.3: what happened to the COMMAND (SUCCESS/EXIT_NONZERO/TIMEOUT/...).
+   * executionState only says whether the transport exchange completed.
+   */
+  commandStatus: string
   exitCode: number | null
   output: string
   truncated: boolean
@@ -421,7 +432,7 @@ export class SessionManager {
         approvalResult: request.approvalResult,
         toolCallId: request.toolCallId,
         batchId: request.batchId,
-        result: outcome.executionState,
+        result: outcome.commandStatus,
         exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
         durationMs,
       })
@@ -454,7 +465,7 @@ export class SessionManager {
         approvalResult: request.approvalResult,
         toolCallId: request.toolCallId,
         batchId: request.batchId,
-        result: outcome.executionState,
+        result: outcome.commandStatus,
         exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
         durationMs,
       })
@@ -489,7 +500,18 @@ export class SessionManager {
    * completion marker) and its output is harvested from the observer stream by
    * the job store. The job owns the PTY until it is stopped.
    */
-  async startJob(request: { jobId: string; target: string; command: string; signal?: AbortSignal; toolCallId?: string }): Promise<{ target: string | null; hostname: string | null; state: string; startSeq: number }> {
+  async startJob(request: {
+    jobId: string
+    target: string
+    command: string
+    signal?: AbortSignal
+    toolCallId?: string
+    /** V0.4.3: real classification — the audit must NOT hardcode READ. */
+    classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
+    /** V0.4.3: approval outcome recorded in the audit. */
+    approvalRequired?: boolean
+    approvalResult?: string
+  }): Promise<{ target: string | null; hostname: string | null; state: string; startSeq: number }> {
     return this.queue(async () => {
       this.assertNoActiveJob()
       const cfg = this.options.getConfig()
@@ -507,7 +529,13 @@ export class SessionManager {
         target: st.target,
         hostname: st.hostname,
         command: request.command,
-        risk: 'READ',
+        // V0.4.3: the streaming job is NOT automatically READ. Recording a
+        // hardcoded READ hid `rm -rf` behind a confirm:true from the audit.
+        risk: request.classification?.risk ?? 'UNKNOWN',
+        classification: request.classification,
+        actor: 'AGENT',
+        approvalRequired: request.approvalRequired ?? false,
+        approvalResult: request.approvalResult ?? 'none',
         taskId: request.jobId,
         toolCallId: request.toolCallId,
         result: 'RUNNING',
@@ -518,14 +546,29 @@ export class SessionManager {
     }, request.signal)
   }
 
-  /** V0.4.0: stop a streaming job — Ctrl+C (out-of-band) and release the PTY. */
-  async stopJob(jobId: string): Promise<{ sent: boolean; state: string }> {
+  /**
+   * V0.4.0: stop a streaming job — Ctrl+C (out-of-band) and release the PTY.
+   * V0.4.3: after the interrupt, PROVE the shell came back. Reporting
+   * `state: 'ASSET_SHELL'` without probing let a wedged PTY masquerade as a
+   * usable session, so the next command typed into a dead shell.
+   */
+  async stopJob(jobId: string): Promise<{ sent: boolean; verified: boolean; state: string }> {
     const session = this.session
     if (this.activeJob !== null && this.activeJob !== jobId) {
       throw new JumpServerError('SESSION_BUSY', 'another job (' + this.activeJob + ') owns this shell')
     }
     this.activeJob = null
     const sent = session?.sendInterrupt() ?? false
+    let verified = false
+    if (sent && session !== null) {
+      verified = await session.verifyShell().catch(() => false)
+      if (verified) {
+        session.setStateForVerification?.('ASSET_SHELL')
+      } else {
+        session.setStateForVerification?.('UNKNOWN')
+        this.options.onLog?.('job stopped but the shell could not be re-verified; session collapsed to UNKNOWN')
+      }
+    }
     await this.audit({
       operation: 'job-stop',
       target: session?.currentTarget ?? null,
@@ -533,11 +576,11 @@ export class SessionManager {
       command: null,
       risk: 'READ',
       taskId: jobId,
-      result: sent ? 'ok' : 'not-sent',
+      result: sent ? (verified ? 'STOPPED' : 'LOST') : 'not-sent',
       exitCode: null,
       durationMs: null,
     })
-    return { sent, state: this.status().state }
+    return { sent, verified, state: this.status().state }
   }
 
   /**
@@ -549,6 +592,18 @@ export class SessionManager {
    * per command so one bad command cannot mask its neighbours' results.
    */
   async runTargetBatch(request: TargetBatchRequest): Promise<TargetBatchResult> {
+    // V0.4.3: maxSessions is enforced HERE, around the whole target turn, so
+    // it caps how many assets are entered simultaneously regardless of the
+    // caller's concurrency. Callers that never set a gate are unaffected.
+    const release = this.options.sessionGate !== undefined ? await this.options.sessionGate.acquire() : null
+    try {
+      return await this.runTargetBatchGated(request)
+    } finally {
+      release?.()
+    }
+  }
+
+  private async runTargetBatchGated(request: TargetBatchRequest): Promise<TargetBatchResult> {
     return this.queue(async () => {
       const cfg = this.options.getConfig()
       if (cfg.enabled === false) {
@@ -586,6 +641,7 @@ export class SessionManager {
           results.push({
             command: item.command,
             executionState: outcome.executionState,
+            commandStatus: outcome.commandStatus,
             exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
             output: outcome.output,
             truncated: outcome.kind === 'completed' || outcome.kind === 'timeout' ? outcome.truncated : false,
@@ -605,7 +661,7 @@ export class SessionManager {
             toolCallId: item.toolCallId ?? request.toolCallId,
             batchId: item.batchId ?? request.batchId,
             batchIndex: item.batchIndex,
-            result: outcome.executionState,
+            result: outcome.commandStatus,
             exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
             durationMs,
           })
@@ -613,6 +669,7 @@ export class SessionManager {
           results.push({
             command: item.command,
             executionState: 'ERROR',
+            commandStatus: 'UNKNOWN',
             exitCode: null,
             output: '',
             truncated: false,

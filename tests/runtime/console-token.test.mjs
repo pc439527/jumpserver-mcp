@@ -131,3 +131,22 @@ test('rotation is reflected in auditViewerUrl so the next handover is correct', 
   assert.equal(auditViewerUrl(), next)
   assert.notEqual(auditViewerUrl(), before)
 })
+
+/* ------------------------------------------------- V0.4.3 on-disk secrecy */
+
+test('the discovery file NEVER contains the token or a tokenized URL', async () => {
+  const { token } = parts(await boot())
+  // The heartbeat file is written on boot and refreshed every 5s.
+  const { readFileSync, existsSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const file = join('data', 'consoles', String(process.pid) + '.json')
+  assert.ok(existsSync(file), 'expected a discovery file at ' + file)
+  const raw = readFileSync(file, 'utf8')
+  const parsed = JSON.parse(raw)
+
+  assert.equal(raw.includes(token), false, 'the token must not be readable from disk')
+  assert.equal('url' in parsed, false, 'the tokenized URL must not be persisted')
+  assert.equal(typeof parsed.port, 'number')
+  assert.equal(typeof parsed.pid, 'number')
+  assert.ok('startedAt' in parsed && 'heartbeatAt' in parsed)
+})

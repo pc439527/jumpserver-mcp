@@ -71,8 +71,10 @@ const configSchema = z.object({
               command: z.string().optional(),
               timeout: z.number().optional(),
               // V0.4.2: assertions evaluated against the step output.
+              // V0.4.3: `probe` narrows a profile-step assertion to one probe.
               expect: z
                 .object({
+                  probe: z.string().optional(),
                   contains: z.string().optional(),
                   notContains: z.string().optional(),
                   matches: z.string().optional(),

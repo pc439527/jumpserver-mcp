@@ -63,10 +63,27 @@ export interface SessionStatus {
   reconnectCount: number
 }
 
+/**
+ * V0.4.3: what actually happened to the COMMAND, as opposed to whether the
+ * transport delivered a completion marker.
+ *
+ * `executionState: 'COMPLETED'` only means "the completion marker came back
+ * normally". A command that exits 127 (`jps: command not found`) is a
+ * COMPLETED execution with a FAILED command. Reporting it as ok=true hid real
+ * failures from the model, the console audit and any PASS/FAIL judgement.
+ */
+export type CommandStatus =
+  | 'SUCCESS'         // exit code 0
+  | 'EXIT_NONZERO'    // ran to completion, exited with a non-zero code
+  | 'TIMEOUT'         // the completion marker never arrived
+  | 'INTERRUPTED'     // Ctrl+C / abort
+  | 'CONNECTION_LOST' // the PTY closed underneath us
+  | 'UNKNOWN'         // ran, but the outcome could not be determined
+
 export type ExecOutcome =
-  | { kind: 'completed'; exitCode: number; output: string; truncated: boolean; durationMs: number; executionState: 'COMPLETED' }
-  | { kind: 'timeout'; output: string; truncated: boolean; durationMs: number; executionState: 'TIMEOUT' | 'UNKNOWN' }
-  | { kind: 'signal-lost'; output: string; durationMs: number; executionState: 'UNKNOWN' }
+  | { kind: 'completed'; exitCode: number; commandStatus: 'SUCCESS' | 'EXIT_NONZERO'; output: string; truncated: boolean; durationMs: number; executionState: 'COMPLETED' }
+  | { kind: 'timeout'; commandStatus: 'TIMEOUT' | 'UNKNOWN'; output: string; truncated: boolean; durationMs: number; executionState: 'TIMEOUT' | 'UNKNOWN' }
+  | { kind: 'signal-lost'; commandStatus: 'CONNECTION_LOST'; output: string; durationMs: number; executionState: 'UNKNOWN' }
 
 export interface ExecOptions {
   timeoutMs?: number
@@ -295,7 +312,7 @@ export class JumpServerSession {
       }
       if (run.closed) {
         this.setState(SessionState.DISCONNECTED)
-        return { kind: 'signal-lost', output: '', durationMs, executionState: 'UNKNOWN' }
+        return { kind: 'signal-lost', commandStatus: 'CONNECTION_LOST', output: '', durationMs, executionState: 'UNKNOWN' }
       }
       if (!run.matched) {
         // V0.2.5 P0: a timeout only means the completion marker never
@@ -308,11 +325,11 @@ export class JumpServerSession {
         if (!verified) {
           this.setState(SessionState.UNKNOWN)
           this.callbacks.onLog?.('command timed out and the shell could not be re-verified; session collapsed to UNKNOWN')
-          return { kind: 'timeout', output: run.text, truncated: run.truncated, durationMs, executionState: 'UNKNOWN' }
+          return { kind: 'timeout', commandStatus: 'UNKNOWN', output: run.text, truncated: run.truncated, durationMs, executionState: 'UNKNOWN' }
         }
         this.setState(SessionState.ASSET_SHELL)
         this.touch()
-        return { kind: 'timeout', output: run.text, truncated: run.truncated, durationMs, executionState: 'TIMEOUT' }
+        return { kind: 'timeout', commandStatus: 'TIMEOUT', output: run.text, truncated: run.truncated, durationMs, executionState: 'TIMEOUT' }
       }
       const done = parseDoneLine(run.text, marker)
       this.setState(SessionState.ASSET_SHELL)
@@ -323,6 +340,9 @@ export class JumpServerSession {
       return {
         kind: 'completed',
         exitCode: done.exitCode,
+        // V0.4.3: the command itself succeeded or failed — separate from the
+        // transport having completed the exchange.
+        commandStatus: done.exitCode === 0 ? 'SUCCESS' : 'EXIT_NONZERO',
         output: cleanCommandOutput(run.text, marker),
         truncated: run.truncated,
         durationMs,
@@ -650,6 +670,28 @@ export class JumpServerSession {
     const run = await this.runOp(buildProbeScript(marker), PROBE_PREFIX + marker, Math.min(budgetMs, 3000), signal)
     if (run.aborted || run.closed || !run.matched) return false
     return parseProbeOutput(run.text, marker) !== null
+  }
+
+  /**
+   * V0.4.3: public Ctrl+C + re-verify, used after stopping a streaming job.
+   * Stopping a job sends an out-of-band Ctrl+C; without re-proving the shell
+   * the connector cannot tell "the job stopped and the prompt is back" from
+   * "the PTY is wedged / the connection dropped". Returns true when the shell
+   * answers a probe and is safe to reuse.
+   */
+  async verifyShell(budgetMs = 3000): Promise<boolean> {
+    return this.recoverShell(budgetMs)
+  }
+
+  /**
+   * V0.4.3: apply the outcome of an out-of-band verification (job stop).
+   * recoverShell proves the shell answers a probe; the caller must then move
+   * the state machine to match, or the session keeps reporting its stale
+   * COMMAND_RUNNING / UNKNOWN state.
+   */
+  setStateForVerification(state: 'ASSET_SHELL' | 'UNKNOWN'): void {
+    this.setState(state === 'ASSET_SHELL' ? SessionState.ASSET_SHELL : SessionState.UNKNOWN)
+    if (state === 'ASSET_SHELL') this.touch()
   }
 
   private assertState(expected: SessionState, code: 'NOT_AT_MENU' | 'NOT_IN_ASSET', detail: string): void {

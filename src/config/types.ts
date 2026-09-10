@@ -108,6 +108,20 @@ export interface AssetGroupDef {
  * runbook reports PASS / FAIL per target. All rules must hold (AND).
  */
 export interface RunbookExpect {
+  /**
+   * V0.4.3: narrow the assertion to ONE probe of a profile step.
+   *
+   * A profile step expands to N probes whose outputs are unrelated to each
+   * other (`ss -lntp` vs `cat /etc/hosts`). Asserting "contains LISTEN"
+   * against every probe independently is wrong: it reports FAIL on a healthy
+   * host. `probe` names the single probe id the assertion targets, e.g.
+   * `expect: { probe: "listen", contains: "LISTEN" }`.
+   *
+   * When omitted on a profile step, the assertion is evaluated ONCE against
+   * the aggregated output of all probes (see RunbookStepResult.aggregated).
+   * On a command step this field is meaningless and ignored.
+   */
+  probe?: string
   /** Output must contain this substring (case-insensitive). */
   contains?: string
   /** Output must NOT contain this substring (case-insensitive). */

@@ -98,9 +98,14 @@ export function normalizeLines(
 }
 
 /**
- * Group targets by their exact (order-insensitive) line set and pick the
- * majority set as the signature. A set is identified by its sorted unique
- * lines so that mere ordering differences do not create a false group.
+ * Group targets by their exact (order-insensitive) MULTISET of lines and pick
+ * the majority set as the signature.
+ *
+ * V0.4.3: this used to key on the unique line set, so a target with 12
+ * duplicate warnings and one with a single warning were declared IDENTICAL —
+ * the exact difference an ops comparison exists to surface. The key is now a
+ * count-aware multiset (line × occurrences, sorted), and a target whose line
+ * counts differ is reported as an outlier.
  */
 export function groupBySignature(
   targets: CompareTarget[],
@@ -108,7 +113,14 @@ export function groupBySignature(
   const ok = targets.filter((t) => t.ok)
   if (ok.length === 0) return { distinct: 0, groups: [] }
 
-  const keyOf = (lines: string[]): string => [...new Set(lines)].sort().join('\u0000')
+  const keyOf = (lines: string[]): string => {
+    const counts = new Map<string, number>()
+    for (const line of lines) counts.set(line, (counts.get(line) ?? 0) + 1)
+    return [...counts.entries()]
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([line, n]) => n + '\u0001' + line)
+      .join('\u0000')
+  }
   const buckets = new Map<string, { lines: string[]; members: CompareTarget[] }>()
   for (const target of ok) {
     const key = keyOf(target.lines)
@@ -119,38 +131,52 @@ export function groupBySignature(
 
   const sorted = [...buckets.entries()].sort((a, b) => b[1].members.length - a[1].members.length)
   const majority = sorted[0]![1]
-  const majoritySet = new Set(majority.lines)
+  const majorityKey = keyOf(majority.lines)
   const groups: CompareGroup[] = []
 
   // Majority group first: outliers are measured against it.
   groups.push({
     signature: dedupeStable(majority.lines),
     outliers: ok
-      .filter((t) => keyOf(t.lines) !== keyOf(majority.lines))
-      .map((t) => diffAgainst(majoritySet, t)),
+      .filter((t) => keyOf(t.lines) !== majorityKey)
+      .map((t) => diffAgainst(majority.lines, t)),
   })
 
   // Every minority group is its own signature block.
   for (const [, bucket] of sorted.slice(1)) {
     groups.push({
       signature: dedupeStable(bucket.lines),
-      outliers: bucket.members.map((t) => ({
-        target: t.target,
-        missing: dedupeStable([...majoritySet].filter((l) => !new Set(t.lines).has(l))),
-        extra: dedupeStable(t.lines.filter((l) => !majoritySet.has(l))),
-      })),
+      outliers: bucket.members.map((t) => diffAgainst(majority.lines, t)),
     })
   }
   return { distinct: sorted.length, groups }
 }
 
-function diffAgainst(majoritySet: Set<string>, target: CompareTarget): { target: string; missing: string[]; extra: string[] } {
-  const own = new Set(target.lines)
-  return {
-    target: target.target,
-    missing: dedupeStable([...majoritySet].filter((l) => !own.has(l))),
-    extra: dedupeStable(target.lines.filter((l) => !majoritySet.has(l))),
+/**
+ * Count-aware diff: a line present twice in the baseline but once in the
+ * target is MISSING (once), and vice versa. Comparing unique sets silently
+ * dropped that, which is how duplicate-count drift escaped the report.
+ */
+function diffAgainst(majorityLines: string[], target: CompareTarget): { target: string; missing: string[]; extra: string[] } {
+  const missing = multisetDifference(majorityLines, target.lines)
+  const extra = multisetDifference(target.lines, majorityLines)
+  return { target: target.target, missing: dedupeStable(missing), extra: dedupeStable(extra) }
+}
+
+/** Lines present more often in `from` than in `against` (duplicates included). */
+function multisetDifference(from: string[], against: string[]): string[] {
+  const counts = new Map<string, number>()
+  for (const line of against) counts.set(line, (counts.get(line) ?? 0) + 1)
+  const out: string[] = []
+  for (const line of from) {
+    const left = counts.get(line) ?? 0
+    if (left > 0) {
+      counts.set(line, left - 1)
+      continue
+    }
+    out.push(line)
   }
+  return out
 }
 
 function dedupeStable(lines: string[]): string[] {

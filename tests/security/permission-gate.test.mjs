@@ -44,14 +44,22 @@ test('requireTargetAllowed: empty target is a no-op', () => {
 
 test('requireTargetAllowed: deny always wins', () => {
   const cfg = { allowedTargets: ['192.168.79.'], deniedTargets: ['101'] }
+  // V0.4.3: a bare entry is EXACT, so the deny entry names the literal target.
   assert.throws(
-    () => requireTargetAllowed(cfg, '192.168.79.101'),
+    () => requireTargetAllowed(cfg, '101'),
+    (err) => err.code === 'TARGET_DENIED',
+  )
+  // A prefix deny uses the trailing-dot/dash form.
+  const prefix = { allowedTargets: ['192.168.79.'], deniedTargets: ['192.168.79.101'] }
+  assert.throws(
+    () => requireTargetAllowed(prefix, '192.168.79.101'),
     (err) => err.code === 'TARGET_DENIED',
   )
 })
 
 test('requireTargetAllowed: substring allow', () => {
-  const cfg = { allowedTargets: ['oa-', '192.168.79.'] }
+  // V0.4.3: a name fragment needs an explicit glob; an IP prefix uses a dot.
+  const cfg = { allowedTargets: ['*oa*', '192.168.79.'] }
   assert.doesNotThrow(() => requireTargetAllowed(cfg, 'oa-app-01'))
   assert.doesNotThrow(() => requireTargetAllowed(cfg, '192.168.79.99'))
   assert.throws(

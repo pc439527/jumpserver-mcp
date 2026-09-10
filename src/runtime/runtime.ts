@@ -17,6 +17,8 @@ import { startAuditViewer, notifyAuditRecord } from './audit-viewer.js'
 import { SessionManager } from '../jumpserver/session-manager.js'
 import type { AuditRecord } from '../jumpserver/session-manager.js'
 import { SessionRegistry, type SessionBundle } from '../jumpserver/session-registry.js'
+import { Semaphore } from '../jumpserver/concurrency.js'
+import { DEFAULT_MAX_SESSIONS } from '../config/types.js'
 import { TerminalObserver } from '../jumpserver/terminal-observer.js'
 import { SessionGrant } from '../security/grant.js'
 
@@ -39,8 +41,19 @@ export interface Runtime {
   assets: AssetStore
   /** V0.4.0: display timezone for audit timestamps (storage stays UTC). */
   timeZone: string
+  /**
+   * V0.4.3: whether this process can keep several conversations apart.
+   *  - 'transport'  the host assigns a sessionId per request (HTTP/SSE)
+   *  - 'env'        JUMPSERVER_MCP_SESSION pins one scope per process
+   *  - 'process'    stdio process-per-conversation (the WorkBuddy default)
+   * Anything else means one process is silently serving several conversations
+   * with a single shared bastion session.
+   */
+  sessionScope: SessionScopeMode
   dispose: () => void
 }
+
+export type SessionScopeMode = 'transport' | 'env' | 'process' | 'shared-unsafe'
 
 /** Project root (two levels up from this file: lib/runtime -> lib -> root). */
 function projectRoot(): string {
@@ -102,6 +115,9 @@ export function createRuntime(): Runtime {
   }
 
   const grants = new SessionGrant()
+  // V0.4.3: one gate for the whole process — `maxSessions` now really caps how
+  // many targets are entered at once when batchConcurrency > 1.
+  const sessionGate = new Semaphore(config.maxSessions ?? DEFAULT_MAX_SESSIONS)
   const registry = new SessionRegistry({
     create: (sessionId: string): SessionBundle => {
       const cfg = getConfig()
@@ -112,6 +128,7 @@ export function createRuntime(): Runtime {
         onAudit,
         onLog: (message: string) => log(sessionId + ': ' + message),
         observer,
+        sessionGate,
       })
       return { manager, observer, lastUsedAt: Date.now() }
     },
@@ -144,6 +161,12 @@ export function createRuntime(): Runtime {
   }, 60_000)
   timer.unref?.()
 
+  const sessionScope = detectSessionScope()
+  log(
+    'session scope: ' + describeSessionScope(sessionScope) +
+      ' — one bastion PTY per scope; a host that multiplexes conversations in one process must set a transport sessionId or JUMPSERVER_MCP_SESSION',
+  )
+
   return {
     registry,
     grants,
@@ -157,10 +180,43 @@ export function createRuntime(): Runtime {
     baselines,
     assets,
     timeZone: resolveTimeZone(config.timeZone),
+    sessionScope,
     dispose: () => {
       clearInterval(timer)
       jobs.dispose()
       registry.dispose()
     },
+  }
+}
+
+/**
+ * V0.4.3: decide — and WARN LOUDLY — whether this process can distinguish
+ * conversations.
+ *
+ * WorkBuddy spawns one MCP stdio server per conversation, so the default is
+ * safe: process isolation IS the conversation boundary. The dangerous case is
+ * a host that multiplexes several conversations over ONE process without
+ * supplying a transport sessionId — then every conversation shares
+ * ANONYMOUS_SESSION, and one user's entered asset leaks into another's
+ * terminal. We cannot detect that from inside, so we state the assumption and
+ * tell the operator exactly how to fix it rather than pretending the registry
+ * is multi-conversation when it is not.
+ */
+function detectSessionScope(): SessionScopeMode {
+  const env = process.env['JUMPSERVER_MCP_SESSION']
+  if (env !== undefined && env.length > 0) return 'env'
+  return 'process'
+}
+
+export function describeSessionScope(mode: SessionScopeMode): string {
+  switch (mode) {
+    case 'transport':
+      return 'per-request transport sessionId'
+    case 'env':
+      return 'JUMPSERVER_MCP_SESSION (one scope per process)'
+    case 'process':
+      return 'process isolation (one MCP server per conversation)'
+    case 'shared-unsafe':
+      return 'SHARED (several conversations, one session scope)'
   }
 }

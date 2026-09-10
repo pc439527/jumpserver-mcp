@@ -174,6 +174,7 @@ tr:hover td{background:#1d1d1d}
 .tgt{color:#c9a86a;white-space:nowrap;max-width:200px;overflow:hidden;text-overflow:ellipsis}
 .risk{white-space:nowrap}
 .risk-READ{color:#7fc98f}.risk-PRIVILEGED_READ{color:#c9c37f}.risk-UNKNOWN{color:#bbb}.risk-MODIFY{color:#e8a86a}.risk-DANGEROUS{color:#e87f7f}
+.bad{color:#e87f7f;font-weight:600}
 .cmd{color:#a8d8a8;word-break:break-all}
 #empty{padding:40px;text-align:center;color:#666}
 .termbox{background:#0d0d0d;border:1px solid #2a2a2a;border-radius:8px;padding:10px;height:calc(100vh - 210px);overflow-y:auto;white-space:pre-wrap;word-break:break-all;font-size:12.5px;line-height:1.45}
@@ -630,10 +631,16 @@ function renderAudit(){
     var tgt=e.target||e.hostname||'-';
     var cmd=e.redactedCommand||e.command||'-';
     var risk=esc(e.risk||'?');
+    // V0.4.3: result carries commandStatus. A COMPLETED exchange with a
+    // non-zero exit is a FAILED command and must not look healthy.
+    var status=String(e.result||'?');
+    var exitN=e.exitCode;
+    var bad=(status!=='SUCCESS'&&status!=='COMPLETED'&&status!=='ok'&&status!=='RUNNING'&&status!=='')
+      || (typeof exitN==='number'&&exitN!==0);
     return '<tr><td class="time">'+esc(fmtTime(e.timestamp))+'</td>'
       +'<td class="op">'+esc(e.operation)+'</td>'
       +'<td class="tgt" title="'+esc(tgt)+'">'+esc(tgt)+'</td>'
-      +'<td class="risk risk-'+risk+'">'+risk+' / '+esc(e.result||'?')+'</td>'
+      +'<td class="risk risk-'+risk+'">'+risk+' / '+esc(status)+(bad?' <span class="bad">exit '+esc(String(exitN!=null?exitN:'?'))+'</span>':'')+'</td>'
       +'<td class="cmd">'+esc(cmd)+'</td></tr>';
   }).join('');
   $('rows').innerHTML=rows;
@@ -770,6 +777,27 @@ function lastSeqOf(events: TerminalEvent[]): number {
 }
 
 /**
+ * V0.4.3: connector-internal bookkeeping the user must never see in the live
+ * terminal — the `__dsh_rc=$?` capture line, the completion/probe markers, and
+ * the printf wrapper that prints them.
+ *
+ * This is a DISPLAY filter only. The raw events stay in the ring buffer and in
+ * the audit JSONL, so the evidence trail an investigator needs is intact.
+ */
+const INTERNAL_MARKER_LINE = /^\s*(__dsh_rc=|printf\s+'?\\n?__DSH_JS_(DONE|PROBE)|__DSH_JS_(DONE|PROBE)(_END)?_)/
+
+export function stripInternalMarkers(event: TerminalEvent): TerminalEvent {
+  if (event.type !== 'output' && event.type !== 'input') return event
+  const data = event.data
+  if (!data.includes('__dsh_rc') && !data.includes('__DSH_JS_')) return event
+  const kept = data
+    .split('\n')
+    .filter((line) => !INTERNAL_MARKER_LINE.test(line) && !line.includes('__DSH_JS_') && !line.includes('__dsh_rc'))
+    .join('\n')
+  return { ...event, data: kept }
+}
+
+/**
  * V0.4.1: project the last topology into a target -> roles map so the 资产 tab
  * can render a 角色 column. Tolerant of the loosely-typed stored node shape:
  * a node without roles simply does not appear.
@@ -875,7 +903,16 @@ export function startAuditViewer(
           byTarget[targetName] = (byTarget[targetName] ?? 0) + 1
           if (day.length > 0) byDayMap[day] = (byDayMap[day] ?? 0) + 1
           const approvalPending = e['approvalRequired'] === true && String(e['approvalResult']) === 'pending'
-          if (String(e['result'] ?? '') !== 'COMPLETED' || approvalPending) failed += 1
+          // V0.4.3: `result` now carries commandStatus (SUCCESS/EXIT_NONZERO/
+          // TIMEOUT/...). Judging failure on result !== 'COMPLETED' alone hid
+          // real failures: `jps -lv` exiting 127 was recorded COMPLETED and
+          // counted as healthy. Fall back to the exit code so older records
+          // (pre-V0.4.3) are still classified correctly.
+          const status = String(e['result'] ?? '')
+          const exitCode = e['exitCode']
+          const statusFailed = status !== '' && status !== 'SUCCESS' && status !== 'COMPLETED' && status !== 'ok' && status !== 'RUNNING'
+          const exitFailed = typeof exitCode === 'number' && exitCode !== 0
+          if (statusFailed || exitFailed || approvalPending) failed += 1
         }
         const byDay = Object.keys(byDayMap).sort().map((d) => [d.slice(5), byDayMap[d] ?? 0] as [string, number])
         sendJson(res, {
@@ -979,6 +1016,11 @@ export function startAuditViewer(
         for (const [id, bundle] of registry.snapshot()) {
           let events = bundle.observer.snapshotSince(since)
           if (events.length > TERMINAL_TAIL_EVENTS) events = events.slice(-TERMINAL_TAIL_EVENTS)
+          // V0.4.3: the live terminal is a USER view. The connector's own
+          // bookkeeping (`__dsh_rc`, __DSH_JS_DONE_/PROBE_ markers and the
+          // printf wrapper) is stripped here — the raw events stay in the ring
+          // buffer and the audit JSONL, so the evidence trail is untouched.
+          events = events.map(stripInternalMarkers)
           sessions.push({ id, status: bundle.manager.status(), lastSeq: lastSeqOf(bundle.observer.snapshot()), events })
         }
         sendJson(res, { sessions })
@@ -1060,18 +1102,22 @@ function consoleUrl(port: number): string {
 
 /**
  * Heartbeat a per-process discovery file:
- *   data/consoles/<pid>.json = { pid, port, url, startedAt, heartbeatAt }
+ *   data/consoles/<pid>.json = { pid, port, startedAt, heartbeatAt, tokenExpiresAt }
  * Stale files (heartbeat older than 20s => the conversation/process is gone)
  * are pruned, so external tools can enumerate live consoles by listing the dir.
+ *
+ * V0.4.3 SECURITY: the file must NEVER contain the tokenized URL. Any local
+ * process (or a sync agent watching the workspace) could otherwise read the
+ * token off disk and reach the console, defeating the token entirely. The
+ * token lives only in this process's memory and is handed to the user through
+ * the MCP response (consoleHintForModel).
  */
-/** Best-effort write of this process's discovery file (heartbeat + rotation). */
 function writeConsoleFile(): void {
   if (consoleFile === null) return
   try {
     writeFileSync(consoleFile, JSON.stringify({
       pid: process.pid,
       port: consolePort,
-      url: viewerUrl,
       startedAt: consoleStartedAt,
       heartbeatAt: new Date().toISOString(),
       tokenExpiresAt: consoleTokenExpiresAt !== null ? new Date(consoleTokenExpiresAt).toISOString() : null,

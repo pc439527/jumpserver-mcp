@@ -57,12 +57,23 @@ export function toLosslessJsonValue<T>(value: T): T {
 }
 
 /**
- * Resolve the session scope id. MCP stdio is a process-per-client model; each
- * WorkBuddy conversation that spawns this server gets its own registry, so a
- * fixed scope is authoritative. Override with JUMPSERVER_MCP_SESSION when one
- * server process is intentionally shared by several conversations.
+ * Resolve the session scope id, in priority order:
+ *
+ *  1. `exec.sessionId` — the transport session the HOST assigned. Present when
+ *     a single server process serves several conversations (HTTP/SSE, or a
+ *     host that multiplexes). This is the only way to keep conversations
+ *     apart inside one process.
+ *  2. `JUMPSERVER_MCP_SESSION` — explicit operator override, for deployments
+ *     that pin one scope per spawned process.
+ *  3. `ANONYMOUS_SESSION` — the stdio default. MCP stdio is a
+ *     process-per-client model: each WorkBuddy conversation spawns its own
+ *     server, so a single fixed scope IS the conversation. Reusing one process
+ *     across conversations without (1) or (2) collapses them into one session,
+ *     which is why the runtime self-check refuses that combination.
  */
-export function sessionIdOf(_exec: ToolRunContext): string {
+export function sessionIdOf(exec: ToolRunContext): string {
+  const fromTransport = exec.sessionId
+  if (fromTransport !== undefined && fromTransport.length > 0) return fromTransport
   const env = process.env['JUMPSERVER_MCP_SESSION']
   return env !== undefined && env.length > 0 ? env : ANONYMOUS_SESSION
 }
@@ -117,17 +128,25 @@ export function execOutcomeToValue(status: SessionStatus & { configured: boolean
     case 'completed':
       return dropNulls({
         ...base,
+        // V0.4.3: a COMPLETED exchange is not a SUCCESSFUL command. `jps -lv`
+        // exiting 127 must NOT be reported as ok=true.
+        ok: outcome.commandStatus === 'SUCCESS',
         completed: true,
         executionState: 'COMPLETED',
+        commandStatus: outcome.commandStatus,
         exitCode: outcome.exitCode,
         output: outcome.output,
         truncated: outcome.truncated,
+        ...(outcome.commandStatus === 'SUCCESS'
+          ? {}
+          : { code: 'COMMAND_EXIT_NONZERO', message: 'command exited with code ' + String(outcome.exitCode) }),
       } as unknown as Record<string, unknown>) as unknown as ResultValue
     case 'timeout':
       return dropNulls({
         ...base,
         ok: false,
         code: 'COMMAND_TIMEOUT',
+        commandStatus: outcome.commandStatus,
         message:
           outcome.executionState === 'TIMEOUT'
             ? 'command timed out; the shell was interrupted (Ctrl+C) and re-verified - it remains usable'
@@ -142,6 +161,7 @@ export function execOutcomeToValue(status: SessionStatus & { configured: boolean
         ...base,
         ok: false,
         code: 'CONNECTION_LOST',
+        commandStatus: outcome.commandStatus,
         message: 'SSH connection lost during command execution',
         completed: false,
         executionState: 'UNKNOWN',
@@ -213,7 +233,8 @@ export function renderBatchResult(tasks: TargetBatchResult[]): ResultValue {
     totalDurationMs += durationMs
     if (task.error !== null) failed += 1
     for (const cmd of task.commands) {
-      if (cmd.error !== null) failed += 1
+      // V0.4.3: a non-zero exit / timeout is a FAILURE, not a completed command.
+      if (cmd.error !== null || (cmd.exitCode !== null && cmd.exitCode !== 0)) failed += 1
     }
     lines.push('target=' + task.target + ' hostname=' + (task.hostname ?? '?') + ' commands=' + task.commands.length)
     if (task.error !== null) lines.push('  error=' + task.error.code + ': ' + task.error.message)
@@ -224,7 +245,7 @@ export function renderBatchResult(tasks: TargetBatchResult[]): ResultValue {
         lines.push('    error=' + cmd.error.code + ': ' + cmd.error.message)
         continue
       }
-      lines.push('    exitCode=' + rc + ' state=' + cmd.executionState + ' durationMs=' + cmd.durationMs)
+      lines.push('    exitCode=' + rc + ' status=' + cmd.commandStatus + ' state=' + cmd.executionState + ' durationMs=' + cmd.durationMs)
       const out = cmd.output.trim()
       if (out.length > 0) {
         lines.push('    --- output ---')

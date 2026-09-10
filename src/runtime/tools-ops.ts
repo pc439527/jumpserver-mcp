@@ -22,7 +22,7 @@ import { resolveRunbook, runRunbook, type RunbookResult } from '../jumpserver/ru
 import { compareTargets, type CompareResult } from '../jumpserver/compare.js'
 import { diffBaseline, type Baseline, type BaselineHost, type DriftResult } from './baseline-store.js'
 import { requireTargetAllowed } from '../security/target-scope.js'
-import { classifyCommand } from '../security/permission.js'
+import { gateCommandForNavigation } from '../security/permission-gate.js'
 import { JumpServerError } from '../jumpserver/errors.js'
 import { redactCommandSecrets } from '../security/command-redaction.js'
 import { guardText, guardValue, type ResultValue } from './tools-common.js'
@@ -49,7 +49,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_inspect', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_inspect', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
         const blocked = host.requireGrant(exec)
         if (blocked !== null) return render(blocked)
@@ -91,7 +91,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_topology', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_topology', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
         const blocked = host.requireGrant(exec)
         if (blocked !== null) return render(blocked)
@@ -146,7 +146,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_profile_run', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_profile_run', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
         const blocked = host.requireGrant(exec)
         if (blocked !== null) return render(blocked)
@@ -183,7 +183,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_compare', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_compare', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
         const blocked = host.requireGrant(exec)
         if (blocked !== null) return render(blocked)
@@ -220,7 +220,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_baseline_capture', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_baseline_capture', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
         const blocked = host.requireGrant(exec)
         if (blocked !== null) return render(blocked)
@@ -271,7 +271,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_baseline_compare', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_baseline_compare', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
         const blocked = host.requireGrant(exec)
         if (blocked !== null) return render(blocked)
@@ -303,7 +303,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       inputSchema: {},
     },
     async (_args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_interrupt', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_interrupt', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolText(await guardValue(exec, async (): Promise<ResultValue> => {
         const blocked = host.requireGrant(exec)
         if (blocked !== null) return blocked
@@ -342,20 +342,17 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_job_start', callId: extra.requestId, signal: extra.signal, confirm: args.confirm === true }
+      const exec: ToolRunContext = { name: 'jumpserver_job_start', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: args.confirm === true }
       return toolText(await guardValue(exec, async (): Promise<ResultValue> => {
         const blocked = host.requireGrant(exec)
         if (blocked !== null) return blocked
         requireTargetAllowed(host.getConfig(), args.target)
-        const classification = classifyCommand(args.command)
-        if (classification.risk !== 'READ' && exec.confirm !== true) {
-          throw new JumpServerError(
-            'COMMAND_APPROVAL_REQUIRED',
-            '【未执行】流式任务命令被分类为 ' + classification.risk + '（规则 ' + classification.ruleId + '：' + classification.reason + '）。\n' +
-              '目标：' + args.target + '\n命令：' + redactCommandSecrets(args.command) + '\n' +
-              '确认后请用同样的参数并带上 confirm:true 重试；否则请改用只读命令（如 tail -f / journalctl -f）。',
-          )
-        }
+        const bundle = host.bundleFor(exec)
+        // V0.4.3: job_start runs through the SAME gate as every other
+        // execution tool. Before this it classified + asked for confirmation
+        // itself, so a READ_ONLY deployment could still start a MODIFY job
+        // with confirm:true, and the audit hardcoded risk:'READ'.
+        const gated = await gateCommandForNavigation(host.servicesFor(bundle), exec, args.command)
         const job = await runtime.jobs.start({
           sessionId: host.sessionIdOf(exec),
           target: args.target,
@@ -363,6 +360,16 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           maxDurationMs: args.maxDuration !== undefined ? args.maxDuration * 1000 : undefined,
           signal: exec.signal,
           toolCallId: String(exec.callId),
+          classification: {
+            risk: gated.classification.risk,
+            reason: gated.classification.reason,
+            ruleId: gated.classification.ruleId,
+            confidence: gated.classification.confidence,
+            classifierVersion: gated.classification.classifierVersion,
+            normalizedCommand: gated.classification.normalizedCommand,
+          },
+          approvalRequired: gated.approvalRequired,
+          approvalResult: gated.approvalRequired ? 'approved' : 'none',
         })
         return {
           ok: true,
@@ -370,6 +377,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           target: job.target,
           hostname: job.hostname,
           state: job.state,
+          risk: gated.classification.risk,
           maxDurationMs: job.maxDurationMs,
           message: 'job started: 用 jumpserver_job_read("' + job.id + '") 读取增量输出，jumpserver_job_stop("' + job.id + '") 结束。',
         } as unknown as ResultValue
@@ -390,7 +398,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_job_read', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_job_read', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
         const job = runtime.jobs.read(args.jobId)
         if (job === null) return 'code: UNKNOWN_JOB\nno job with id ' + args.jobId
@@ -418,16 +426,21 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       },
     },
     async (args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_job_stop', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_job_stop', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolText(await guardValue(exec, async (): Promise<ResultValue> => {
         const job = await runtime.jobs.stop(args.jobId)
+        // V0.4.3: LOST means Ctrl+C was sent but the shell could not be
+        // re-proved — the job is over, but the session is NOT usable.
+        const lost = job.state === 'LOST'
         return {
-          ok: true,
+          ok: !lost,
           jobId: job.id,
           state: job.state,
           elapsedMs: (job.stoppedAt ?? Date.now()) - job.startedAt,
           bytes: job.bytes,
-          message: 'job stopped; the shell is available again',
+          message: lost
+            ? 'job stopped, but the remote shell could NOT be re-verified; the session collapsed to UNKNOWN - reconnect before running anything else'
+            : 'job stopped; the shell was re-verified and is available again',
         } as unknown as ResultValue
       }))
     },
@@ -441,7 +454,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       annotations: { readOnlyHint: true },
     },
     async (_args, extra) => {
-      const exec: ToolRunContext = { name: 'jumpserver_jobs', callId: extra.requestId, signal: extra.signal, confirm: false }
+      const exec: ToolRunContext = { name: 'jumpserver_jobs', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
         const jobs = runtime.jobs.list()
         if (jobs.length === 0) return 'jobs=0 (没有流式任务)'
@@ -489,6 +502,7 @@ export function renderRunbook(result: RunbookResult): string {
     }
     for (const step of target.steps) {
       const head = '  [' + step.id + ']' + (step.title !== null ? ' ' + step.title : '') +
+        (step.kind === 'profile' ? ' (profile ' + step.source + ', ' + String(step.commands.length) + ' probes)' : '') +
         ' exit=' + (step.exitCode ?? '?') + ' ' + step.durationMs + 'ms' + (step.truncated ? ' (truncated)' : '') +
         (step.check !== null ? ' -> ' + step.check.verdict.toUpperCase() : '')
       lines.push(head)
@@ -497,6 +511,22 @@ export function renderRunbook(result: RunbookResult): string {
       }
       if (step.error !== null) {
         lines.push('    !! ' + step.error.code + ': ' + step.error.message)
+        continue
+      }
+      // V0.4.3: a profile step is ONE row; its per-probe output is nested so
+      // the model still sees every probe without the step being repeated.
+      if (step.kind === 'profile' && step.commands.length > 1) {
+        for (const cmd of step.commands) {
+          const probeHead = '    - ' + (cmd.probe ?? '?') + ': ' + cmd.command +
+            ' exit=' + (cmd.exitCode ?? '?')
+          lines.push(probeHead)
+          if (cmd.error !== null) {
+            lines.push('      !! ' + cmd.error.code + ': ' + cmd.error.message)
+            continue
+          }
+          const probeBody = cmd.output.trim()
+          lines.push(probeBody.length > 0 ? indent(probeBody, '      ') : '      (无输出)')
+        }
         continue
       }
       const body = step.output.trim()

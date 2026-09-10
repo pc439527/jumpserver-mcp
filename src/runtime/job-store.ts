@@ -14,7 +14,7 @@
 import { randomHex } from '../jumpserver/timing.js'
 import type { SessionRegistry } from '../jumpserver/session-registry.js'
 
-export type JobState = 'RUNNING' | 'STOPPED' | 'LOST'
+export type JobState = 'RUNNING' | 'STOPPING' | 'VERIFYING' | 'STOPPED' | 'LOST'
 
 export interface JobRecord {
   id: string
@@ -46,6 +46,11 @@ export interface JobStartOptions {
   maxDurationMs?: number
   signal?: AbortSignal
   toolCallId?: string
+  /** V0.4.3: real classification — the audit must NOT hardcode READ. */
+  classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
+  /** V0.4.3: approval outcome recorded in the audit. */
+  approvalRequired?: boolean
+  approvalResult?: string
 }
 
 export class JobStore {
@@ -72,6 +77,9 @@ export class JobStore {
       command: options.command,
       signal: options.signal,
       toolCallId: options.toolCallId,
+      classification: options.classification,
+      approvalRequired: options.approvalRequired,
+      approvalResult: options.approvalResult,
     })
     const record: JobRecord = {
       id,
@@ -128,23 +136,35 @@ export class JobStore {
   }
 
   private finish(job: JobRecord, state: JobState, error: string | null): void {
-    if (job.state === 'RUNNING') {
-      job.state = state
-      job.stoppedAt = Date.now()
-      job.error = error
-    }
+    if (job.state === 'STOPPED' || job.state === 'LOST') return
+    job.state = state
+    job.stoppedAt = Date.now()
+    job.error = error
   }
 
-  /** Stop a job: Ctrl+C on the PTY (out-of-band) + release the shell. */
+  /**
+   * Stop a job: Ctrl+C on the PTY (out-of-band), then PROVE the shell came
+   * back. V0.4.3: the state walks RUNNING -> STOPPING -> VERIFYING ->
+   * STOPPED/LOST so a wedged PTY is reported as LOST instead of being
+   * silently presented as a healthy stopped job.
+   */
   async stop(id: string): Promise<JobRecord> {
     const job = this.jobs.get(id)
     if (job === undefined) throw new Error('unknown job: ' + id)
     const bundle = this.registry.get(job.sessionId)
-    if (bundle !== undefined) {
+    if (job.state === 'RUNNING') {
+      job.state = 'STOPPING'
+      if (bundle !== undefined) job.state = 'VERIFYING'
       try {
-        await bundle.manager.stopJob(id)
-      } catch {
-        /* the shell may already be gone; the job is still marked stopped */
+        const outcome = bundle !== undefined ? await bundle.manager.stopJob(id) : { sent: false, verified: false }
+        if (!outcome.verified) {
+          this.finish(job, 'LOST', 'Ctrl+C sent but the remote shell could not be re-verified')
+          return job
+        }
+      } catch (error) {
+        // The shell may already be gone; the job is still terminal.
+        this.finish(job, 'LOST', error instanceof Error ? error.message : String(error))
+        return job
       }
     }
     this.finish(job, 'STOPPED', null)
