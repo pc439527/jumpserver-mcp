@@ -126,10 +126,12 @@ test('compare: a TIMEOUT target is reported as ok=false and excluded from the ma
   const oa2 = result.results.find((t) => t.target === 'oa-2')
   assert.equal(oa2.ok, false)
   assert.equal(oa2.exitCode, null)
-  assert.match(String(oa2.error?.code ?? ''), /COMMAND_EXIT_NONZERO|TIMEOUT|UNKNOWN/)
+  // V0.4.5 locks the CODE: a timeout is a timeout, not a fake non-zero exit.
+  assert.equal(oa2.error?.code, 'COMMAND_TIMEOUT')
+  assert.match(String(oa2.error?.message ?? ''), /timed out/)
 })
 
-test('compare: a CONNECTION_LOST target is reported as ok=false', async () => {
+test('compare: a CONNECTION_LOST target is reported as ok=false with its own code', async () => {
   const manager = makeFakeManager({
     'oa-1': [{ ...successCmd }],
     'oa-2': [{ ...lostCmd }],
@@ -141,4 +143,20 @@ test('compare: a CONNECTION_LOST target is reported as ok=false', async () => {
   )
   const oa2 = result.results.find((t) => t.target === 'oa-2')
   assert.equal(oa2.ok, false)
+  assert.equal(oa2.error?.code, 'CONNECTION_LOST', 'a lost transport must not masquerade as EXIT_NONZERO')
+})
+
+test('compare: an EXIT_NONZERO target keeps COMMAND_EXIT_NONZERO', async () => {
+  const manager = makeFakeManager({
+    'oa-1': [{ ...successCmd }],
+    'oa-2': [{ ...exitNonZeroCmd }],
+  })
+  const result = await compareTargets(
+    manager,
+    () => ({}),
+    { command: 'jps -lv', targets: ['oa-1', 'oa-2'] },
+  )
+  const oa2 = result.results.find((t) => t.target === 'oa-2')
+  assert.equal(oa2.error?.code, 'COMMAND_EXIT_NONZERO')
+  assert.match(String(oa2.error?.message ?? ''), /127/)
 })

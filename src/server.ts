@@ -20,6 +20,7 @@ import { createRuntime, type Runtime } from './runtime/runtime.js'
 import { auditViewerUrl, consoleTokenInfo, readAuditEntries, rotateConsoleAccessToken, stripInternalMarkers } from './runtime/audit-viewer.js'
 import { registerOpsTools } from './runtime/tools-ops.js'
 import { toolText, toolTextRaw } from './runtime/tool-host.js'
+import { projectSessionScope } from './runtime/session-scope.js'
 import { formatAuditTime } from './runtime/time.js'
 import { requireTargetAllowed } from './security/target-scope.js'
 import type { ToolRunContext } from './runtime/context.js'
@@ -98,10 +99,11 @@ async function main(): Promise<void> {
           ...runtimeVersion(),
           // V0.4.3: state the conversation-isolation mode so an operator can
           // tell process-per-conversation from a multiplexed host.
-          // V0.4.4: when the actual transport carried a sessionId we are
-          // talking transport-scoped; the runtime-level mode is irrelevant
-          // for THIS request — surface what the user is actually on.
-          sessionScope: sessionIdOf(exec).length > 0 ? 'transport' : runtime.sessionScope,
+          // V0.4.5: derived from whether the TRANSPORT carried a sessionId.
+          // V0.4.4 asked sessionIdOf(exec).length > 0, which is always true
+          // (it falls back to JUMPSERVER_MCP_SESSION / ANONYMOUS_SESSION), so
+          // every WorkBuddy stdio conversation claimed to be transport-scoped.
+          sessionScope: projectSessionScope(exec, runtime.sessionScope),
           sessionId: sessionIdOf(exec),
           consoleUrl: auditViewerUrl(),
           consoleTokenTtlMinutes: tokenInfo.ttlMinutes,

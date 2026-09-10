@@ -33,6 +33,7 @@ import type { JobStore } from './job-store.js'
 import type { TopologyStore } from './topology-store.js'
 import type { AssetStore } from './asset-store.js'
 import type { BaselineStore } from './baseline-store.js'
+import { interruptSession } from './interrupt.js'
 
 export interface AuditViewerOptions {
   enabled: boolean
@@ -995,18 +996,18 @@ export function startAuditViewer(
         const only = typeof body['sessionId'] === 'string' && body['sessionId'].length > 0 ? body['sessionId'] : null
         let interrupted = 0
         let verified = false
+        let jobsStopped = 0
         for (const [id, bundle] of registry.snapshot()) {
           if (only !== null && id !== only) continue
-          const result = await bundle.manager.interrupt()
-          if (result.sent) {
-            interrupted += 1
-            verified = verified || result.verified
-          }
+          // V0.4.5: the console uses the SAME single-entry interrupt as the
+          // MCP tool. Previously it called manager.interrupt() and THEN
+          // jobs.stopAll(), which sent two Ctrl+C to a streaming job.
+          const outcome = await interruptSession(services.jobs, bundle.manager, id, 'console interrupt')
+          if (outcome.sent) interrupted += 1
+          if (outcome.verified) verified = true
+          jobsStopped += outcome.jobsStopped
         }
-        if (services.jobs !== null && services.jobs !== undefined) {
-          await services.jobs.stopAll(only ?? undefined).catch(() => 0)
-        }
-        sendJson(res, { interrupted, verified })
+        sendJson(res, { interrupted, verified, jobsStopped })
         return
       }
       if (href === '/api/terminal') {

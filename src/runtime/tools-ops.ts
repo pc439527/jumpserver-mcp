@@ -27,6 +27,8 @@ import { JumpServerError } from '../jumpserver/errors.js'
 import { redactCommandSecrets } from '../security/command-redaction.js'
 import { guardText, guardValue, type ResultValue } from './tools-common.js'
 import { createToolHost, toolText, toolTextRaw, type ToolHost } from './tool-host.js'
+// V0.4.5: the MCP interrupt tool and the console share ONE stop entry point.
+import { interruptSession } from './interrupt.js'
 import { randomHex } from '../jumpserver/timing.js'
 import type { ToolRunContext } from './context.js'
 
@@ -308,21 +310,24 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
         const blocked = host.requireGrant(exec)
         if (blocked !== null) return blocked
         const bundle = host.bundleFor(exec)
-        const jobs = runtime.jobs.list().filter((j) => j.state === 'RUNNING')
-        const result = await bundle.manager.interrupt()
-        for (const job of jobs) await runtime.jobs.stop(job.id).catch(() => undefined)
+        // V0.4.5: ONE owner per PTY. If a streaming job owns this shell, the
+        // stop MUST go through JobStore.stop (one ^C + verify); calling
+        // manager.interrupt() first and jobs.stop() second sent TWO Ctrl+C to
+        // the same job. interruptSession() decides, and the console calls it too.
+        const sessionId = host.sessionIdOf(exec)
+        const result = await interruptSession(runtime.jobs, bundle.manager, sessionId)
         return {
           ok: result.sent,
           code: result.sent ? undefined : 'NOTHING_TO_INTERRUPT',
-          message: result.sent
-            ? (result.verified
-                ? '中断信号已发送，远程 Shell 已重新验证可用（ASSET_SHELL）'
-                : '中断信号已发送，但 Shell 未能重新验证；会话已降级为 UNKNOWN，需要重连后再操作')
-            : '当前没有可中断的活动会话或远端 Shell',
+          message: result.message,
           state: result.state,
           target: result.target,
           interrupted: result.sent,
           verified: result.verified,
+          mode: result.mode,
+          jobId: result.jobId ?? undefined,
+          jobState: result.jobState ?? undefined,
+          jobsStopped: result.jobsStopped,
         } as unknown as ResultValue
       }))
     },
@@ -393,10 +398,11 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     'jumpserver_job_read',
     {
       description:
-        'Read the output collected so far by a streaming job (jumpserver_job_start). Returns only what arrived since the last read unless full:true. Use it to watch logs while you work: "keep reading the OA log" = call this repeatedly.',
+        'Read the output of a streaming job (jumpserver_job_start) as a CURSOR READ: by default it returns only what arrived after the previous read and reports nextSeq, which you pass back as sinceSeq to resume exactly where you left off (safe to retry, never re-consumes old lines). full:true returns the whole buffered output instead. Use it to watch logs while you work: "keep reading the OA log" = call this repeatedly.',
       inputSchema: {
         jobId: z.string().describe('Job id returned by jumpserver_job_start, e.g. jsjob_8fd11a'),
-        full: z.boolean().optional().describe('Return the whole buffered output instead of only the new tail (default false).'),
+        sinceSeq: z.number().int().min(0).optional().describe('Absolute cursor to resume from — pass the nextSeq of the previous read. Omit to continue from the last read.'),
+        full: z.boolean().optional().describe('Return the whole buffered output instead of only what arrived since the cursor (default false).'),
         maxChars: z.number().int().min(200).max(200000).optional().describe('Cap the returned characters (default 8000).'),
       },
       annotations: { readOnlyHint: true },
@@ -404,17 +410,23 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_job_read', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
-        const job = runtime.jobs.read(args.jobId)
-        if (job === null) return 'code: UNKNOWN_JOB\nno job with id ' + args.jobId
-        const maxChars = args.maxChars ?? 8000
-        const full = args.full === true
-        const output = full ? job.output : tailSince(job.output, maxChars)
+        const sessionId = host.sessionIdOf(exec)
+        const job = runtime.jobs.read(args.jobId, {
+          sessionId,
+          maxChars: args.maxChars ?? 8000,
+          full: args.full === true,
+          sinceSeq: args.sinceSeq ?? null,
+        })
+        if (job === null) return 'code: UNKNOWN_JOB\nno job with id ' + args.jobId + ' in this conversation'
         return [
           'jobId=' + job.id + ' state=' + job.state + ' target=' + job.target +
             ' elapsedMs=' + (Date.now() - job.startedAt) + ' bytes=' + job.bytes + (job.truncated ? ' (buffer truncated)' : ''),
           '$ ' + redactCommandSecrets(job.command),
-          '--- output (' + (full ? 'full' : 'tail') + ') ---',
-          output.length > 0 ? output : '(还没有输出)',
+          'nextSeq=' + job.nextSeq + ' mode=' + (args.full === true ? 'full' : 'cursor') +
+            (job.partial ? ' partial=true (more buffered: read again with the same nextSeq)' : '') +
+            (job.droppedChars > 0 ? ' droppedChars=' + job.droppedChars + ' (older output evicted)' : ''),
+          '--- output (' + (args.full === true ? 'full' : 'cursor') + ') ---',
+          job.output.length > 0 ? job.output : '(还没有输出)',
           ...(job.error !== null ? ['note: ' + job.error] : []),
         ].join('\n')
       }))
@@ -432,7 +444,12 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_job_stop', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolText(await guardValue(exec, async (): Promise<ResultValue> => {
-        const job = await runtime.jobs.stop(args.jobId)
+        const sessionId = host.sessionIdOf(exec)
+        // V0.4.5: never touch another conversation's job.
+        if (runtime.jobs.get(args.jobId, sessionId) === null) {
+          return { ok: false, code: 'UNKNOWN_JOB', message: 'no job with id ' + args.jobId + ' in this conversation' }
+        }
+        const job = await runtime.jobs.stop(args.jobId, null, sessionId)
         // V0.4.3: LOST means Ctrl+C was sent but the shell could not be
         // re-proved — the job is over, but the session is NOT usable.
         const lost = job.state === 'LOST'
@@ -460,7 +477,9 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     async (_args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_jobs', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
-        const jobs = runtime.jobs.list()
+        // V0.4.5: jobs are conversation-scoped — a multiplexed process must not
+        // let conversation B list (or stop) conversation A's streaming jobs.
+        const jobs = runtime.jobs.list(host.sessionIdOf(exec))
         if (jobs.length === 0) return 'jobs=0 (没有流式任务)'
         return ['jobs=' + jobs.length, ...jobs.map((j) =>
           [j.id, j.state, j.target, (j.hostname ?? '?'), String(Date.now() - j.startedAt) + 'ms', j.bytes + 'B', redactCommandSecrets(j.command)].join(' | '),
@@ -631,10 +650,6 @@ export function renderCompare(result: CompareResult): string {
     }
   }
   return lines.join('\n')
-}
-
-function tailSince(output: string, maxChars: number): string {
-  return output.length <= maxChars ? output : output.slice(output.length - maxChars)
 }
 
 /** Resolve explicit targets or a configured asset group into a target list. */

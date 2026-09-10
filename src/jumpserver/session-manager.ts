@@ -320,6 +320,16 @@ export class SessionManager {
     return this.activeJob !== null
   }
 
+  /**
+   * V0.4.5: which job currently owns this session's PTY, or null. The JobStore
+   * pump uses this as the authority for "does this job still own a shell?",
+   * instead of inferring ownership from the DISCONNECTED state — a reconnect
+   * that completed within one pump interval used to leave a dead job RUNNING.
+   */
+  activeJobId(): string | null {
+    return this.activeJob
+  }
+
   /** Fail fast when a streaming job owns the shell instead of corrupting its output. */
   private assertNoActiveJob(): void {
     if (this.stoppingJob !== null) {
@@ -328,6 +338,19 @@ export class SessionManager {
     if (this.activeJob !== null) {
       throw new JumpServerError('SESSION_BUSY', 'a streaming job (' + this.activeJob + ') owns this shell; stop it with jumpserver_job_stop first')
     }
+  }
+
+  /**
+   * V0.4.5: drop PTY ownership. Called whenever the transport underneath the
+   * session disappears — close(), dispose(), transport loss, or a reconnect
+   * that replaces the session object. Without this a streaming job kept a
+   * ghost claim on a shell that no longer exists, so after a reconnect every
+   * exec / job_start answered SESSION_BUSY forever, and the JobStore (which
+   * only looked at DISCONNECTED) could keep reporting a lost job as RUNNING.
+   */
+  private releasePtyOwnership(): void {
+    this.activeJob = null
+    this.stoppingJob = null
   }
 
   /** Public connect: serialized through the session queue. */
@@ -346,6 +369,9 @@ export class SessionManager {
       return { sent: false, verified: false, state: this.status().state, target: this.status().target }
     }
     const result = await session.interrupt()
+    // V0.4.5: an out-of-band ^C ends the job's claim on the PTY. Only
+    // `activeJob` is dropped here — `stoppingJob` must keep guarding a
+    // concurrent stopJob() whose probe is still in flight.
     this.activeJob = null
     await this.audit({
       operation: 'interrupt',
@@ -386,6 +412,8 @@ export class SessionManager {
     } catch {
       /* stale session */
     }
+    // V0.4.5: the previous transport is gone; no job may keep claiming its PTY.
+    this.releasePtyOwnership()
     const observer = this.options.observer
     let prevState: SessionState | null = null
     const session = new JumpServerSession(toRuntimeConfig(cfg, password, this.options.wireFactory), {
@@ -585,9 +613,11 @@ export class SessionManager {
         // hardcoded READ hid `rm -rf` behind a confirm:true from the audit.
         risk: request.classification?.risk ?? 'UNKNOWN',
         classification: request.classification,
-        actor: 'AGENT',
+          actor: 'AGENT',
         approvalRequired: request.approvalRequired ?? false,
-        approvalResult: 'approved',
+        // V0.4.5: a READ job that never needed approval must not be audited as
+        // `approved` — that made every tail -f look like a human decision.
+        approvalResult: request.approvalRequired === true ? 'approved' : 'none',
         taskId: request.jobId,
         toolCallId: request.toolCallId,
         result: 'RUNNING',
@@ -930,6 +960,9 @@ export class SessionManager {
       this.cancelReconnect()
       // The PTY is gone; a stale asset capture must not survive a new session.
       this.assetCache = null
+      // V0.4.5: and neither must a stale job claim — the next connect() must
+      // not inherit a SESSION_BUSY ghost from the closed session.
+      this.releasePtyOwnership()
       const session = this.session
       this.session = null
       if (session !== null) {
@@ -997,6 +1030,10 @@ export class SessionManager {
 
   private onSessionLost(): void {
     if (this.disposed) return
+    // V0.4.5: the wire is gone, so any job that owned this PTY lost its shell
+    // right now — regardless of whether an auto-reconnect lands a second
+    // later. The JobStore reads activeJobId() and marks the job LOST.
+    this.releasePtyOwnership()
     const cfg = this.options.getConfig()
     if (!cfg.autoReconnect) return
     const session = this.session

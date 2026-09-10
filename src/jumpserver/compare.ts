@@ -17,6 +17,7 @@
  */
 import { classifyCommand } from '../security/permission.js'
 import { requireTargetAllowed } from '../security/target-scope.js'
+import { commandStatusToError } from './command-status.js'
 import { JumpServerError } from './errors.js'
 import { mapWithConcurrency } from './concurrency.js'
 import { resolveProfile } from './profiles.js'
@@ -280,7 +281,16 @@ export async function compareTargets(
           hostname: batch.hostname,
           ok: false,
           exitCode: failed.exitCode ?? null,
-          error: failed.error ?? { code: 'COMMAND_EXIT_NONZERO', message: 'commandStatus=' + failed.commandStatus },
+          // V0.4.4 excluded a failed probe from the diff but still reported
+          // EVERY failure as COMMAND_EXIT_NONZERO, so TIMEOUT / CONNECTION_LOST
+          // / UNKNOWN were indistinguishable to the caller. V0.4.5 decodes the
+          // commandStatus through the ONE shared mapping.
+          error:
+            failed.error ??
+            commandStatusToError(failed.commandStatus, { exitCode: failed.exitCode, executionState: failed.executionState }) ?? {
+              code: 'COMMAND_STATUS_UNKNOWN',
+              message: 'unknown commandStatus=' + failed.commandStatus,
+            },
           durationMs: 0,
           lines: [],
           truncated: false,

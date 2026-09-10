@@ -4,6 +4,8 @@
  * semantics: abort rethrows, everything else maps to a structured value).
  */
 import { AbortRequestedError, JumpServerError } from '../jumpserver/errors.js'
+// V0.4.5: one shared commandStatus -> error decode (exec + compare + runbook).
+import { commandStatusToError } from '../jumpserver/command-status.js'
 import type { ExecOutcome, SessionStatus } from '../jumpserver/session.js'
 import type { TargetBatchResult } from '../jumpserver/session-manager.js'
 import type { SessionBundle } from '../jumpserver/session-registry.js'
@@ -115,8 +117,20 @@ export function statusToValue(status: SessionStatus & { configured: boolean; per
   })
 }
 
-export function execOutcomeToValue(status: SessionStatus & { configured: boolean; permissionMode: string }, outcome: ExecOutcome): ResultValue {
-  const base = {
+/**
+ * V0.4.5: a COMPLETED exchange with a non-SUCCESS commandStatus becomes a
+ * structured failure. Derived from the shared commandStatus mapping so exec
+ * and compare can never report the same status with two different codes.
+ */
+function completedFailure(outcome: { commandStatus: string; exitCode: number; executionState: string }): { code?: string; message?: string } {
+  const failure = commandStatusToError(outcome.commandStatus, {
+    exitCode: outcome.exitCode,
+    executionState: outcome.executionState,
+  })
+  return failure === null ? {} : { code: failure.code, message: failure.message }
+}
+
+export function execOutcomeToValue(status: SessionStatus & { configured: boolean; permissionMode: string }, outcome: ExecOutcome): ResultValue {  const base = {
     ok: true as boolean,
     gateway: status.gateway,
     state: status.state,
@@ -137,9 +151,8 @@ export function execOutcomeToValue(status: SessionStatus & { configured: boolean
         exitCode: outcome.exitCode,
         output: outcome.output,
         truncated: outcome.truncated,
-        ...(outcome.commandStatus === 'SUCCESS'
-          ? {}
-          : { code: 'COMMAND_EXIT_NONZERO', message: 'command exited with code ' + String(outcome.exitCode) }),
+        // V0.4.5: one shared decode of commandStatus -> error code/message.
+        ...completedFailure(outcome),
       } as unknown as Record<string, unknown>) as unknown as ResultValue
     case 'timeout':
       return dropNulls({
