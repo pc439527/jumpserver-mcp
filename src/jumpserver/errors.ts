@@ -24,6 +24,12 @@ export const JUMP_ERROR_CODES = [
   'UNKNOWN_STATE',
   'TARGET_VERIFICATION_FAILED',
   'INVALID_GROUP',
+  // V0.4.0: target outside allowedTargets / inside deniedTargets.
+  'TARGET_DENIED',
+  // V0.4.0: no running command to interrupt, or nothing to interrupt.
+  'NOTHING_TO_INTERRUPT',
+  // V0.4.0: inspect/topology target list too large.
+  'TOO_MANY_TARGETS',
   // V0.3.1: an ops profile command the classifier does not confirm as READ.
   'PROFILE_RISK_MISMATCH',
 ] as const

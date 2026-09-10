@@ -23,6 +23,12 @@ export const auditRecordSchema = z.object({
   /** V0.3.1: approval gate outcomes. */
   approvalRequired: z.boolean().default(false),
   approvalResult: z.string().default('none'),
+  /** V0.4.0: AI task correlation (one MCP request / batch / job). */
+  toolCallId: z.string().optional(),
+  batchId: z.string().optional(),
+  taskId: z.string().optional(),
+  sequence: z.number().optional(),
+  batchIndex: z.number().optional(),
   permissionMode: z.string(),
   result: z.string(),
   exitCode: z.number().nullable(),

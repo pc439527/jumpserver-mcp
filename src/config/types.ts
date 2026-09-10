@@ -20,19 +20,9 @@ export const COMMAND_RISKS: readonly CommandRisk[] = ['READ', 'PRIVILEGED_READ',
 /** Legacy alias (V0.2.x LOW == privileged read). Kept for config compat. */
 export const LEGACY_RISK_LOW = 'LOW' as const
 
-/**
- * V0.2.7: how the HUAMN sidebar terminal input is gated (Agent commands keep
- * using permissionMode). FOLLOW_AGENT applies the same READ_ONLY/AUTO/FULL
- * matrix to manual input; CONFIRM_MODIFY (default) lets reads pass and asks
- * the user to confirm modifying commands; FULL_ACCESS is the old behavior.
- */
-export type ManualPolicy = 'FOLLOW_AGENT' | 'CONFIRM_MODIFY' | 'FULL_ACCESS'
-
 export interface JumpServerConfig {
   /** Master switch: when false every jumpserver_* tool refuses with DISABLED (default true) */
   enabled: boolean
-  /** Open the browser JumpServer Terminal drawer automatically on session page? (default true) */
-  autoOpenTerminal: boolean
   /** Terminal scrollback line budget (default 5000) */
   terminalScrollback: number
   /** Bastion gateway host (transport host), e.g. 203.0.113.10 */
@@ -58,8 +48,19 @@ export interface JumpServerConfig {
    * mode (default false — READ_ONLY only auto-runs plain READ).
    */
   privilegedReadInReadOnly?: boolean
-  /** V0.2.7: manual sidebar terminal input policy (default CONFIRM_MODIFY). */
-  manualPermissionMode?: ManualPolicy
+  /**
+   * V0.4.0 display timezone for audit timestamps (IANA name, default
+   * Asia/Shanghai). Storage stays UTC — only the console / jumpserver_audit
+   * rendering converts. Use "local" to follow the MCP host's own zone.
+   */
+  timeZone?: string
+  /**
+   * V0.4.0 scope guard: when set, only these targets may be entered/run
+   * (substring match on the requested target). Empty/absent = unrestricted.
+   */
+  allowedTargets?: string[]
+  /** V0.4.0 scope guard: these targets are always refused (checked first). */
+  deniedTargets?: string[]
   /** How long one capture of the KoKo 'p' asset list is cached per conversation (seconds; default 300). */
   assetCacheTtlSeconds?: number
   /**
@@ -109,8 +110,3 @@ export const MAX_COMMAND_TIMEOUT_MS = 600000
 export const MAX_ASSET_CAPTURE_BYTES = 256 * 1024
 
 export const DEFAULT_PASSWORD_ENV = 'JUMPSERVER_PASSWORD'
-
-/** Resolve the manual terminal policy with its default (CONFIRM_MODIFY). */
-export function manualPolicyOf(cfg: Pick<JumpServerConfig, 'manualPermissionMode'>): ManualPolicy {
-  return cfg.manualPermissionMode ?? 'CONFIRM_MODIFY'
-}

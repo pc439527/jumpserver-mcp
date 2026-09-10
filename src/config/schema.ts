@@ -4,7 +4,6 @@ import {
   DEFAULT_PASSWORD_ENV,
   DEFAULT_TERMINAL_SCROLLBACK,
   type JumpServerConfig,
-  type ManualPolicy,
   type PermissionMode,
 } from './types.js'
 
@@ -32,7 +31,6 @@ export type McpConfig = JumpServerConfig & {
 }
 
 const permissionModes = ['READ_ONLY', 'AUTO', 'FULL_ACCESS'] as const
-const manualPolicies = ['FOLLOW_AGENT', 'CONFIRM_MODIFY', 'FULL_ACCESS'] as const
 
 const configSchema = z.object({
   enabled: z.boolean().optional(),
@@ -46,7 +44,9 @@ const configSchema = z.object({
   idleTimeout: z.number().optional(),
   permissionMode: z.enum(permissionModes).optional(),
   privilegedReadInReadOnly: z.boolean().optional(),
-  manualPermissionMode: z.enum(manualPolicies).optional(),
+  timeZone: z.string().optional(),
+  allowedTargets: z.array(z.string()).optional(),
+  deniedTargets: z.array(z.string()).optional(),
   assetCacheTtlSeconds: z.number().optional(),
   assetGroups: z.record(z.object({ keywords: z.array(z.string()) })).optional(),
   autoReconnect: z.boolean().optional(),
@@ -69,7 +69,6 @@ export function parseConfig(input: unknown): McpConfig {
   const raw = configSchema.parse(input)
   const cfg: McpConfig = {
     enabled: raw.enabled ?? true,
-    autoOpenTerminal: true,
     terminalScrollback: raw.terminalScrollback ?? DEFAULT_TERMINAL_SCROLLBACK,
     host: raw.host,
     port: raw.port ?? 2222,
@@ -81,7 +80,9 @@ export function parseConfig(input: unknown): McpConfig {
     idleTimeout: raw.idleTimeout ?? 30,
     permissionMode: (raw.permissionMode ?? 'READ_ONLY') as PermissionMode,
     privilegedReadInReadOnly: raw.privilegedReadInReadOnly,
-    manualPermissionMode: raw.manualPermissionMode as ManualPolicy | undefined,
+    timeZone: raw.timeZone,
+    allowedTargets: raw.allowedTargets,
+    deniedTargets: raw.deniedTargets,
     assetCacheTtlSeconds: raw.assetCacheTtlSeconds ?? DEFAULT_ASSET_CACHE_TTL_SECONDS,
     assetGroups: raw.assetGroups,
     autoReconnect: raw.autoReconnect ?? true,

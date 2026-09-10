@@ -17,7 +17,11 @@ import { gateCommand, gateCommandForNavigation, gateCommandsForNavigation, type 
 import { JUMPSERVER_NOT_ARMED, NOT_ARMED_MESSAGE, type SessionGrant } from './security/grant.js'
 import { redactCommandSecrets } from './security/command-redaction.js'
 import { createRuntime, type Runtime } from './runtime/runtime.js'
-import { auditViewerUrl, consoleHintForModel, readAuditEntries } from './runtime/audit-viewer.js'
+import { auditViewerUrl, readAuditEntries } from './runtime/audit-viewer.js'
+import { registerOpsTools } from './runtime/tools-ops.js'
+import { toolText, toolTextRaw } from './runtime/tool-host.js'
+import { formatAuditTime } from './runtime/time.js'
+import { requireTargetAllowed } from './security/target-scope.js'
 import type { ToolRunContext } from './runtime/context.js'
 import {
   assetsToValue,
@@ -49,29 +53,10 @@ function requireGrant(grants: SessionGrant, runtime: Runtime, exec: ToolRunConte
   return grants.isGranted(sessionIdOf(exec)) ? null : notArmed()
 }
 
-/**
- * The console can only be raised by the HOST app. This hands its URL to the
- * model exactly once per process (= once per conversation), instructing it to
- * open the URL via present_files -> WorkBuddy built-in preview panel.
- * Never use a shell-open here: that lands in the OS default browser.
- */
-let toolCallCount = 0
-
-/** First response hands over the URL; every 20th repeats it so it cannot be missed. */
-function withConsoleHint(body: string): string {
-  toolCallCount += 1
-  if (toolCallCount !== 1 && toolCallCount % 20 !== 0) return body
-  const hint = consoleHintForModel()
-  return hint === null ? body : hint + '\n' + body
-}
-
-function text(value: ResultValue): { content: Array<{ type: 'text'; text: string }> } {
-  return { content: [{ type: 'text', text: withConsoleHint(renderResult(value)) }] }
-}
-
-function textRaw(value: string): { content: Array<{ type: 'text'; text: string }> } {
-  return { content: [{ type: 'text', text: withConsoleHint(value) }] }
-}
+// Console handover + text projection live in runtime/tool-host.ts so the ops
+// tool modules (inspect / topology / jobs) share the exact same behaviour.
+const text = toolText
+const textRaw = toolTextRaw
 
 const CONFIRM_DESCRIPTION =
   'Set to true ONLY after the user explicitly approved the listed command(s). ' +
@@ -197,10 +182,12 @@ async function main(): Promise<void> {
         if (blocked !== null) return blocked
         const bundle = bundleFor(exec, registry)
         const gated = await gateCommand(servicesFor(bundle), exec, args.command)
+        requireTargetAllowed(runtime.getConfig(), bundle.manager.status().target)
         const timeoutMs = args.timeout !== undefined ? Math.max(1, args.timeout) * 1000 : undefined
         const { status, outcome } = await bundle.manager.exec({
           command: args.command,
           timeoutMs,
+          toolCallId: String(exec.callId),
           risk: gated.risk,
           classification: gated.classification,
           approvalRequired: gated.approvalRequired,
@@ -231,11 +218,13 @@ async function main(): Promise<void> {
         if (blocked !== null) return blocked
         const bundle = bundleFor(exec, registry)
         const gated = await gateCommandForNavigation(servicesFor(bundle), exec, args.command)
+        requireTargetAllowed(runtime.getConfig(), args.target)
         const timeoutMs = args.timeout !== undefined ? Math.max(1, args.timeout) * 1000 : undefined
         const result = await bundle.manager.run({
           target: args.target,
           command: args.command,
           timeoutMs,
+          toolCallId: String(exec.callId),
           risk: gated.risk,
           classification: gated.classification,
           approvalRequired: gated.approvalRequired,
@@ -270,6 +259,7 @@ async function main(): Promise<void> {
         if (blocked !== null) return blocked
         const bundle = bundleFor(exec, registry)
         const executed: TargetBatchResult[] = []
+        const batchId = 'bat_' + Math.random().toString(36).slice(2, 8)
         for (const task of args.tasks) {
           if (exec.signal.aborted === true) throw new AbortRequestedError()
           const target = String(task.target ?? '')
@@ -283,6 +273,7 @@ async function main(): Promise<void> {
             continue
           }
           try {
+            requireTargetAllowed(runtime.getConfig(), target)
             const gated = await gateCommandsForNavigation(servicesFor(bundle), exec, commands)
             const timeoutMs = typeof task.timeout === 'number' && Number.isFinite(task.timeout) ? Math.max(1, task.timeout) * 1000 : undefined
             const commandRequests: BatchCommandRequest[] = gated.map((g, i) => {
@@ -293,6 +284,9 @@ async function main(): Promise<void> {
                 classification: g.classification,
                 approvalRequired: g.approvalRequired,
                 approvalResult: g.approvalRequired ? 'pending' : 'none',
+                toolCallId: String(exec.callId),
+                batchId,
+                batchIndex: i,
               }
               if (g.beforeExec !== undefined) {
                 const before = g.beforeExec
@@ -308,7 +302,13 @@ async function main(): Promise<void> {
               }
               return request
             })
-            executed.push(await bundle.manager.runTargetBatch({ target, commands: commandRequests, signal: exec.signal }))
+            executed.push(await bundle.manager.runTargetBatch({
+              target,
+              commands: commandRequests,
+              signal: exec.signal,
+              toolCallId: String(exec.callId),
+              batchId,
+            }))
           } catch (error) {
             if (error instanceof AbortRequestedError || (exec.signal as { aborted?: boolean }).aborted === true) throw error
             executed.push({ target, hostname: null, error: thisJumpError(error), commands: [] })
@@ -437,12 +437,16 @@ async function main(): Promise<void> {
         const filtered = q !== null ? entries.filter((e) => JSON.stringify(e).toLowerCase().includes(q)) : entries
         const limit = typeof args.limit === 'number' ? Math.max(1, Math.floor(args.limit)) : 20
         const picked = filtered.slice(-limit)
+        const tz = runtime.timeZone
         const lines = picked.map((e) => {
-          const ts = String(e['timestamp'] ?? '').replace('T', ' ').slice(0, 19)
+          // V0.4.0: storage is UTC; display uses the configured zone.
+          const ts = formatAuditTime(e['timestamp'], tz)
           const cmd = String(e['redactedCommand'] ?? e['command'] ?? '-')
-          return [ts, String(e['operation'] ?? '-'), String(e['target'] ?? e['hostname'] ?? '-'), '[' + String(e['risk'] ?? '?') + ']', String(e['result'] ?? '?'), cmd].join(' | ')
+          const callId = e['toolCallId'] !== undefined ? String(e['toolCallId']) : '-'
+          const batchId = e['batchId'] !== undefined ? String(e['batchId']) : '-'
+          return [ts, String(e['operation'] ?? '-'), String(e['target'] ?? e['hostname'] ?? '-'), '[' + String(e['risk'] ?? '?') + ']', String(e['result'] ?? '?'), 'call=' + callId, 'batch=' + batchId, cmd].join(' | ')
         })
-        lines.unshift('entries=' + String(filtered.length) + (q !== null ? ' (filtered)' : '') + ' showing=' + String(picked.length))
+        lines.unshift('entries=' + String(filtered.length) + (q !== null ? ' (filtered)' : '') + ' showing=' + String(picked.length) + ' tz=' + tz)
         lines.unshift('audit=' + runtime.auditPath)
         const viewer = auditViewerUrl()
         if (viewer !== null) lines.unshift('viewer=' + viewer)
@@ -481,6 +485,9 @@ async function main(): Promise<void> {
       },
     )
   }
+
+  // V0.4.0: the investigation layer (inspect / topology / interrupt / jobs).
+  registerOpsTools(server, runtime)
 
   process.on('SIGINT', () => {
     runtime.dispose()

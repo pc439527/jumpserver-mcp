@@ -276,7 +276,23 @@ export class JumpServerSession {
     try {
       const run = await this.runOp(script, marker, timeoutMs, options.signal)
       const durationMs = Date.now() - started
-      if (run.aborted) throw new AbortRequestedError()
+      if (run.aborted) {
+        // V0.4.0 P0: an ABORT is not a timeout, but the risk is the same —
+        // the remote foreground job keeps running after the model stopped
+        // listening (tail -f, a stuck script, a long find). Interrupt it with
+        // Ctrl+C and re-prove the shell before the connector declares the
+        // asset usable again. Note the recovery runs WITHOUT the abort signal:
+        // we are already aborting, so it must not cancel itself.
+        const verified = await this.recoverShell(EXEC_RECOVERY_MS)
+        if (verified) {
+          this.setState(SessionState.ASSET_SHELL)
+          this.touch()
+        } else {
+          this.setState(SessionState.UNKNOWN)
+          this.callbacks.onLog?.('command aborted; the remote job was interrupted but the shell could not be re-verified - session collapsed to UNKNOWN')
+        }
+        throw new AbortRequestedError()
+      }
       if (run.closed) {
         this.setState(SessionState.DISCONNECTED)
         return { kind: 'signal-lost', output: '', durationMs, executionState: 'UNKNOWN' }
@@ -315,6 +331,58 @@ export class JumpServerSession {
     } catch (error) {
       if (this.stateValue === SessionState.COMMAND_RUNNING && !this.wireClosed) this.setState(SessionState.ASSET_SHELL)
       throw error
+    }
+  }
+
+  /**
+   * V0.4.0 P0: out-of-band interrupt. Writes Ctrl+C straight to the PTY
+   * WITHOUT taking the operation queue, so it reaches the remote shell even
+   * while a command (or a whole batch) is still in flight. Used by
+   * jumpserver_interrupt and by the console's 中断 button.
+   */
+  sendInterrupt(): boolean {
+    if (this.wire === null || this.wireClosed) return false
+    try {
+      this.wire.write('\u0003')
+      this.callbacks.onInput?.('^C')
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Interrupt whatever the remote shell is doing, then re-prove the shell.
+   * The connector only returns to ASSET_SHELL when a probe actually answers.
+   */
+  async interrupt(budgetMs: number = EXEC_RECOVERY_MS): Promise<{ sent: boolean; verified: boolean; state: SessionState }> {
+    const sent = this.sendInterrupt()
+    if (!sent) return { sent: false, verified: false, state: this.stateValue }
+    this.callbacks.onLog?.('interrupt: Ctrl+C sent; re-verifying the remote shell')
+    const verified = await this.recoverShell(budgetMs)
+    if (verified) {
+      this.setState(SessionState.ASSET_SHELL)
+      this.touch()
+    } else {
+      this.setState(SessionState.UNKNOWN)
+    }
+    return { sent, verified, state: this.stateValue }
+  }
+
+  /**
+   * Raw write for the streaming job model (tail -f / journalctl -f / top):
+   * the line is sent as-is, with NO completion marker and NO state wait —
+   * output is collected from the observer stream instead.
+   */
+  writeLine(text: string): boolean {
+    if (this.wire === null || this.wireClosed) return false
+    try {
+      this.wire.write(text.endsWith('\n') ? text : text + '\n')
+      this.callbacks.onInput?.(text.replace(/\n$/, ''))
+      this.touch()
+      return true
+    } catch {
+      return false
     }
   }
 

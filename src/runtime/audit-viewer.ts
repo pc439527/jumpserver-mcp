@@ -1,12 +1,14 @@
 /**
- * Embedded ops console (MCP V0.3.0) — one local page served from inside the
+ * Embedded ops console (V0.4.0) — one local page served from inside the
  * MCP process. Tabs:
  *   实时终端  live per-conversation PTY mirror (redacted stream from TerminalObserver)
- *   审计日志  JSONL audit table + filter + JSONL/CSV export
+ *   拓扑      last jumpserver_topology result (nodes / edges / evidence)
+ *   任务      streaming jobs (tail -f …) with progress and stop
+ *   审计日志  audit table + filter + JSONL/CSV export (configured timezone)
  *   统计      risk / target / operation / daily aggregates
- *   会话      active sessions + disconnect buttons
+ *   会话      active sessions + interrupt / disconnect buttons
  *
- * V0.3.1 behavior:
+ * Behaviour:
  *   - one console per conversation: when the configured port is taken (another
  *     conversation's MCP process holds it), fall back to an ephemeral port so
  *     every conversation gets its OWN live console with its OWN data.
@@ -17,12 +19,17 @@
  *     so any external process can enumerate the live consoles and their ports.
  *   - the page detects a dead server (conversation ended => process gone) and
  *     shows an "expired" overlay, attempting to close itself.
+ *   - audit reads go through the incremental AuditStore (no whole-file reads)
+ *     and render in the configured timezone (storage stays UTC).
  */
 import http from 'node:http'
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { SessionRegistry } from '../jumpserver/session-registry.js'
 import type { TerminalEvent } from '../jumpserver/terminal-observer.js'
+import type { AuditStore } from './audit-store.js'
+import type { JobStore } from './job-store.js'
+import type { TopologyStore } from './topology-store.js'
 
 export interface AuditViewerOptions {
   enabled: boolean
@@ -30,6 +37,15 @@ export interface AuditViewerOptions {
   autoOpen: boolean
   /** EADDRINUSE => take an ephemeral port instead of sharing another process's console (default true). */
   portFallback: boolean
+}
+
+export interface AuditViewerServices {
+  /** V0.4.0: incremental audit sink (null => fall back to whole-file reads). */
+  audit?: AuditStore | null
+  jobs?: JobStore | null
+  topology?: TopologyStore | null
+  /** IANA display zone for audit timestamps (default Asia/Shanghai). */
+  timeZone?: string
 }
 
 /** Terminal events sent to the page per poll (tail; older events are dropped). */
@@ -66,7 +82,7 @@ export function readAuditEntries(file: string): Record<string, unknown>[] {
   }
 }
 
-function page(): string {
+function page(timeZone: string): string {
   return `<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
 <title>JumpServer MCP 控制台</title>
@@ -101,7 +117,7 @@ tr:hover td{background:#1d1d1d}
 .risk-READ{color:#7fc98f}.risk-PRIVILEGED_READ{color:#c9c37f}.risk-UNKNOWN{color:#bbb}.risk-MODIFY{color:#e8a86a}.risk-DANGEROUS{color:#e87f7f}
 .cmd{color:#a8d8a8;word-break:break-all}
 #empty{padding:40px;text-align:center;color:#666}
-.termbox{background:#0d0d0d;border:1px solid #2a2a2a;border-radius:8px;padding:10px;height:calc(100vh - 170px);overflow-y:auto;white-space:pre-wrap;word-break:break-all;font-size:12.5px;line-height:1.45}
+.termbox{background:#0d0d0d;border:1px solid #2a2a2a;border-radius:8px;padding:10px;height:calc(100vh - 210px);overflow-y:auto;white-space:pre-wrap;word-break:break-all;font-size:12.5px;line-height:1.45}
 .t-out{color:#cfe3cf}.t-in{color:#e8d47f}.t-sys{color:#6fa8c9}.t-err{color:#e87f7f}
 .sessbar{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
 .sesschip{background:#222;border:1px solid #333;border-radius:6px;padding:2px 10px;cursor:pointer;color:#999;white-space:nowrap}
@@ -117,6 +133,26 @@ tr:hover td{background:#1d1d1d}
 .bar .track{flex:1;background:#222;border-radius:4px;height:14px;overflow:hidden}
 .bar .fill{height:100%;background:#3f6d8a;display:block}
 .bar .cnt{width:60px;color:#888;flex:none}
+/* V0.4.0: topology */
+.nodes{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.node{background:#1b1b1b;border:1px solid #2a2a2a;border-radius:8px;padding:8px 12px;min-width:190px;cursor:pointer}
+.node:hover{border-color:#3f6d8a}
+.node.on{border-color:#5f8fae;background:#20272c}
+.node .ip{color:#fff;font-size:13px}
+.node .host{color:#c9a86a;font-size:12px}
+.node .role{color:#7fb3e8;font-size:12px}
+.node .meta{color:#888;font-size:12px}
+.node.dead{border-color:#5f3535;opacity:.75}
+#topodetail{background:#0d0d0d;border:1px solid #2a2a2a;border-radius:8px;padding:10px 14px;margin-bottom:12px;white-space:pre-wrap;color:#bbb;min-height:44px}
+.badge{display:inline-block;padding:0 6px;border-radius:4px;font-size:11px;border:1px solid #35505f;color:#9fd3ee}
+.badge.HIGH{border-color:#2f6b45;color:#7fc98f}
+.badge.MEDIUM{border-color:#6b5f2f;color:#c9c37f}
+.badge.LOW{border-color:#4a4a4a;color:#bbb}
+.ev{color:#888;font-size:12px}
+/* V0.4.0: jobs */
+.jobbar{height:6px;background:#222;border-radius:3px;overflow:hidden;min-width:120px}
+.jobbar i{display:block;height:100%;background:#3f6d8a}
+.state-RUNNING{color:#7fc98f}.state-STOPPED{color:#c9c37f}.state-LOST{color:#e87f7f}
 #dead{position:fixed;inset:0;background:rgba(10,10,10,.92);z-index:50;display:none;align-items:center;justify-content:center;flex-direction:column;gap:14px}
 #dead .t{font-size:16px;color:#e8a86a}
 #dead .d{color:#999;font-size:13px;max-width:420px;text-align:center}
@@ -131,6 +167,8 @@ tr:hover td{background:#1d1d1d}
   <div class="dot"></div><h1>JumpServer MCP 控制台</h1>
   <nav>
     <button data-tab="terminal">实时终端</button>
+    <button data-tab="topology">拓扑</button>
+    <button data-tab="jobs">任务</button>
     <button data-tab="audit">审计日志</button>
     <button data-tab="stats">统计</button>
     <button data-tab="sessions">会话</button>
@@ -141,14 +179,42 @@ tr:hover td{background:#1d1d1d}
 
 <section id="tab-terminal">
   <div class="sessbar" id="sesschips"></div>
+  <div class="sessbar">
+    <button class="act warn" id="btn-interrupt">中断当前命令 (Ctrl+C)</button>
+    <label style="color:#999;font-size:12px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
+    <button class="act" id="btn-clear">清屏</button>
+    <span style="color:#777;font-size:12px">中断会向远端 Shell 发送 Ctrl+C 并重新验证，不会断开会话。</span>
+  </div>
   <div class="termbox" id="term"></div>
+</section>
+
+<section id="tab-topology">
+  <div class="sessbar">
+    <button class="act" id="topo-refresh">刷新</button>
+    <span style="color:#777;font-size:12px">数据来自 jumpserver_topology / jumpserver_inspect 的最近一次采集。</span>
+  </div>
+  <div id="topometa" style="color:#888;margin-bottom:8px"></div>
+  <div class="nodes" id="toponodes"></div>
+  <div id="topodetail">点击节点查看详情</div>
+  <div class="grp"><h3>关系（含证据）</h3><div id="topoedges"></div></div>
+</section>
+
+<section id="tab-jobs">
+  <div class="sessbar">
+    <button class="act" id="jobs-refresh">刷新</button>
+    <span style="color:#777;font-size:12px">流式任务（tail -f / journalctl -f / tcpdump）。任务运行期间该 Shell 被独占。</span>
+  </div>
+  <div class="tw"><table><thead><tr><th style="width:150px">任务</th><th style="width:170px">目标</th><th style="width:100px">状态</th><th style="width:170px">运行时长</th><th>命令</th><th style="width:90px"></th></tr></thead>
+  <tbody id="jrows"></tbody></table></div>
+  <div class="grp" style="margin-top:12px"><h3>输出尾部</h3><div class="termbox" id="jobout" style="height:220px"></div></div>
 </section>
 
 <section id="tab-audit">
   <div class="sessbar">
-    <input type="text" id="filter" placeholder="过滤：命令 / 资产 / 操作类型 / 风险" style="width:280px">
+    <input type="text" id="filter" placeholder="过滤：命令 / 资产 / 操作类型 / 风险 / callId" style="width:280px">
     <button class="act" id="exp-jsonl">导出 JSONL</button>
     <button class="act" id="exp-csv">导出 CSV</button>
+    <span style="color:#777;font-size:12px">时间显示时区：${timeZone}（存储为 UTC）</span>
   </div>
   <div class="tw"><table><thead><tr><th style="width:165px">时间</th><th style="width:125px">操作</th><th style="width:185px">目标</th><th style="width:140px">风险 / 结果</th><th>命令</th></tr></thead>
   <tbody id="rows"></tbody></table></div>
@@ -166,6 +232,7 @@ tr:hover td{background:#1d1d1d}
 <section id="tab-sessions">
   <div class="sessbar">
     <button class="act warn" id="close-all">断开全部会话</button>
+    <button class="act" id="interrupt-all">中断当前命令</button>
     <span style="color:#777;font-size:12px">断开会释放 SSH/PTY；AI 侧下次调用工具会自动重连。</span>
   </div>
   <div class="tw"><table><thead><tr><th style="width:200px">会话</th><th style="width:150px">状态</th><th style="width:190px">当前资产</th><th style="width:120px">权限模式</th><th style="width:170px">最近使用</th><th></th></tr></thead>
@@ -175,16 +242,28 @@ tr:hover td{background:#1d1d1d}
 </main>
 <div id="dead"><div class="t">工作台已失效</div><div class="d">对应的对话已结束，服务进程已退出。本页不会再更新，可以关闭。</div><button class="act" id="dead-close">关闭本页</button></div>
 <script>
+var TZ = ${JSON.stringify(timeZone)};
 var tab = (location.hash || '#audit').slice(1);
 var auditAll = [], lastCount = -1;
 var trackedSeq = {}, currentSess = null, sessStatus = {}, termLines = 0;
 var failCount = 0, deadShown = false;
+var topo = null, topoPick = null, jobPick = null;
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function stripAnsi(s){return String(s == null ? '' : s).replace(/\\x1b\\[[0-9;?]*[A-Za-z]/g,'').replace(/[\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f]/g,'');}
 function shortId(id){return id.length > 22 ? id.slice(0,8) + '…' + id.slice(-10) : id;}
 function labelId(id){return id === 'anonymous' ? '当前对话' : shortId(id);}
-function fmtTime(ts){return String(ts == null ? '' : ts).replace('T',' ').slice(0,19);}
+/* V0.4.0: storage is UTC, display is the configured zone. */
+var dtf = null;
+try { dtf = new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}); } catch(e) { dtf = null; }
+function fmtTime(ts){
+  var raw = String(ts == null ? '' : ts);
+  if (!raw) return '';
+  var d = new Date(raw);
+  if (isNaN(d.getTime())) return raw.replace('T',' ').slice(0,19);
+  if (dtf) { try { return dtf.format(d).replace(',',''); } catch(e) {} }
+  return raw.replace('T',' ').slice(0,19) + ' UTC';
+}
 function showDead(){
   if (deadShown) return; deadShown = true;
   $('dead').style.display = 'flex';
@@ -193,6 +272,9 @@ $('dead-close').addEventListener('click', function(){ window.close(); });
 /* fetch wrapper: any success resets the dead-counter; N misses => expired overlay */
 function F(u,o){
   return fetch(u,o).then(function(r){failCount=0;return r;}).catch(function(e){failCount++;if(failCount>=${DEAD_AFTER_FAILURES})showDead();throw e;});
+}
+function POST(u,body){
+  return F(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
 }
 
 /* ---- tabs ---- */
@@ -205,12 +287,14 @@ function showTab(name){
   if (name==='audit') pollAudit();
   if (name==='stats') pollStats();
   if (name==='sessions') pollSessions();
+  if (name==='topology') pollTopology();
+  if (name==='jobs') pollJobs();
 }
 var navBtns = document.querySelectorAll('nav button');
 for (var b=0;b<navBtns.length;b++){
   (function(btn){btn.addEventListener('click',function(){showTab(btn.getAttribute('data-tab'));});})(navBtns[b]);
 }
-showTab(['terminal','audit','stats','sessions'].indexOf(tab)>=0?tab:'audit');
+showTab(['terminal','topology','jobs','audit','stats','sessions'].indexOf(tab)>=0?tab:'audit');
 
 /* ---- terminal ---- */
 function renderChips(list){
@@ -244,7 +328,7 @@ function appendTerm(sess, events){
     box.appendChild(div);termLines++;
   }
   while (termLines > ${TERMINAL_MAX_LINES} && box.firstChild){box.removeChild(box.firstChild);termLines--;}
-  if (stick) box.scrollTop = box.scrollHeight;
+  if (stick && $('autoscroll').checked) box.scrollTop = box.scrollHeight;
 }
 function pollTerminal(){
   if (tab!=='terminal'){setTimeout(pollTerminal,1000);return;}
@@ -266,6 +350,93 @@ function pollTerminal(){
   setTimeout(pollTerminal,1000);
 }
 pollTerminal();
+$('btn-clear').addEventListener('click',function(){$('term').innerHTML='';termLines=0;});
+$('btn-interrupt').addEventListener('click',function(){
+  POST('/api/interrupt',{sessionId:currentSess}).then(function(r){return r.json();}).then(function(j){
+    alert(j.interrupted ? ('已发送 Ctrl+C；' + (j.verified ? 'Shell 已重新验证可用' : 'Shell 未能验证，已降级为 UNKNOWN')) : '当前没有可中断的活动会话');
+  }).catch(function(){});
+});
+
+/* ---- topology (V0.4.0) ---- */
+function renderTopology(){
+  if (!topo){ $('topometa').textContent='暂无拓扑数据：在对话里执行 jumpserver_topology（或 jumpserver_inspect）后这里会出现节点与关系。'; $('toponodes').innerHTML=''; $('topoedges').innerHTML=''; $('topodetail').textContent='点击节点查看详情'; return; }
+  var nodes = topo.nodes||[], edges = topo.edges||[];
+  $('topometa').textContent = '节点 ' + nodes.length + ' · 关系 ' + edges.length + ' · profiles ' + (topo.profiles||[]).join(',') +
+    ' · 采集于 ' + fmtTime(new Date(topo.updatedAt).toISOString()) + ' · 耗时 ' + (topo.durationMs||0) + 'ms';
+  $('toponodes').innerHTML = nodes.map(function(n){
+    return '<div class="node'+(n.reachable?'':' dead')+(topoPick===n.target?' on':'')+'" data-t="'+esc(n.target)+'">'
+      +'<div class="ip">'+esc(n.target)+'</div>'
+      +'<div class="host">'+esc(n.hostname||'未知主机名')+'</div>'
+      +'<div class="role">'+esc((n.roles||[]).join(', ')||'未识别')+'</div>'
+      +'<div class="meta">端口 '+(n.ports&&n.ports.length?n.ports.join(','):'无')+' · '+(n.os||'未知系统')+'</div>'
+      +'</div>';
+  }).join('');
+  var cards = $('toponodes').querySelectorAll('.node');
+  for (var i=0;i<cards.length;i++){(function(c){c.addEventListener('click',function(){topoPick=c.getAttribute('data-t');renderTopology();});})(cards[i]);}
+  if (topoPick){
+    var n = null; for (var q=0;q<nodes.length;q++) if (nodes[q].target===topoPick) n=nodes[q];
+    if (n){
+      var ins = edges.filter(function(e){return e.to===n.target && e.type!=='same_upstream';});
+      var outs = edges.filter(function(e){return e.from===n.target && e.type!=='same_upstream';});
+      $('topodetail').textContent =
+        n.target + (n.hostname?(' ('+n.hostname+')'):'') + '\\n'
+        + '角色      ' + ((n.roles||[]).join(', ')||'未识别') + '\\n'
+        + '系统      ' + (n.os||'?') + '  内核 ' + (n.kernel||'?') + '\\n'
+        + '负载      ' + (n.load?n.load.join(' / '):'?') + '   内存 ' + (n.memoryUsedPct==null?'?':(n.memoryUsedPct+'%')) + '   核数 ' + (n.cores==null?'?':n.cores) + '\\n'
+        + '端口      ' + ((n.ports||[]).join(', ')||'无') + '\\n'
+        + 'IP        ' + ((n.ips||[]).join(', ')||'?') + '\\n'
+        + '入向      ' + (ins.length? ins.map(function(e){return e.from+' → '+e.type+':'+(e.port||'?')+' ['+e.confidence+']';}).join('\\n          ') : '无') + '\\n'
+        + '出向      ' + (outs.length? outs.map(function(e){return e.type+':'+(e.port||'?')+' → '+e.to+' ['+e.confidence+']';}).join('\\n          ') : '无');
+    }
+  } else { $('topodetail').textContent='点击节点查看详情'; }
+  $('topoedges').innerHTML = edges.length ? edges.map(function(e){
+    return '<div style="padding:4px 0;border-bottom:1px solid #222">'
+      +'<span style="color:#fff">'+esc(e.from)+'</span> ──▶ <span style="color:#fff">'+esc(e.to)+'</span> '
+      +'<span class="badge">'+esc(e.type)+'</span> :'+esc(e.port==null?'?':e.port)+' '
+      +'<span class="badge '+esc(e.confidence)+'">'+esc(e.confidence)+'</span><br>'
+      +'<span class="ev">'+esc((e.evidence||[]).join(' · '))+'</span></div>';
+  }).join('') : '<span style="color:#666">没有发现节点间关系（可能需要 network/web profile，或这些主机之间没有直接连接）</span>';
+}
+function pollTopology(){
+  if (tab!=='topology') return;
+  F('/api/topology').then(function(r){return r.json();}).then(function(j){
+    topo = j && j.nodes ? j : null;
+    renderTopology();
+  }).catch(function(){});
+}
+$('topo-refresh').addEventListener('click',pollTopology);
+setInterval(pollTopology,3000);
+
+/* ---- jobs (V0.4.0) ---- */
+function renderJobs(list){
+  $('jrows').innerHTML = list.length ? list.map(function(j){
+    var pct = j.maxDurationMs ? Math.min(100, Math.round((Date.now()-j.startedAt)/j.maxDurationMs*100)) : 0;
+    return '<tr data-id="'+esc(j.id)+'"><td>'+esc(j.id)+'</td>'
+      +'<td class="tgt">'+esc(j.target)+(j.hostname?(' ('+esc(j.hostname)+')'):'')+'</td>'
+      +'<td class="state-'+esc(j.state)+'">'+esc(j.state)+'</td>'
+      +'<td><div class="jobbar"><i style="width:'+pct+'%"></i></div><span class="time">'+Math.round((Date.now()-j.startedAt)/1000)+'s / '+Math.round(j.maxDurationMs/1000)+'s</span></td>'
+      +'<td class="cmd">'+esc(j.command)+'</td>'
+      +'<td>'+(j.state==='RUNNING'?'<button class="act warn" data-stop="'+esc(j.id)+'">停止</button>':'')+'</td></tr>';
+  }).join('') : '<tr><td colspan="6" style="text-align:center;color:#666;padding:30px">没有任务 —— 在对话里用 jumpserver_job_start 启动 tail -f / journalctl -f 一类的流式命令</td></tr>';
+  var rows=$('jrows').querySelectorAll('tr[data-id]');
+  for (var i=0;i<rows.length;i++){(function(r){r.addEventListener('click',function(){jobPick=r.getAttribute('data-id');showJobOut(list);});})(rows[i]);}
+  var stops=$('jrows').querySelectorAll('button[data-stop]');
+  for (var s=0;s<stops.length;s++){(function(btn){btn.addEventListener('click',function(ev){
+    ev.stopPropagation();
+    POST('/api/jobs/stop',{id:btn.getAttribute('data-stop')}).then(function(){pollJobs();}).catch(function(){});
+  });})(stops[s]);}
+  showJobOut(list);
+}
+function showJobOut(list){
+  var j=null; for (var i=0;i<list.length;i++) if (list[i].id===jobPick) j=list[i];
+  $('jobout').textContent = j ? ('# ' + j.id + '  ' + j.target + '  [' + j.state + ']\\n\\n' + (j.output||'(无输出)')) : '点击一行查看输出';
+}
+function pollJobs(){
+  if (tab!=='jobs') return;
+  F('/api/jobs').then(function(r){return r.json();}).then(function(list){renderJobs(list||[]);}).catch(function(){});
+}
+$('jobs-refresh').addEventListener('click',pollJobs);
+setInterval(pollJobs,1000);
 
 /* ---- audit ---- */
 function renderAudit(){
@@ -303,7 +474,7 @@ $('exp-jsonl').addEventListener('click',function(){
   download('jumpserver-audit.jsonl','application/json',auditAll.map(function(e){return JSON.stringify(e);}).join('\\n'));
 });
 $('exp-csv').addEventListener('click',function(){
-  var cols=['timestamp','operation','actor','target','hostname','risk','result','exitCode','durationMs','redactedCommand'];
+  var cols=['timestamp','operation','actor','target','hostname','risk','result','exitCode','durationMs','toolCallId','batchId','taskId','redactedCommand'];
   var q=function(v){v=v==null?'':String(v);return /[",\\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
   var lines=[cols.join(',')];
   auditAll.forEach(function(e){lines.push(cols.map(function(c){return q(e[c]);}).join(','));});
@@ -352,24 +523,37 @@ function pollSessions(){
         +'<td>'+esc(st.state||'?')+'</td>'
         +'<td class="tgt">'+esc(st.target||'-')+(st.hostname?' ('+esc(st.hostname)+')':'')+'</td>'
         +'<td>'+esc(st.permissionMode||'-')+'</td>'
-        +'<td class="time">'+new Date(s.lastUsedAt).toLocaleString()+'</td>'
-        +'<td><button class="act warn" data-id="'+esc(s.id)+'">断开</button></td></tr>';
+        +'<td class="time">'+fmtTime(new Date(s.lastUsedAt).toISOString())+'</td>'
+        +'<td><button class="act" data-int="'+esc(s.id)+'">中断</button> <button class="act warn" data-id="'+esc(s.id)+'">断开</button></td></tr>';
     }).join('') : '<tr><td colspan="6" style="text-align:center;color:#666;padding:30px">无活动会话</td></tr>';
-    var btns=$('srows').querySelectorAll('button');
+    var btns=$('srows').querySelectorAll('button[data-id]');
     for (var i=0;i<btns.length;i++){
       (function(btn){btn.addEventListener('click',function(){
         if (!confirm('断开该会话？')) return;
-        F('/api/sessions/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:btn.getAttribute('data-id')})})
+        POST('/api/sessions/close',{sessionId:btn.getAttribute('data-id')})
           .then(function(){pollSessions();}).catch(function(){});
       });})(btns[i]);
+    }
+    var ints=$('srows').querySelectorAll('button[data-int]');
+    for (var k=0;k<ints.length;k++){
+      (function(btn){btn.addEventListener('click',function(){
+        POST('/api/interrupt',{sessionId:btn.getAttribute('data-int')}).then(function(r){return r.json();}).then(function(j){
+          alert(j.interrupted ? ('已发送 Ctrl+C；' + (j.verified ? 'Shell 已重新验证可用' : 'Shell 未能验证，已降级为 UNKNOWN')) : '该会话当前不可中断');
+          pollSessions();
+        }).catch(function(){});
+      });})(ints[k]);
     }
   }).catch(function(){});
 }
 setInterval(pollSessions,2000);
 $('close-all').addEventListener('click',function(){
   if (!confirm('断开全部 JumpServer 会话？')) return;
-  F('/api/sessions/close',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"all":true}'})
-    .then(function(){pollSessions();}).catch(function(){});
+  POST('/api/sessions/close',{all:true}).then(function(){pollSessions();}).catch(function(){});
+});
+$('interrupt-all').addEventListener('click',function(){
+  POST('/api/interrupt',{}).then(function(r){return r.json();}).then(function(j){
+    alert('已向 '+(j.interrupted||0)+' 个会话发送 Ctrl+C');
+  }).catch(function(){});
 });
 </script></body></html>`
 }
@@ -419,7 +603,7 @@ export function consoleHintForModel(): string | null {
   if (url === null || hintEnabled !== true) return null
   return (
     '[jumpserver-console] 本对话的 JumpServer 工作台: ' + url + '\n' +
-    '请立即调用 present_files 打开这个 URL（会显示在 WorkBuddy 内置预览面板里，实时终端/审计/统计/会话四个页签）。\n' +
+    '请立即调用 present_files 打开这个 URL（会显示在 WorkBuddy 内置预览面板里，实时终端/拓扑/任务/审计/统计/会话六个页签）。\n' +
     '禁止改用系统浏览器打开（不要 rundll32 / start / explorer / 外部浏览器），每个对话端口独立，关掉对话即失效。'
   )
 }
@@ -434,27 +618,31 @@ export function startAuditViewer(
   auditPath: string,
   opts: AuditViewerOptions,
   registry: SessionRegistry | null,
+  services: AuditViewerServices = {},
 ): string | null {
   if (opts.enabled !== true) return null
   hintEnabled = opts.autoOpen
   consoleDir = join(dirname(auditPath), 'consoles')
+  const audit = services.audit ?? null
+  const timeZone = services.timeZone ?? 'Asia/Shanghai'
   const server = http.createServer((req, res) => {
     void (async () => {
       const target = req.url ?? '/'
       const href = target.split('?')[0] ?? '/'
       const query = new URLSearchParams(target.split('?')[1] ?? '')
+      const entries = (): Record<string, unknown>[] => (audit !== null ? audit.list() : readAuditEntries(auditPath))
       if (href === '/api/entries') {
-        sendJson(res, readAuditEntries(auditPath))
+        sendJson(res, entries())
         return
       }
       if (href === '/api/stats') {
-        const entries = readAuditEntries(auditPath)
+        const list = entries()
         const byRisk: Record<string, number> = {}
         const byOperation: Record<string, number> = {}
         const byTarget: Record<string, number> = {}
         const byDayMap: Record<string, number> = {}
         let failed = 0
-        for (const e of entries) {
+        for (const e of list) {
           const risk = String(e['risk'] ?? '?')
           const op = String(e['operation'] ?? '?')
           const targetName = String(e['target'] ?? e['hostname'] ?? '(未进入资产)')
@@ -468,7 +656,7 @@ export function startAuditViewer(
         }
         const byDay = Object.keys(byDayMap).sort().map((d) => [d.slice(5), byDayMap[d] ?? 0] as [string, number])
         sendJson(res, {
-          total: entries.length,
+          total: list.length,
           failed,
           targets: Object.keys(byTarget).length,
           days: byDay.length,
@@ -514,6 +702,30 @@ export function startAuditViewer(
         sendJson(res, { closed })
         return
       }
+      // V0.4.0: out-of-band Ctrl+C — reaches the remote shell even mid-command.
+      if (href === '/api/interrupt' && req.method === 'POST') {
+        if (registry === null) {
+          sendJson(res, { interrupted: 0, verified: false })
+          return
+        }
+        const body = await readBody(req)
+        const only = typeof body['sessionId'] === 'string' && body['sessionId'].length > 0 ? body['sessionId'] : null
+        let interrupted = 0
+        let verified = false
+        for (const [id, bundle] of registry.snapshot()) {
+          if (only !== null && id !== only) continue
+          const result = await bundle.manager.interrupt()
+          if (result.sent) {
+            interrupted += 1
+            verified = verified || result.verified
+          }
+        }
+        if (services.jobs !== null && services.jobs !== undefined) {
+          await services.jobs.stopAll(only ?? undefined).catch(() => 0)
+        }
+        sendJson(res, { interrupted, verified })
+        return
+      }
       if (href === '/api/terminal') {
         if (registry === null) {
           sendJson(res, { sessions: [] })
@@ -529,8 +741,31 @@ export function startAuditViewer(
         sendJson(res, { sessions })
         return
       }
+      if (href === '/api/topology') {
+        sendJson(res, services.topology?.get() ?? { nodes: [], edges: [], warnings: [] })
+        return
+      }
+      if (href === '/api/jobs') {
+        sendJson(res, services.jobs !== null && services.jobs !== undefined ? services.jobs.list() : [])
+        return
+      }
+      if (href === '/api/jobs/stop' && req.method === 'POST') {
+        if (services.jobs === null || services.jobs === undefined) {
+          sendJson(res, { stopped: false })
+          return
+        }
+        const body = await readBody(req)
+        const id = String(body['id'] ?? '')
+        try {
+          const job = await services.jobs.stop(id)
+          sendJson(res, { stopped: true, state: job.state })
+        } catch {
+          sendJson(res, { stopped: false })
+        }
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      res.end(page())
+      res.end(page(timeZone))
     })().catch(() => {
       try {
         res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })

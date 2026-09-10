@@ -4,6 +4,9 @@
   "username": "your-jumpserver-user",
   "passwordEnv": "JUMPSERVER_PASSWORD",
   "permissionMode": "READ_ONLY",
+  "timeZone": "Asia/Shanghai",
+  "allowedTargets": [],
+  "deniedTargets": [],
   "assetGroups": {
     "OA": { "keywords": ["OA", "portal", "workflow", "办公"] }
   },

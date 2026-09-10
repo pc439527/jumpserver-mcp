@@ -36,6 +36,16 @@ export interface AuditRecord {
   approvalRequired: boolean
   /** V0.3.1: 'none' | 'approved' | 'denied' — the gate outcome. */
   approvalResult: string
+  /** V0.4.0: MCP request id that produced this record (AI task correlation). */
+  toolCallId?: string
+  /** V0.4.0: one id per jumpserver_batch / inspect / topology call. */
+  batchId?: string
+  /** V0.4.0: long-running job id (jumpserver_job_start). */
+  taskId?: string
+  /** V0.4.0: index of this command inside its batch (audit ordering). */
+  batchIndex?: number
+  /** V0.4.0: monotonic per-process write sequence (stable ordering in the JSONL). */
+  sequence?: number
   permissionMode: PermissionMode
   result: string
   exitCode: number | null
@@ -69,6 +79,10 @@ export interface ExecRequest {
   /** V0.3.1: approval outcomes from the gate. */
   approvalRequired?: boolean
   approvalResult?: string
+  /** V0.4.0: MCP request id (audit correlation). */
+  toolCallId?: string
+  /** V0.4.0: batch/inspect run id (audit correlation). */
+  batchId?: string
   signal?: AbortSignal
 }
 
@@ -84,6 +98,10 @@ export interface RunRequest {
   classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
   approvalRequired?: boolean
   approvalResult?: string
+  /** V0.4.0: MCP request id (audit correlation). */
+  toolCallId?: string
+  /** V0.4.0: batch/inspect run id (audit correlation). */
+  batchId?: string
   /** Runs right after navigation (target verified) and immediately before exec. */
   beforeExec?: () => Promise<void>
 }
@@ -99,6 +117,12 @@ export interface BatchCommandRequest {
   classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
   approvalRequired?: boolean
   approvalResult?: string
+  /** V0.4.0: MCP request id (audit correlation). */
+  toolCallId?: string
+  /** V0.4.0: batch/inspect run id (audit correlation). */
+  batchId?: string
+  /** V0.4.0: index of this command inside its batch (audit ordering). */
+  batchIndex?: number
   /** Runs right after the target is verified and immediately before this command's exec. */
   beforeExec?: () => Promise<void>
 }
@@ -108,6 +132,10 @@ export interface TargetBatchRequest {
   target: string
   commands: BatchCommandRequest[]
   signal?: AbortSignal
+  /** V0.4.0: MCP request id (audit correlation). */
+  toolCallId?: string
+  /** V0.4.0: one id for the whole batch run (inspect/topology/batch). */
+  batchId?: string
 }
 
 export interface BatchCommandResult {
@@ -130,6 +158,9 @@ export interface TargetBatchResult {
 
 const RECONNECT_LIMIT = 2
 const RECONNECT_BACKOFF = [1000, 3000] as const
+
+/** V0.4.0: monotonic audit write sequence (per process). */
+let auditSequence = 0
 
 export function toRuntimeConfig(cfg: JumpServerConfig, password: string, wireFactory?: import('./session.js').WireFactory): SessionRuntimeConfig {
   return {
@@ -212,6 +243,12 @@ export class SessionManager {
   private assetCache: AssetCaptureCache | null = null
   /** V0.2.5: a connection dropped during a pending op; reconnect once the turn settles. */
   private reconnectPending = false
+  /**
+   * V0.4.0: id of the streaming job currently owning the PTY (tail -f …).
+   * While set, no other command may use the shell — mixing commands into a
+   * streaming job's output would corrupt both.
+   */
+  private activeJob: string | null = null
 
   constructor(private readonly options: SessionManagerOptions) {}
 
@@ -257,9 +294,46 @@ export class SessionManager {
     }
   }
 
+  /** True while a streaming job owns the PTY (see activeJob). */
+  hasActiveJob(): boolean {
+    return this.activeJob !== null
+  }
+
+  /** Fail fast when a streaming job owns the shell instead of corrupting its output. */
+  private assertNoActiveJob(): void {
+    if (this.activeJob !== null) {
+      throw new JumpServerError('SESSION_BUSY', 'a streaming job (' + this.activeJob + ') owns this shell; stop it with jumpserver_job_stop first')
+    }
+  }
+
   /** Public connect: serialized through the session queue. */
   async connect(signal?: AbortSignal): Promise<ManagerStatus> {
     return this.queue(() => this.connectLocked(signal), signal)
+  }
+
+  /**
+   * V0.4.0 P0: out-of-band interrupt — Ctrl+C reaches the remote shell even
+   * while a command/batch is in flight (the queue is deliberately bypassed;
+   * queueing would only deliver the interrupt after the running op finished).
+   */
+  async interrupt(): Promise<{ sent: boolean; verified: boolean; state: string; target: string | null }> {
+    const session = this.session
+    if (session === null || !session.isLive()) {
+      return { sent: false, verified: false, state: this.status().state, target: this.status().target }
+    }
+    const result = await session.interrupt()
+    this.activeJob = null
+    await this.audit({
+      operation: 'interrupt',
+      target: session.currentTarget,
+      hostname: session.currentHostname,
+      command: null,
+      risk: 'READ',
+      result: result.verified ? 'ok' : 'unverified',
+      exitCode: null,
+      durationMs: null,
+    })
+    return { sent: result.sent, verified: result.verified, state: result.state, target: session.currentTarget }
   }
 
   /**
@@ -328,6 +402,7 @@ export class SessionManager {
   async exec(request: ExecRequest): Promise<{ status: ManagerStatus; outcome: ExecOutcome }> {
     return this.queue(async () => {
       const session = this.requireLiveSession()
+      this.assertNoActiveJob()
       if (session.status().state !== SessionState.ASSET_SHELL) {
         throw new JumpServerError('NOT_IN_ASSET', 'exec requires an entered (verified) asset shell')
       }
@@ -344,6 +419,8 @@ export class SessionManager {
         classification: request.classification,
         approvalRequired: request.approvalRequired,
         approvalResult: request.approvalResult,
+        toolCallId: request.toolCallId,
+        batchId: request.batchId,
         result: outcome.executionState,
         exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
         durationMs,
@@ -359,23 +436,8 @@ export class SessionManager {
         throw new JumpServerError('NOT_CONFIGURED', 'JumpServer is not configured')
       }
       const session = await this.ensureConnectedLocked(request.signal)
-      let st = session.status()
-      if (st.state === SessionState.ASSET_SHELL && st.target === request.target) {
-        // already there
-      } else {
-        if (st.state === SessionState.ASSET_SHELL) {
-          await session.leave(request.signal)
-          st = session.status()
-        }
-        if (st.state === SessionState.UNKNOWN || st.state === SessionState.ERROR) {
-          throw new JumpServerError('UNKNOWN_STATE', 'current session state is not reliably navigable; reconnect and retry')
-        }
-        if (st.state !== SessionState.JUMPSERVER_MENU) {
-          throw new JumpServerError('NOT_AT_MENU', 'cannot navigate: session is in state ' + st.state)
-        }
-        await session.enter(request.target, request.signal)
-        st = session.status()
-      }
+      this.assertNoActiveJob()
+      const st = await this.navigateToTarget(session, request.target, request.signal)
       if (request.beforeExec !== undefined) await request.beforeExec()
       const started = Date.now()
       const outcome = await session.exec(request.command, { timeoutMs: request.timeoutMs, signal: request.signal })
@@ -390,12 +452,92 @@ export class SessionManager {
         classification: request.classification,
         approvalRequired: request.approvalRequired,
         approvalResult: request.approvalResult,
+        toolCallId: request.toolCallId,
+        batchId: request.batchId,
         result: outcome.executionState,
         exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
         durationMs,
       })
       return { status: this.status(), outcome, target: st.target, hostname: st.hostname }
     }, request.signal)
+  }
+
+  /** Shared navigation: menu -> enter(target) -> verified status. */
+  private async navigateToTarget(session: JumpServerSession, target: string, signal?: AbortSignal): Promise<SessionStatus> {
+    let st = session.status()
+    if (st.state === SessionState.ASSET_SHELL && st.target === target) return st
+    if (st.state === SessionState.ASSET_SHELL) {
+      await session.leave(signal)
+      st = session.status()
+      if (st.state !== SessionState.JUMPSERVER_MENU) {
+        throw new JumpServerError('UNKNOWN_STATE', 'not reliably at the JumpServer menu after leaving an asset')
+      }
+    }
+    if (st.state === SessionState.UNKNOWN || st.state === SessionState.ERROR) {
+      throw new JumpServerError('UNKNOWN_STATE', 'current session state is not reliably navigable; reconnect and retry')
+    }
+    if (st.state !== SessionState.JUMPSERVER_MENU) {
+      throw new JumpServerError('NOT_AT_MENU', 'cannot navigate: session is in state ' + st.state)
+    }
+    await session.enter(target, signal)
+    return session.status()
+  }
+
+  /**
+   * V0.4.0: start a streaming job (tail -f / journalctl -f / top / ping / tcpdump).
+   * Navigation happens inside the queue; the command is then written RAW (no
+   * completion marker) and its output is harvested from the observer stream by
+   * the job store. The job owns the PTY until it is stopped.
+   */
+  async startJob(request: { jobId: string; target: string; command: string; signal?: AbortSignal; toolCallId?: string }): Promise<{ target: string | null; hostname: string | null; state: string; startSeq: number }> {
+    return this.queue(async () => {
+      this.assertNoActiveJob()
+      const cfg = this.options.getConfig()
+      if (cfg.enabled === false) throw new JumpServerError('DISABLED', 'JumpServer is disabled in settings')
+      if (!cfg.host || !cfg.username) throw new JumpServerError('NOT_CONFIGURED', 'JumpServer is not configured')
+      const session = await this.ensureConnectedLocked(request.signal)
+      const st = await this.navigateToTarget(session, request.target, request.signal)
+      const startSeq = this.options.observer?.cursorSeq ?? 0
+      if (!session.writeLine(request.command)) {
+        throw new JumpServerError('CONNECTION_LOST', 'could not write the job command to the PTY')
+      }
+      this.activeJob = request.jobId
+      await this.audit({
+        operation: 'job-start',
+        target: st.target,
+        hostname: st.hostname,
+        command: request.command,
+        risk: 'READ',
+        taskId: request.jobId,
+        toolCallId: request.toolCallId,
+        result: 'RUNNING',
+        exitCode: null,
+        durationMs: null,
+      })
+      return { target: st.target, hostname: st.hostname, state: session.state, startSeq }
+    }, request.signal)
+  }
+
+  /** V0.4.0: stop a streaming job — Ctrl+C (out-of-band) and release the PTY. */
+  async stopJob(jobId: string): Promise<{ sent: boolean; state: string }> {
+    const session = this.session
+    if (this.activeJob !== null && this.activeJob !== jobId) {
+      throw new JumpServerError('SESSION_BUSY', 'another job (' + this.activeJob + ') owns this shell')
+    }
+    this.activeJob = null
+    const sent = session?.sendInterrupt() ?? false
+    await this.audit({
+      operation: 'job-stop',
+      target: session?.currentTarget ?? null,
+      hostname: session?.currentHostname ?? null,
+      command: null,
+      risk: 'READ',
+      taskId: jobId,
+      result: sent ? 'ok' : 'not-sent',
+      exitCode: null,
+      durationMs: null,
+    })
+    return { sent, state: this.status().state }
   }
 
   /**
@@ -418,31 +560,15 @@ export class SessionManager {
       let session: JumpServerSession
       try {
         session = await this.ensureConnectedLocked(request.signal)
+        this.assertNoActiveJob()
       } catch (error) {
         return { target: request.target, hostname: null, error: this.errorDetail(error), commands: [] }
       }
-      let st = session.status()
+      let st: SessionStatus
       try {
-        if (st.state === SessionState.ASSET_SHELL) {
-          if (st.target === request.target) {
-            // already inside the requested asset
-          } else {
-            await session.leave(request.signal)
-            st = session.status()
-            if (st.state !== SessionState.JUMPSERVER_MENU) throw new JumpServerError('UNKNOWN_STATE', 'not reliably at the JumpServer menu after leaving an asset')
-            await session.enter(request.target, request.signal)
-            st = session.status()
-          }
-        } else if (st.state === SessionState.JUMPSERVER_MENU) {
-          await session.enter(request.target, request.signal)
-          st = session.status()
-        } else if (st.state === SessionState.UNKNOWN || st.state === SessionState.ERROR) {
-          throw new JumpServerError('UNKNOWN_STATE', 'current session state is not reliably navigable; reconnect and retry')
-        } else {
-          throw new JumpServerError('NOT_AT_MENU', 'cannot navigate: session is in state ' + st.state)
-        }
+        st = await this.navigateToTarget(session, request.target, request.signal)
       } catch (error) {
-        return { target: request.target, hostname: st?.hostname ?? null, error: this.errorDetail(error), commands: [] }
+        return { target: request.target, hostname: session.currentHostname, error: this.errorDetail(error), commands: [] }
       }
       const results: BatchCommandResult[] = []
       for (const item of request.commands) {
@@ -476,6 +602,9 @@ export class SessionManager {
             classification: item.classification,
             approvalRequired: item.approvalRequired,
             approvalResult: item.approvalResult,
+            toolCallId: item.toolCallId ?? request.toolCallId,
+            batchId: item.batchId ?? request.batchId,
+            batchIndex: item.batchIndex,
             result: outcome.executionState,
             exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
             durationMs,
@@ -500,6 +629,9 @@ export class SessionManager {
             classification: item.classification,
             approvalRequired: item.approvalRequired,
             approvalResult: item.approvalResult,
+            toolCallId: item.toolCallId ?? request.toolCallId,
+            batchId: item.batchId ?? request.batchId,
+            batchIndex: item.batchIndex,
             result: 'error',
             exitCode: null,
             durationMs: null,
@@ -788,6 +920,12 @@ export class SessionManager {
     classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
     approvalRequired?: boolean
     approvalResult?: string
+    /** V0.4.0: MCP request id / batch id / job id (AI task correlation). */
+    toolCallId?: string
+    batchId?: string
+    taskId?: string
+    /** V0.4.0: index of this command inside its batch (audit ordering). */
+    batchIndex?: number
     risk: string
     result: string
     exitCode?: number | null
@@ -819,6 +957,11 @@ export class SessionManager {
         : undefined,
       approvalRequired: partial.approvalRequired ?? false,
       approvalResult: partial.approvalResult ?? 'none',
+      toolCallId: partial.toolCallId,
+      batchId: partial.batchId,
+      taskId: partial.taskId,
+      sequence: ++auditSequence,
+      batchIndex: partial.batchIndex,
       permissionMode: cfg.permissionMode,
       result: partial.result,
       exitCode: partial.exitCode ?? null,

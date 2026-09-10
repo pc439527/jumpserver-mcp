@@ -3,10 +3,14 @@
  * (cordis context, DSH credential domain and storage domain are replaced by
  * env-var password resolution and a JSONL audit file).
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseConfig, type McpConfig } from '../config/schema.js'
+import { AuditStore, DEFAULT_AUDIT_RING_SIZE } from './audit-store.js'
+import { JobStore } from './job-store.js'
+import { TopologyStore } from './topology-store.js'
+import { resolveTimeZone } from './time.js'
 import { startAuditViewer, notifyAuditRecord } from './audit-viewer.js'
 import { SessionManager } from '../jumpserver/session-manager.js'
 import type { AuditRecord } from '../jumpserver/session-manager.js'
@@ -21,6 +25,14 @@ export interface Runtime {
   resolvePassword: (env?: string) => string | undefined
   configPath: string
   auditPath: string
+  /** V0.4.0: incremental audit sink (console + jumpserver_audit read it). */
+  audit: AuditStore
+  /** V0.4.0: streaming jobs (tail -f / journalctl -f / tcpdump …). */
+  jobs: JobStore
+  /** V0.4.0: last topology result, shared with the console's 拓扑 tab. */
+  topology: TopologyStore
+  /** V0.4.0: display timezone for audit timestamps (storage stays UTC). */
+  timeZone: string
   dispose: () => void
 }
 
@@ -65,15 +77,22 @@ export function createRuntime(): Runtime {
     return literal !== undefined && literal.length > 0 ? literal : undefined
   }
 
+  const audit = new AuditStore(auditPath, {
+    ringSize: DEFAULT_AUDIT_RING_SIZE,
+    log: (message) => log(message),
+  })
+  // The sink directory is created once at boot; appends are asynchronous and
+  // never block the tool call that produced the record.
+  try {
+    mkdirSync(dirname(auditPath), { recursive: true })
+  } catch (error) {
+    log('audit dir create failed: ' + (error instanceof Error ? error.message : String(error)))
+  }
+
   const onAudit = (record: AuditRecord): void => {
     if (getConfig().enableAudit !== true) return
-    try {
-      mkdirSync(dirname(auditPath), { recursive: true })
-      appendFileSync(auditPath, JSON.stringify(record) + '\n', 'utf8')
-      notifyAuditRecord()
-    } catch (error) {
-      log('audit write failed: ' + (error instanceof Error ? error.message : String(error)))
-    }
+    audit.append(record)
+    notifyAuditRecord()
   }
 
   const grants = new SessionGrant()
@@ -95,7 +114,15 @@ export function createRuntime(): Runtime {
   // Embedded ops console (default on): audit mirror + live terminal + stats +
   // session control, served in-process. Browser auto-opens on the FIRST
   // audited command, not at boot.
-  startAuditViewer(auditPath, config.auditViewer, registry)
+  const jobs = new JobStore(registry)
+  const topology = new TopologyStore()
+
+  startAuditViewer(auditPath, config.auditViewer, registry, {
+    audit,
+    jobs,
+    topology,
+    timeZone: resolveTimeZone(config.timeZone),
+  })
 
   // Reap idle disconnected bundles (same role as the DSH host fiber timer).
   const timer = setInterval(() => {
@@ -114,8 +141,13 @@ export function createRuntime(): Runtime {
     resolvePassword,
     configPath,
     auditPath,
+    audit,
+    jobs,
+    topology,
+    timeZone: resolveTimeZone(config.timeZone),
     dispose: () => {
       clearInterval(timer)
+      jobs.dispose()
       registry.dispose()
     },
   }

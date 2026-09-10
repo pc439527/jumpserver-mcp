@@ -214,6 +214,8 @@ const READ_RULES: Record<string, ReaderRule> = {
   httpd: new Set(['v', 'V', 't', 'T', 'S']),
   apachectl: new Set(['S', 't', 'v', 'V']),
   jcmd: new Set(['l']),
+  // V0.4.0: jps only lists JVM processes (-l/-v/-m are display flags).
+  jps: 'any',
   java: new Set(['version']),
   node: new Set(['v', 'version']),
   python3: new Set(['V', 'version']),
