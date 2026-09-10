@@ -9,6 +9,7 @@
 import { classifyCommand } from '../security/permission.js'
 import { requireTargetAllowed } from '../security/target-scope.js'
 import { JumpServerError } from './errors.js'
+import { mapWithConcurrency } from './concurrency.js'
 import { applyProbe, detectRoles, emptyInventory, type HostInventory } from './host-parse.js'
 import { resolveProfile } from './profiles.js'
 import type { BatchCommandRequest, SessionManager } from './session-manager.js'
@@ -22,6 +23,8 @@ export interface InspectOptions {
   signal?: AbortSignal
   toolCallId?: string
   batchId?: string
+  /** V0.4.1: how many targets to survey at once (default 1 = sequential). */
+  concurrency?: number
 }
 
 export interface SkippedProbe {
@@ -73,47 +76,53 @@ export async function inspectTargets(
   }
 
   const inventories: HostInventory[] = []
-  for (const target of targets) {
-    requireTargetAllowed(getConfig(), target)
-    const commands: BatchCommandRequest[] = usable.map((c, index) => ({
-      command: c.step.command,
-      risk: c.classification.risk,
-      classification: {
+  // V0.4.1: bounded concurrency, result order == input order. Each target is
+  // still navigated and executed inside its own serialized manager turn.
+  const perTarget = await mapWithConcurrency(
+    targets,
+    async (target): Promise<HostInventory> => {
+      requireTargetAllowed(getConfig(), target)
+      const commands: BatchCommandRequest[] = usable.map((c, index) => ({
+        command: c.step.command,
         risk: c.classification.risk,
-        reason: c.classification.reason,
-        ruleId: c.classification.ruleId,
-        confidence: c.classification.confidence,
-        classifierVersion: c.classification.classifierVersion,
-        normalizedCommand: c.classification.normalizedCommand,
-      },
-      approvalRequired: false,
-      approvalResult: 'none',
-      batchIndex: index,
-      batchId: options.batchId,
-      toolCallId: options.toolCallId,
-    }))
-    const result = await manager.runTargetBatch({
-      target,
-      commands,
-      signal: options.signal,
-      toolCallId: options.toolCallId,
-      batchId: options.batchId,
-    })
-    if (result.error !== null) {
-      inventories.push(emptyInventory(target, used, result.error.code + ': ' + result.error.message))
-      continue
-    }
-    const inventory = emptyInventory(target, used)
-    result.commands.forEach((cmd, index) => {
-      const step = usable[index]?.step
-      if (step === undefined) return
-      if (cmd.error !== null) return
-      if (cmd.exitCode !== null && cmd.exitCode !== 0 && cmd.output.trim().length === 0) return
-      applyProbe(inventory, step.id, cmd.output, cmd.exitCode)
-    })
-    inventory.roles = detectRoles(inventory)
-    inventories.push(inventory)
-  }
+        classification: {
+          risk: c.classification.risk,
+          reason: c.classification.reason,
+          ruleId: c.classification.ruleId,
+          confidence: c.classification.confidence,
+          classifierVersion: c.classification.classifierVersion,
+          normalizedCommand: c.classification.normalizedCommand,
+        },
+        approvalRequired: false,
+        approvalResult: 'none',
+        batchIndex: index,
+        batchId: options.batchId,
+        toolCallId: options.toolCallId,
+      }))
+      const result = await manager.runTargetBatch({
+        target,
+        commands,
+        signal: options.signal,
+        toolCallId: options.toolCallId,
+        batchId: options.batchId,
+      })
+      if (result.error !== null) {
+        return emptyInventory(target, used, result.error.code + ': ' + result.error.message)
+      }
+      const inventory = emptyInventory(target, used)
+      result.commands.forEach((cmd, index) => {
+        const step = usable[index]?.step
+        if (step === undefined) return
+        if (cmd.error !== null) return
+        if (cmd.exitCode !== null && cmd.exitCode !== 0 && cmd.output.trim().length === 0) return
+        applyProbe(inventory, step.id, cmd.output, cmd.exitCode)
+      })
+      inventory.roles = detectRoles(inventory)
+      return inventory
+    },
+    { concurrency: options.concurrency ?? 1, signal: options.signal },
+  )
+  inventories.push(...perTarget)
 
   return {
     inventories,

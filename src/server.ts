@@ -158,6 +158,15 @@ async function main(): Promise<void> {
           args.refresh === true,
           typeof args.group === 'string' ? args.group : undefined,
         )
+        // V0.4.1: hand the listing to the console's 资产 tab (read-only mirror).
+        runtime.assets.set({
+          updatedAt: Date.now(),
+          filter: typeof args.filter === 'string' && args.filter.length > 0 ? args.filter : null,
+          group: typeof args.group === 'string' && args.group.length > 0 ? args.group : null,
+          reportedTotal: result.reportedTotal,
+          health: result.health,
+          assets: result.assets,
+        })
         return assetsToValue(result, { includeRawText: args.includeRawText === true })
       })
       return textRaw(renderAssetsResult(value))

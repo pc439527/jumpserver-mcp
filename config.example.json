@@ -7,8 +7,21 @@
   "timeZone": "Asia/Shanghai",
   "allowedTargets": [],
   "deniedTargets": [],
+  "batchConcurrency": 1,
+  "maxSessions": 4,
   "assetGroups": {
     "OA": { "keywords": ["OA", "portal", "workflow", "办公"] }
+  },
+  "runbooks": {
+    "oa-health": {
+      "title": "OA 集群健康巡检",
+      "description": "主机基础 + 网络监听 + 进程，逐台执行同样的只读检查。",
+      "steps": [
+        { "id": "host", "title": "主机基础", "profile": "basic" },
+        { "id": "net", "title": "监听端口", "profile": "network" },
+        { "id": "proc", "title": "进程 TOP", "profile": "process" }
+      ]
+    }
   },
   "auditViewer": {
     "enabled": true,

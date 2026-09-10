@@ -1,8 +1,8 @@
 # jumpserver-mcp
 
-JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server. Ported from `dsh-jumpserver` (v0.3.1) core. From v0.4.0 it is no longer just "AI safely executes JumpServer commands" — it is an **AI infrastructure investigation / fault-analysis platform**: fixed read-only probes, structured host inventory, evidence-annotated topology, streaming job model, and an embedded ops console (6 tabs).
+JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server. Ported from `dsh-jumpserver` (v0.3.1) core. From v0.4.0 it is no longer just "AI safely executes JumpServer commands" — it is an **AI infrastructure investigation / fault-analysis platform**: fixed read-only probes, structured host inventory, evidence-annotated topology, streaming job model, and an embedded ops console (7 tabs). v0.4.1 adds the fleet layer: bounded-concurrency surveys, config-driven runbooks, multi-host diffing, baseline drift detection, an assets tab, and console access tokens.
 
-## Tools (18)
+## Tools (22)
 
 | Tool | Purpose |
 |---|---|
@@ -19,6 +19,10 @@ JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server. Ported
 | `jumpserver_audit` | Read recent audit entries (in-chat; time displayed in the configured zone) |
 | `jumpserver_inspect` | Fixed read-only profile probes -> structured HostInventory |
 | `jumpserver_topology` | Build an evidence-annotated relationship graph between hosts |
+| `jumpserver_profile_run` | Run a NAMED runbook (config `runbooks`) across targets — same steps, every host |
+| `jumpserver_compare` | Run one command/profile on N hosts and report the DIFF (groups + outliers) |
+| `jumpserver_baseline_capture` | Snapshot a named baseline to `data/baselines/<name>.json` |
+| `jumpserver_baseline_compare` | Re-inspect and report DRIFT vs a saved baseline |
 | `jumpserver_interrupt` | Ctrl+C the remote shell NOW, re-verify, out-of-band (does not wait for the running op) |
 | `jumpserver_job_start` | Start a streaming job (`tail -f` / `journalctl -f` / `tcpdump`) |
 | `jumpserver_job_read` | Read the buffered + new output of a job |
@@ -38,6 +42,11 @@ When `requireArm: true`, `jumpserver_arm` / `jumpserver_disarm` (30-minute autho
 - **Audit timezone (V0.4.0)**: JSONL stays UTC; display uses `timeZone` (default `Asia/Shanghai`).
 - **Target scope (V0.4.0)**: `allowedTargets` / `deniedTargets` (substring match); deny always wins; every navigation and every `exec` against an already-entered asset is checked.
 - **Version single source (V0.4.0)**: `package.json` is the only truth; runtime `PLUGIN_VERSION` reads from there. `npm version` and the runtime can no longer drift.
+- **Bounded-concurrency surveys (V0.4.1)**: `batchConcurrency` (default 1 = strictly sequential) lets inspect / topology / compare / profile_run visit several targets at once. Result order always matches input order; one target's failure never aborts its siblings; a `Semaphore` caps simultaneous bastion sessions at `maxSessions` (default 4).
+- **Runbooks (V0.4.1)**: `jumpserver_profile_run` executes a named, reviewed recipe from config `runbooks`. Each step is an inspect profile or an explicit READ command; a non-READ step (or a typo'd profile) is SKIPPED and reported — never silently executed.
+- **Multi-host diff (V0.4.1)**: `jumpserver_compare` runs the SAME read-only command/profile on every target and groups them by signature, reporting each outlier's missing/extra lines versus the majority. Order-insensitive, so `ss`/`ps` line ordering does not create false diffs.
+- **Baseline drift (V0.4.1)**: `jumpserver_baseline_capture` persists a compact state snapshot to `data/baselines/<name>.json`; `jumpserver_baseline_compare` re-inspects and reports real drift (ports, disks, services, roles, kernel, cores; load/memory jitter is suppressed). An unreachable host is reported as unreachable, never as "unchanged".
+- **Console access token (V0.4.1)**: the embedded console binds to 127.0.0.1 but every request must present a per-process random token (`/?token=…` or the `X-Console-Token` header) — otherwise 403. The token is handed over only in the model's console URL.
 
 ## Configuration
 
@@ -51,7 +60,10 @@ Copy `config.example.json` to `config.json`, fill `host` / `username`. The passw
 | `timeZone` | `Asia/Shanghai` | Display zone for audit timestamps (storage is still UTC) |
 | `allowedTargets` | `[]` | Substring allow-list, e.g. `["192.168.79.", "oa-"]` |
 | `deniedTargets` | `[]` | Substring deny-list (checked first) |
+| `batchConcurrency` | `1` | Targets surveyed at once per batch/inspect/compare call (1..8; 1 = sequential) |
+| `maxSessions` | `4` | Cap on simultaneous bastion sessions (1..16) |
 | `assetGroups` | `{}` | Named group -> keywords, used by `jumpserver_assets` |
+| `runbooks` | `{}` | Named runbook -> `{ title, steps[] }`; each step is a `profile` or a READ `command` |
 | `auditPath` | `<root>/data/audit.jsonl` | JSONL audit sink |
 | `auditViewer.{enabled,port,autoOpen,portFallback}` | `true/8765/true/true` | Embedded console |
 | `requireArm` | `false` | Require `jumpserver_arm` before any tool runs |
@@ -66,7 +78,7 @@ Copy `config.example.json` to `config.json`, fill `host` / `username`. The passw
       "command": "node",
       "args": ["C:/Users/114976/WorkBuddy/jumpserver-mcp/lib/server.js"],
       "env": { "JUMPSERVER_PASSWORD": "..." },
-      "description": "JumpServer MCP v0.4.0: fixed probes, host inventory, evidence topology, streaming jobs"
+      "description": "JumpServer MCP v0.4.1: fixed probes, host inventory, evidence topology, streaming jobs, runbooks, compare, baselines"
     }
   }
 }
@@ -74,11 +86,12 @@ Copy `config.example.json` to `config.json`, fill `host` / `username`. The passw
 
 ## Embedded ops console
 
-Once the MCP process starts it serves a local page on `127.0.0.1:<port>/` (default 8765; if taken it auto-falls back to an ephemeral port so every conversation gets its own console). The model receives the URL in the first tool response and must open it with `present_files` (WorkBuddy's built-in preview panel) — **do not** use the system browser. Each conversation has its own port; closing the conversation invalidates the page.
+Once the MCP process starts it serves a local page on `127.0.0.1:<port>/?token=<random>` (default 8765; if taken it auto-falls back to an ephemeral port so every conversation gets its own console). Every request must carry the token, so a stray local process cannot read the audit trail or drive the interrupt API. The model receives the tokenized URL in the first tool response and must open it with `present_files` (WorkBuddy's built-in preview panel) — **do not** use the system browser. Each conversation has its own port; closing the conversation invalidates the page.
 
 Tabs:
 
 - **Live terminal** — real-time PTY mirror, input echo, state-transition markers; "Interrupt current command (Ctrl+C)" / Clear / Auto-scroll.
+- **Assets** — last `jumpserver_assets` listing with search, group/platform/status filters, and name/IP/platform/node/role/status columns; roles come from the last topology, status from the last 30 minutes of audit activity. Also lists saved baselines.
 - **Topology** — last `jumpserver_topology` result: node cards + edge list (with confidence + evidence) + per-node detail (roles, OS, ports, IPs, in/out edges, memory, load).
 - **Jobs** — streaming jobs (`jsjob_xxxx`) of this conversation: progress bar, Stop button, output tail.
 - **Audit log** — `AuditStore` memory ring (5000) in the configured timezone; supports `callId` / `batchId`; JSONL / CSV export.
@@ -111,6 +124,11 @@ Test coverage (`tests/`):
 - `jumpserver/host-parse.test.mjs` — every parser.
 - `jumpserver/topology.test.mjs` — edge construction and evidence.
 - `inspect/profile-safety.test.mjs` — every profile command is still READ.
+- `jumpserver/concurrency.test.mjs` — bounded concurrency order/limit, abort, `Semaphore`.
+- `jumpserver/runbook.test.mjs` — non-READ / unknown-profile steps are skipped, never scheduled.
+- `jumpserver/compare.test.mjs` — order-insensitive grouping, outlier missing/extra, failed hosts excluded.
+- `runtime/baseline.test.mjs` — baseline save/load, name safety, drift diff, jitter suppression.
+- `runtime/console-token.test.mjs` — 403 without token, 200 with token / header.
 - `runtime/audit-store.test.mjs` — async append, ring cap, incremental tail.
 - `runtime/time.test.mjs` — timezone formatting.
 

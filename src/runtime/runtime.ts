@@ -10,6 +10,8 @@ import { parseConfig, type McpConfig } from '../config/schema.js'
 import { AuditStore, DEFAULT_AUDIT_RING_SIZE } from './audit-store.js'
 import { JobStore } from './job-store.js'
 import { TopologyStore } from './topology-store.js'
+import { BaselineStore } from './baseline-store.js'
+import { AssetStore } from './asset-store.js'
 import { resolveTimeZone } from './time.js'
 import { startAuditViewer, notifyAuditRecord } from './audit-viewer.js'
 import { SessionManager } from '../jumpserver/session-manager.js'
@@ -31,6 +33,10 @@ export interface Runtime {
   jobs: JobStore
   /** V0.4.0: last topology result, shared with the console's 拓扑 tab. */
   topology: TopologyStore
+  /** V0.4.1: named baselines for drift detection (data/baselines/*.json). */
+  baselines: BaselineStore
+  /** V0.4.1: last asset listing, shared with the console's 资产 tab. */
+  assets: AssetStore
   /** V0.4.0: display timezone for audit timestamps (storage stays UTC). */
   timeZone: string
   dispose: () => void
@@ -116,11 +122,15 @@ export function createRuntime(): Runtime {
   // audited command, not at boot.
   const jobs = new JobStore(registry)
   const topology = new TopologyStore()
+  const baselines = new BaselineStore(join(root, 'data', 'baselines'))
+  const assets = new AssetStore()
 
   startAuditViewer(auditPath, config.auditViewer, registry, {
     audit,
     jobs,
     topology,
+    assets,
+    baselines,
     timeZone: resolveTimeZone(config.timeZone),
   })
 
@@ -144,6 +154,8 @@ export function createRuntime(): Runtime {
     audit,
     jobs,
     topology,
+    baselines,
+    assets,
     timeZone: resolveTimeZone(config.timeZone),
     dispose: () => {
       clearInterval(timer)

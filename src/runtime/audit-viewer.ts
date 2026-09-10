@@ -23,6 +23,7 @@
  *     and render in the configured timezone (storage stays UTC).
  */
 import http from 'node:http'
+import { randomBytes } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { SessionRegistry } from '../jumpserver/session-registry.js'
@@ -30,6 +31,8 @@ import type { TerminalEvent } from '../jumpserver/terminal-observer.js'
 import type { AuditStore } from './audit-store.js'
 import type { JobStore } from './job-store.js'
 import type { TopologyStore } from './topology-store.js'
+import type { AssetStore } from './asset-store.js'
+import type { BaselineStore } from './baseline-store.js'
 
 export interface AuditViewerOptions {
   enabled: boolean
@@ -44,6 +47,10 @@ export interface AuditViewerServices {
   audit?: AuditStore | null
   jobs?: JobStore | null
   topology?: TopologyStore | null
+  /** V0.4.1: last asset listing, rendered by the 资产 tab. */
+  assets?: AssetStore | null
+  /** V0.4.1: named baselines (data/baselines) for the 资产 tab's drift column. */
+  baselines?: BaselineStore | null
   /** IANA display zone for audit timestamps (default Asia/Shanghai). */
   timeZone?: string
 }
@@ -61,6 +68,24 @@ let consoleDir: string | null = null
 let consoleFile: string | null = null
 /** Whether this process hands its console URL to the model (config: auditViewer.autoOpen). */
 let hintEnabled = true
+/**
+ * V0.4.1: per-process random access token. The console binds to 127.0.0.1, but
+ * any local process (or a browser tab) could otherwise read the audit trail and
+ * drive /api/interrupt. Every request must carry ?token=… (or the X-Console-Token
+ * header); requests without it get 403. The token lives only in memory and in
+ * the handover URL, never in a log.
+ */
+let consoleToken: string | null = null
+const TOKEN_HEADER = 'x-console-token'
+
+/** Constant-time-ish compare (length is public; content comparison is cheap and adequate here). */
+function tokenMatches(candidate: string | null): boolean {
+  if (consoleToken === null) return true
+  if (candidate === null || candidate.length !== consoleToken.length) return false
+  let diff = 0
+  for (let i = 0; i < candidate.length; i += 1) diff |= candidate.charCodeAt(i) ^ consoleToken.charCodeAt(i)
+  return diff === 0
+}
 
 /** Parse the JSONL audit sink; a missing or partially written file yields what is readable. */
 export function readAuditEntries(file: string): Record<string, unknown>[] {
@@ -167,6 +192,7 @@ tr:hover td{background:#1d1d1d}
   <div class="dot"></div><h1>JumpServer MCP 控制台</h1>
   <nav>
     <button data-tab="terminal">实时终端</button>
+    <button data-tab="assets">资产</button>
     <button data-tab="topology">拓扑</button>
     <button data-tab="jobs">任务</button>
     <button data-tab="audit">审计日志</button>
@@ -186,6 +212,28 @@ tr:hover td{background:#1d1d1d}
     <span style="color:#777;font-size:12px">中断会向远端 Shell 发送 Ctrl+C 并重新验证，不会断开会话。</span>
   </div>
   <div class="termbox" id="term"></div>
+</section>
+
+<section id="tab-assets">
+  <div class="sessbar">
+    <input type="text" id="assq" placeholder="搜索：名称 / IP / 平台 / 节点 / 备注" style="width:260px">
+    <select id="assgroup" title="按分组（节点）筛选"></select>
+    <select id="assplatform" title="按平台筛选"></select>
+    <select id="assstatus" title="按状态筛选">
+      <option value="">全部状态</option>
+      <option value="active">活跃（近期访问）</option>
+      <option value="idle">未访问</option>
+    </select>
+    <button class="act" id="ass-refresh">刷新</button>
+    <span style="color:#777;font-size:12px" id="assmeta"></span>
+  </div>
+  <div class="tw"><table><thead><tr>
+    <th style="width:40px">#</th><th style="width:200px">名称</th><th style="width:135px">IP</th>
+    <th style="width:90px">平台</th><th style="width:150px">分组 / 节点</th><th style="width:120px">角色</th>
+    <th style="width:100px">状态</th><th>备注</th>
+  </tr></thead><tbody id="assrows"></tbody></table></div>
+  <div id="assempty" style="display:none;color:#888;padding:14px">暂无资产数据 — 让 AI 调用一次 jumpserver_assets 后此处会显示缓存清单。</div>
+  <div class="grp" style="margin-top:12px"><h3>基线（漂移检测）</h3><div id="assbaselines" style="color:#999;font-size:12px">无</div></div>
 </section>
 
 <section id="tab-topology">
@@ -270,8 +318,14 @@ function showDead(){
 }
 $('dead-close').addEventListener('click', function(){ window.close(); });
 /* fetch wrapper: any success resets the dead-counter; N misses => expired overlay */
+/* V0.4.1: every request must carry the console access token from the URL. */
+var TOKEN = (new URLSearchParams(location.search)).get('token') || '';
+function withToken(u){
+  if (!TOKEN) return u;
+  return u + (u.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+}
 function F(u,o){
-  return fetch(u,o).then(function(r){failCount=0;return r;}).catch(function(e){failCount++;if(failCount>=${DEAD_AFTER_FAILURES})showDead();throw e;});
+  return fetch(withToken(u),o).then(function(r){failCount=0;return r;}).catch(function(e){failCount++;if(failCount>=${DEAD_AFTER_FAILURES})showDead();throw e;});
 }
 function POST(u,body){
   return F(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
@@ -289,12 +343,13 @@ function showTab(name){
   if (name==='sessions') pollSessions();
   if (name==='topology') pollTopology();
   if (name==='jobs') pollJobs();
+  if (name==='assets') pollAssets();
 }
 var navBtns = document.querySelectorAll('nav button');
 for (var b=0;b<navBtns.length;b++){
   (function(btn){btn.addEventListener('click',function(){showTab(btn.getAttribute('data-tab'));});})(navBtns[b]);
 }
-showTab(['terminal','topology','jobs','audit','stats','sessions'].indexOf(tab)>=0?tab:'audit');
+showTab(['terminal','assets','topology','jobs','audit','stats','sessions'].indexOf(tab)>=0?tab:'audit');
 
 /* ---- terminal ---- */
 function renderChips(list){
@@ -356,6 +411,87 @@ $('btn-interrupt').addEventListener('click',function(){
     alert(j.interrupted ? ('已发送 Ctrl+C；' + (j.verified ? 'Shell 已重新验证可用' : 'Shell 未能验证，已降级为 UNKNOWN')) : '当前没有可中断的活动会话');
   }).catch(function(){});
 });
+
+/* ---- assets (V0.4.1) ---- */
+var assetData = null;
+/* Activity: a target is "活跃" when the audit log mentions it in the last 30 min. */
+function activeTargets(){
+  var set = {}, cut = Date.now() - 30*60*1000;
+  for (var i=0;i<auditAll.length;i++){
+    var e = auditAll[i];
+    var t = String(e.target || e.hostname || '');
+    if (!t) continue;
+    var ts = Date.parse(String(e.timestamp||''));
+    if (!isNaN(ts) && ts >= cut) set[t] = true;
+  }
+  return set;
+}
+function fillSelect(id, values, allLabel){
+  var el = $(id); if (!el) return;
+  var cur = el.value;
+  var html = '<option value="">'+esc(allLabel)+'</option>';
+  values.sort().forEach(function(v){ html += '<option value="'+esc(v)+'">'+esc(v)+'</option>'; });
+  el.innerHTML = html;
+  if (values.indexOf(cur)>=0) el.value = cur;
+}
+function renderAssets(){
+  var rows = $('assrows');
+  if (!assetData || !assetData.assets || !assetData.assets.length){
+    rows.innerHTML=''; $('assempty').style.display='block'; $('assmeta').textContent=''; return;
+  }
+  $('assempty').style.display='none';
+  var q = ($('assq').value||'').toLowerCase();
+  var gsel = $('assgroup').value, psel = $('assplatform').value, ssel = $('assstatus').value;
+  var active = activeTargets();
+  var roles = assetData.roles || {};
+  var list = assetData.assets.filter(function(a){
+    if (gsel && String(a.node||'') !== gsel) return false;
+    if (psel && String(a.platform||'') !== psel) return false;
+    var isActive = !!(a.ip && active[a.ip]) || !!(a.name && active[a.name]);
+    if (ssel === 'active' && !isActive) return false;
+    if (ssel === 'idle' && isActive) return false;
+    if (q){
+      var hay = [a.name,a.ip,a.platform,a.node,a.comment,a.raw].join(' ').toLowerCase();
+      if (hay.indexOf(q) < 0) return false;
+    }
+    return true;
+  });
+  rows.innerHTML = list.map(function(a){
+    var isActive = !!(a.ip && active[a.ip]) || !!(a.name && active[a.name]);
+    var role = roles[a.ip] || roles[a.name] || [];
+    return '<tr>'
+      + '<td style="color:#666">'+esc(a.index==null?'':a.index)+'</td>'
+      + '<td>'+esc(a.name||'-')+'</td>'
+      + '<td style="font-family:ui-monospace,Consolas,monospace">'+esc(a.ip||'-')+'</td>'
+      + '<td>'+esc(a.platform||'-')+'</td>'
+      + '<td>'+esc(a.node||'-')+'</td>'
+      + '<td>'+esc(role.length?role.join(', '):'-')+'</td>'
+      + '<td>'+(isActive?'<span style="color:#7ad17a">活跃</span>':'<span style="color:#888">未访问</span>')+'</td>'
+      + '<td style="color:#999">'+esc(a.comment||'')+'</td>'
+      + '</tr>';
+  }).join('');
+  $('assmeta').textContent = '共 ' + (assetData.assets.length) + ' 项 · 显示 ' + list.length + ' 项'
+    + (assetData.updatedAt ? ' · 采集于 ' + fmtTime(new Date(assetData.updatedAt).toISOString()) : '')
+    + (assetData.reportedTotal!=null ? ' · KoKo 报告总数 ' + assetData.reportedTotal : '');
+  var bl = assetData.baselines || [];
+  $('assbaselines').innerHTML = bl.length ? bl.map(function(n){return '<span class="sesschip">'+esc(n)+'</span>';}).join(' ') : '无（用 jumpserver_baseline_capture 创建）';
+}
+function pollAssets(){
+  if (tab!=='assets') return;
+  F('/api/assets').then(function(r){return r.json();}).then(function(j){
+    assetData = j;
+    var nodes = {}, plats = {};
+    (j.assets||[]).forEach(function(a){ if(a.node) nodes[a.node]=1; if(a.platform) plats[a.platform]=1; });
+    fillSelect('assgroup', Object.keys(nodes), '全部分组');
+    fillSelect('assplatform', Object.keys(plats), '全部平台');
+    renderAssets();
+  }).catch(function(){});
+}
+['assq','assgroup','assplatform','assstatus'].forEach(function(id){
+  var el = $(id); if (el) el.addEventListener('input', renderAssets);
+});
+var assRefresh = $('ass-refresh');
+if (assRefresh) assRefresh.addEventListener('click', function(){ pollAssets(); });
 
 /* ---- topology (V0.4.0) ---- */
 function renderTopology(){
@@ -586,6 +722,26 @@ function lastSeqOf(events: TerminalEvent[]): number {
 }
 
 /**
+ * V0.4.1: project the last topology into a target -> roles map so the 资产 tab
+ * can render a 角色 column. Tolerant of the loosely-typed stored node shape:
+ * a node without roles simply does not appear.
+ */
+function topologyRoles(store: TopologyStore | null): Record<string, string[]> {
+  const current = store?.get() ?? null
+  if (current === null) return {}
+  const out: Record<string, string[]> = {}
+  for (const node of current.nodes) {
+    if (typeof node !== 'object' || node === null) continue
+    const record = node as { id?: unknown; target?: unknown; roles?: unknown }
+    const key = typeof record.target === 'string' ? record.target : typeof record.id === 'string' ? record.id : null
+    if (key === null) continue
+    const roles = Array.isArray(record.roles) ? record.roles.filter((r): r is string => typeof r === 'string') : []
+    if (roles.length > 0) out[key] = roles
+  }
+  return out
+}
+
+/**
  * There is NO browser launch here on purpose. A MCP server runs as a detached
  * child process: any shell-open it performs lands in the OS default browser
  * (Chrome/Edge), not in the WorkBuddy preview panel. The only available path is
@@ -603,7 +759,7 @@ export function consoleHintForModel(): string | null {
   if (url === null || hintEnabled !== true) return null
   return (
     '[jumpserver-console] 本对话的 JumpServer 工作台: ' + url + '\n' +
-    '请立即调用 present_files 打开这个 URL（会显示在 WorkBuddy 内置预览面板里，实时终端/拓扑/任务/审计/统计/会话六个页签）。\n' +
+    '请立即调用 present_files 打开这个 URL（会显示在 WorkBuddy 内置预览面板里，实时终端/资产/拓扑/任务/审计/统计/会话七个页签）。\n' +
     '禁止改用系统浏览器打开（不要 rundll32 / start / explorer / 外部浏览器），每个对话端口独立，关掉对话即失效。'
   )
 }
@@ -623,13 +779,24 @@ export function startAuditViewer(
   if (opts.enabled !== true) return null
   hintEnabled = opts.autoOpen
   consoleDir = join(dirname(auditPath), 'consoles')
+  consoleToken = randomBytes(16).toString('hex')
   const audit = services.audit ?? null
+  const assets = services.assets ?? null
+  const baselines = services.baselines ?? null
   const timeZone = services.timeZone ?? 'Asia/Shanghai'
   const server = http.createServer((req, res) => {
     void (async () => {
       const target = req.url ?? '/'
       const href = target.split('?')[0] ?? '/'
       const query = new URLSearchParams(target.split('?')[1] ?? '')
+      // V0.4.1: every request must present the token (query or header).
+      const presented = query.get('token') ?? (typeof req.headers[TOKEN_HEADER] === 'string' ? (req.headers[TOKEN_HEADER] as string) : null)
+      if (!tokenMatches(presented)) {
+        res.statusCode = 403
+        res.setHeader('content-type', 'text/plain; charset=utf-8')
+        res.end('forbidden: missing or invalid console token')
+        return
+      }
       const entries = (): Record<string, unknown>[] => (audit !== null ? audit.list() : readAuditEntries(auditPath))
       if (href === '/api/entries') {
         sendJson(res, entries())
@@ -664,6 +831,26 @@ export function startAuditViewer(
           byOperation,
           byTarget,
           byDay,
+        })
+        return
+      }
+      if (href === '/api/assets') {
+        const snapshot = assets?.get() ?? null
+        if (snapshot === null) {
+          sendJson(res, { updatedAt: null, assets: [], baselines: baselines?.list() ?? [], roles: {} })
+          return
+        }
+        sendJson(res, {
+          updatedAt: snapshot.updatedAt,
+          filter: snapshot.filter,
+          group: snapshot.group,
+          reportedTotal: snapshot.reportedTotal,
+          health: snapshot.health,
+          assets: snapshot.assets,
+          baselines: baselines?.list() ?? [],
+          // V0.4.1: role hints from the last topology, so the 资产 tab can show a
+          // 角色 column without the console ever touching the bastion.
+          roles: topologyRoles(services.topology ?? null),
         })
         return
       }
@@ -792,11 +979,11 @@ export function startAuditViewer(
   server.on('listening', () => {
     const address = server.address()
     const port = typeof address === 'object' && address !== null ? address.port : opts.port
-    viewerUrl = 'http://127.0.0.1:' + String(port) + '/'
+    viewerUrl = consoleUrl(port)
     if (port !== opts.port) {
-      console.error('[jumpserver-mcp] ops console: port ' + String(opts.port) + ' busy, using ' + viewerUrl)
+      console.error('[jumpserver-mcp] ops console: port ' + String(opts.port) + ' busy, using port ' + String(port))
     } else {
-      console.error('[jumpserver-mcp] ops console: ' + viewerUrl)
+      console.error('[jumpserver-mcp] ops console: port ' + String(port))
     }
     startHeartbeat(port)
   })
@@ -806,7 +993,13 @@ export function startAuditViewer(
     console.error('[jumpserver-mcp] ops console: ' + (error instanceof Error ? error.message : String(error)))
   }
   server.unref?.()
-  return 'http://127.0.0.1:' + String(opts.port) + '/'
+  return consoleUrl(opts.port)
+}
+
+/** V0.4.1: the console URL always carries the access token. */
+function consoleUrl(port: number): string {
+  const token = consoleToken !== null ? '?token=' + consoleToken : ''
+  return 'http://127.0.0.1:' + String(port) + '/' + token
 }
 
 /**

@@ -1,8 +1,12 @@
 import { z } from 'zod'
 import {
   DEFAULT_ASSET_CACHE_TTL_SECONDS,
+  DEFAULT_BATCH_CONCURRENCY,
+  DEFAULT_MAX_SESSIONS,
   DEFAULT_PASSWORD_ENV,
   DEFAULT_TERMINAL_SCROLLBACK,
+  MAX_BATCH_CONCURRENCY,
+  MAX_SESSIONS_CEILING,
   type JumpServerConfig,
   type PermissionMode,
 } from './types.js'
@@ -47,8 +51,29 @@ const configSchema = z.object({
   timeZone: z.string().optional(),
   allowedTargets: z.array(z.string()).optional(),
   deniedTargets: z.array(z.string()).optional(),
+  batchConcurrency: z.number().int().min(1).max(MAX_BATCH_CONCURRENCY).optional(),
+  maxSessions: z.number().int().min(1).max(MAX_SESSIONS_CEILING).optional(),
   assetCacheTtlSeconds: z.number().optional(),
   assetGroups: z.record(z.object({ keywords: z.array(z.string()) })).optional(),
+  runbooks: z
+    .record(
+      z.object({
+        title: z.string().optional(),
+        description: z.string().optional(),
+        steps: z
+          .array(
+            z.object({
+              id: z.string().min(1),
+              title: z.string().optional(),
+              profile: z.string().optional(),
+              command: z.string().optional(),
+              timeout: z.number().optional(),
+            }),
+          )
+          .min(1),
+      }),
+    )
+    .optional(),
   autoReconnect: z.boolean().optional(),
   enableAudit: z.boolean().optional(),
   auditPath: z.string().optional(),
@@ -83,8 +108,11 @@ export function parseConfig(input: unknown): McpConfig {
     timeZone: raw.timeZone,
     allowedTargets: raw.allowedTargets,
     deniedTargets: raw.deniedTargets,
+    batchConcurrency: raw.batchConcurrency ?? DEFAULT_BATCH_CONCURRENCY,
+    maxSessions: raw.maxSessions ?? DEFAULT_MAX_SESSIONS,
     assetCacheTtlSeconds: raw.assetCacheTtlSeconds ?? DEFAULT_ASSET_CACHE_TTL_SECONDS,
     assetGroups: raw.assetGroups,
+    runbooks: raw.runbooks,
     autoReconnect: raw.autoReconnect ?? true,
     enableAudit: raw.enableAudit ?? true,
     requireArm: raw.requireArm ?? false,

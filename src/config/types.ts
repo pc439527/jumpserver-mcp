@@ -61,6 +61,20 @@ export interface JumpServerConfig {
   allowedTargets?: string[]
   /** V0.4.0 scope guard: these targets are always refused (checked first). */
   deniedTargets?: string[]
+  /**
+   * V0.4.1: how many targets of ONE batch/inspect/topology call may be
+   * processed concurrently (each target still gets its own serialized
+   * session turn). Default 1 (strictly sequential — the safe, auditable
+   * baseline). Raise deliberately: more concurrency = more simultaneous
+   * bastion sessions, which the bastion may rate-limit or audit differently.
+   */
+  batchConcurrency?: number
+  /**
+   * V0.4.1: hard cap on simultaneous JumpServer sessions (the session pool).
+   * Default 4. When every slot is busy, further targets wait instead of
+   * opening yet another bastion login.
+   */
+  maxSessions?: number
   /** How long one capture of the KoKo 'p' asset list is cached per conversation (seconds; default 300). */
   assetCacheTtlSeconds?: number
   /**
@@ -70,6 +84,11 @@ export interface JumpServerConfig {
    * "OA" server without the model guessing raw substrings.
    */
   assetGroups?: Record<string, AssetGroupDef>
+  /**
+   * V0.4.1: named runbooks (Profile / Runbook) — a reusable, reviewed survey
+   * recipe. jumpserver_profile_run executes one by name against a target set.
+   */
+  runbooks?: Record<string, RunbookDef>
   /** Auto reconnect at most 2 times with 1s/3s backoff when idle (default true) */
   autoReconnect: boolean
   /** Persist command audit records (default true) */
@@ -79,6 +98,35 @@ export interface JumpServerConfig {
 /** V0.2.6: one asset group definition (keyword list). */
 export interface AssetGroupDef {
   keywords: string[]
+}
+
+/**
+ * V0.4.1: one named runbook step.
+ *
+ * A step is EITHER an inspect profile (the connector supplies the reviewed
+ * read-only probes) OR an explicit command. Explicit commands are re-classified
+ * by the same classifier every other tool uses: a step that is not READ is
+ * skipped (reported), never silently executed — so a runbook is safe in
+ * READ_ONLY mode by construction.
+ */
+export interface RunbookStep {
+  /** Stable id echoed in the result so a step can be referenced in reports. */
+  id: string
+  /** Human label (optional). */
+  title?: string
+  /** Inspect profile to run for this step (mutually exclusive with command). */
+  profile?: string
+  /** Explicit read-only command (mutually exclusive with profile). */
+  command?: string
+  /** Per-step timeout in seconds. */
+  timeout?: number
+}
+
+/** V0.4.1: a named runbook = an ordered list of read-only steps. */
+export interface RunbookDef {
+  title?: string
+  description?: string
+  steps: RunbookStep[]
 }
 
 /** Default terminal scrollback (rows). */
@@ -105,6 +153,16 @@ export const MAX_OUTPUT_BYTES = 1024 * 1024
 
 /** Max per-command timeout allowed (10 min). */
 export const MAX_COMMAND_TIMEOUT_MS = 600000
+
+/** V0.4.1: default concurrency for a multi-target batch (1 = sequential). */
+export const DEFAULT_BATCH_CONCURRENCY = 1
+
+/** V0.4.1: default session-pool size (simultaneous bastion sessions). */
+export const DEFAULT_MAX_SESSIONS = 4
+
+/** V0.4.1: hard ceiling for batchConcurrency / maxSessions (protects the bastion). */
+export const MAX_BATCH_CONCURRENCY = 8
+export const MAX_SESSIONS_CEILING = 16
 
 /** Bounded capture window for the KoKo 'p' asset-list screen (bytes). */
 export const MAX_ASSET_CAPTURE_BYTES = 256 * 1024

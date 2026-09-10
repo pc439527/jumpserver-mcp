@@ -32,6 +32,12 @@ export const JUMP_ERROR_CODES = [
   'TOO_MANY_TARGETS',
   // V0.3.1: an ops profile command the classifier does not confirm as READ.
   'PROFILE_RISK_MISMATCH',
+  // V0.4.1: runbook / compare / baseline.
+  'UNKNOWN_RUNBOOK',
+  'RUNBOOK_NO_READ_STEPS',
+  'UNKNOWN_BASELINE',
+  'BASELINE_MISMATCH',
+  'INVALID_ARGUMENT',
 ] as const
 
 export type JumpServerErrorCode = (typeof JUMP_ERROR_CODES)[number]

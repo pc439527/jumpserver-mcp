@@ -18,6 +18,9 @@ import { inspectTargets } from '../jumpserver/inspector.js'
 import { buildTopology, renderTopology } from '../jumpserver/topology.js'
 import type { HostInventory } from '../jumpserver/host-parse.js'
 import { INSPECT_PROFILES, type InspectProfile } from '../jumpserver/profiles.js'
+import { resolveRunbook, runRunbook, type RunbookResult } from '../jumpserver/runbook.js'
+import { compareTargets, type CompareResult } from '../jumpserver/compare.js'
+import { diffBaseline, type Baseline, type BaselineHost, type DriftResult } from './baseline-store.js'
 import { requireTargetAllowed } from '../security/target-scope.js'
 import { classifyCommand } from '../security/permission.js'
 import { JumpServerError } from '../jumpserver/errors.js'
@@ -41,6 +44,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
         profile: z.union([z.enum(INSPECT_PROFILES), z.array(z.enum(INSPECT_PROFILES))]).optional().describe('Probe profile(s), default "basic". "full" runs every profile.'),
         group: z.string().optional().describe('Instead of targets: a configured asset group (e.g. "OA") — every asset of that group is inspected.'),
         format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured inventory).'),
+        concurrency: z.number().int().min(1).max(8).optional().describe('How many targets to survey at once (default: batchConcurrency setting). Raise for a large estate; each target still gets its own bastion session turn.'),
       },
       annotations: { readOnlyHint: true },
     },
@@ -57,6 +61,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           signal: exec.signal,
           toolCallId: String(exec.callId),
           batchId: 'ins_' + randomHex(6),
+          concurrency: args.concurrency ?? host.getConfig().batchConcurrency ?? 1,
         })
         const head = 'ok inspect profile=' + result.profiles.join(',') +
           ' targets=' + result.targets + ' reachable=' + result.reachable +
@@ -81,6 +86,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
         profiles: z.array(z.enum(INSPECT_PROFILES)).optional().describe('Probe profiles for the survey (default: network, process, web).'),
         depth: z.number().int().min(1).max(3).optional().describe('1 = direct evidence only (default); 2+ also links nodes sharing one upstream.'),
         format: z.enum(['text', 'json']).optional().describe('text (default, tree) or json (nodes + edges).'),
+        concurrency: z.number().int().min(1).max(8).optional().describe('How many targets to survey at once (default: batchConcurrency setting).'),
       },
       annotations: { readOnlyHint: true },
     },
@@ -99,6 +105,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           signal: exec.signal,
           toolCallId: String(exec.callId),
           batchId: 'topo_' + randomHex(6),
+          concurrency: args.concurrency ?? host.getConfig().batchConcurrency ?? 1,
         })
         const topology = buildTopology(result.inventories, { depth: args.depth ?? 1 })
         runtime.topology.set({
@@ -119,6 +126,170 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           renderTopology(topology),
           ...(topology.edges.length > 0 ? ['', 'edges (json):', JSON.stringify(topology.edges)] : []),
         ].join('\n')
+      }))
+    },
+  )
+
+  // ---------------------------------------------------------- profile_run
+  server.registerTool(
+    'jumpserver_profile_run',
+    {
+      description:
+        'Run a NAMED runbook (a reviewed, reusable survey recipe defined in config under "runbooks") against one or more servers. Each step is either an inspect profile or an explicit READ-only command; non-READ steps are SKIPPED and reported, never executed. Use this instead of hand-assembling the same set of checks for several hosts: it guarantees the exact same steps run on every target, and the results come back grouped per target and per step. Call it with a runbook name (see the config) plus targets[] or a configured group.',
+      inputSchema: {
+        runbook: z.string().describe('Runbook name as defined in config.json under "runbooks", e.g. "oa-health".'),
+        targets: z.array(z.string()).optional().describe('Target IPs or asset names (max 20). Omit when using group.'),
+        group: z.string().optional().describe('Configured asset group (e.g. "OA") — the runbook runs on every asset of that group.'),
+        format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured result).'),
+        concurrency: z.number().int().min(1).max(8).optional().describe('How many targets to run at once (default: batchConcurrency setting).'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args, extra) => {
+      const exec: ToolRunContext = { name: 'jumpserver_profile_run', callId: extra.requestId, signal: extra.signal, confirm: false }
+      return toolTextRaw(await guardText(exec, async (): Promise<string> => {
+        const blocked = host.requireGrant(exec)
+        if (blocked !== null) return render(blocked)
+        const bundle = host.bundleFor(exec)
+        const def = resolveRunbook(host.getConfig().runbooks, args.runbook)
+        const targets = await resolveTargets(host, bundle, exec, args.targets, args.group)
+        const result = await runRunbook(bundle.manager, host.getConfig, args.runbook, def, {
+          targets,
+          signal: exec.signal,
+          toolCallId: String(exec.callId),
+          batchId: 'rbk_' + randomHex(6),
+          concurrency: args.concurrency ?? host.getConfig().batchConcurrency ?? 1,
+        })
+        if (args.format === 'json') return JSON.stringify({ ok: true, ...result }, null, 2)
+        return renderRunbook(result)
+      }))
+    },
+  )
+
+  // -------------------------------------------------------------- compare
+  server.registerTool(
+    'jumpserver_compare',
+    {
+      description:
+        'Run the SAME read-only command (or inspect profile) across several servers and report what DIFFERS — which host has a different config, a missing listener, a full disk. Returns groups of identical hosts plus, for each outlier, the lines it is missing / has extra versus the majority. Use this for "are these 6 nodes configured the same?" / "which one is different?" questions instead of eyeballing 6 raw dumps. Only READ commands are accepted; a mutating command refuses the whole call.',
+      inputSchema: {
+        targets: z.array(z.string()).min(2).max(20).describe('Target IPs or asset names to compare (2..20).'),
+        command: z.string().optional().describe('One read-only command to run on every target (mutually exclusive with profile).'),
+        profile: z.enum(INSPECT_PROFILES).optional().describe('Inspect profile to run on every target (mutually exclusive with command).'),
+        stripPrefixes: z.array(z.string()).optional().describe('Line prefixes to strip before diffing (e.g. volatile timestamps).'),
+        format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured diff).'),
+        concurrency: z.number().int().min(1).max(8).optional().describe('How many targets at once (default: batchConcurrency setting).'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args, extra) => {
+      const exec: ToolRunContext = { name: 'jumpserver_compare', callId: extra.requestId, signal: extra.signal, confirm: false }
+      return toolTextRaw(await guardText(exec, async (): Promise<string> => {
+        const blocked = host.requireGrant(exec)
+        if (blocked !== null) return render(blocked)
+        const bundle = host.bundleFor(exec)
+        const result = await compareTargets(bundle.manager, host.getConfig, {
+          targets: args.targets,
+          command: args.command,
+          profile: args.profile,
+          stripPrefixes: args.stripPrefixes,
+          signal: exec.signal,
+          toolCallId: String(exec.callId),
+          batchId: 'cmp_' + randomHex(6),
+          concurrency: args.concurrency ?? host.getConfig().batchConcurrency ?? 1,
+        })
+        if (args.format === 'json') return JSON.stringify({ ok: true, ...result }, null, 2)
+        return renderCompare(result)
+      }))
+    },
+  )
+
+  // ------------------------------------------------------------ baseline
+  server.registerTool(
+    'jumpserver_baseline_capture',
+    {
+      description:
+        'Capture a NAMED baseline snapshot of one or more servers: the read-only inspect probes are run and a compact state (OS, kernel, cores, memory, disks, listening ports, services, roles) is saved to data/baselines/<name>.json. Later, jumpserver_baseline_compare re-inspects the same targets and reports DRIFT (new/removed ports, disk growth, service changes, load/memory shifts). Use it before a change window, then compare after, to prove what actually changed.',
+      inputSchema: {
+        name: z.string().describe('Baseline name (letters/digits/._-, max 64), e.g. "oa-prechange-20260910".'),
+        targets: z.array(z.string()).min(1).max(20).describe('Target IPs or asset names to snapshot (max 20).'),
+        group: z.string().optional().describe('Instead of targets: a configured asset group whose assets are snapshotted.'),
+        profile: z.enum(INSPECT_PROFILES).optional().describe('Probe profile used for the snapshot (default "full").'),
+        overwrite: z.boolean().optional().describe('Allow replacing an existing baseline of the same name (default false).'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args, extra) => {
+      const exec: ToolRunContext = { name: 'jumpserver_baseline_capture', callId: extra.requestId, signal: extra.signal, confirm: false }
+      return toolTextRaw(await guardText(exec, async (): Promise<string> => {
+        const blocked = host.requireGrant(exec)
+        if (blocked !== null) return render(blocked)
+        const bundle = host.bundleFor(exec)
+        const targets = await resolveTargets(host, bundle, exec, args.targets, args.group)
+        if (args.overwrite !== true && runtime.baselines.list().includes(args.name)) {
+          throw new JumpServerError('INVALID_ARGUMENT', 'baseline "' + args.name + '" already exists; pass overwrite:true to replace it')
+        }
+        const profile = args.profile ?? 'full'
+        const result = await inspectTargets(bundle.manager, host.getConfig, {
+          targets,
+          profile,
+          signal: exec.signal,
+          toolCallId: String(exec.callId),
+          batchId: 'bl_' + randomHex(6),
+          concurrency: host.getConfig().batchConcurrency ?? 1,
+        })
+        const baseline: Baseline = {
+          name: args.name,
+          createdAt: new Date().toISOString(),
+          profile: result.profiles.join(','),
+          targets,
+          hosts: result.inventories.map(toBaselineHost),
+        }
+        const path = runtime.baselines.save(baseline)
+        const reachable = baseline.hosts.filter((h) => h.reachable).length
+        return [
+          'ok baseline=' + baseline.name + ' profile=' + baseline.profile + ' targets=' + String(targets.length) +
+            ' reachable=' + String(reachable) + ' saved=' + path,
+          'createdAt=' + baseline.createdAt,
+          ...baseline.hosts.map((h) => '  ' + h.target + (h.hostname !== null ? ' ' + h.hostname : '') + (h.reachable ? '' : '  !! ' + (h.error ?? 'unreachable'))),
+          ...result.warnings.map((w) => 'note: ' + w),
+        ].join('\n')
+      }))
+    },
+  )
+
+  server.registerTool(
+    'jumpserver_baseline_compare',
+    {
+      description:
+        'Compare a saved baseline (jumpserver_baseline_capture) against the CURRENT state of the same servers and report DRIFT: which hosts changed and exactly what changed (added/removed listening ports, disk usage, services, roles, kernel, cores, memory %, load). Use it after a change window, or periodically, to prove what moved. Hosts that cannot be reached now are reported as unreachable, never as "unchanged".',
+      inputSchema: {
+        name: z.string().describe('Baseline name to compare against.'),
+        profile: z.enum(INSPECT_PROFILES).optional().describe('Probe profile for the fresh capture (default: the profile stored in the baseline).'),
+        format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured drift).'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args, extra) => {
+      const exec: ToolRunContext = { name: 'jumpserver_baseline_compare', callId: extra.requestId, signal: extra.signal, confirm: false }
+      return toolTextRaw(await guardText(exec, async (): Promise<string> => {
+        const blocked = host.requireGrant(exec)
+        if (blocked !== null) return render(blocked)
+        const bundle = host.bundleFor(exec)
+        const baseline = runtime.baselines.load(args.name)
+        const profile = args.profile ?? baseline.profile
+        const result = await inspectTargets(bundle.manager, host.getConfig, {
+          targets: baseline.targets,
+          profile,
+          signal: exec.signal,
+          toolCallId: String(exec.callId),
+          batchId: 'bld_' + randomHex(6),
+          concurrency: host.getConfig().batchConcurrency ?? 1,
+        })
+        const current = result.inventories.map(toBaselineHost)
+        const drift = diffBaseline(baseline, current, new Date().toISOString())
+        if (args.format === 'json') return JSON.stringify({ ok: true, drift, warnings: result.warnings }, null, 2)
+        return renderDrift(drift, result.warnings)
       }))
     },
   )
@@ -286,6 +457,131 @@ function render(value: ResultValue): string {
   const lines: string[] = []
   if (value.code !== undefined) lines.push('code: ' + String(value.code))
   if (value.message !== undefined) lines.push(String(value.message))
+  return lines.join('\n')
+}
+
+/** Compact model-facing projection of a runbook run. */
+export function renderRunbook(result: RunbookResult): string {
+  const lines: string[] = []
+  lines.push(
+    'ok runbook=' + result.runbook + (result.title !== null ? ' (' + result.title + ')' : '') +
+      ' steps=' + String(result.plan.runnable) + ' skipped=' + String(result.plan.skipped) +
+      ' targets=' + String(result.targets) + ' reachable=' + String(result.reachable) +
+      ' durationMs=' + String(result.durationMs),
+  )
+  for (const warning of result.warnings) lines.push('note: ' + warning)
+  for (const target of result.results) {
+    lines.push('')
+    lines.push('== ' + target.target + (target.hostname !== null ? '  ' + target.hostname : '') + ' ==')
+    if (target.error !== null) {
+      lines.push('  !! 失败: ' + target.error.code + ': ' + target.error.message)
+      continue
+    }
+    for (const step of target.steps) {
+      const head = '  [' + step.id + ']' + (step.title !== null ? ' ' + step.title : '') +
+        ' exit=' + (step.exitCode ?? '?') + ' ' + step.durationMs + 'ms' + (step.truncated ? ' (truncated)' : '')
+      lines.push(head)
+      if (step.error !== null) {
+        lines.push('    !! ' + step.error.code + ': ' + step.error.message)
+        continue
+      }
+      const body = step.output.trim()
+      lines.push(body.length > 0 ? indent(body, '    ') : '    (无输出)')
+    }
+  }
+  return lines.join('\n')
+}
+
+function indent(text: string, prefix: string): string {
+  return text.split('\n').map((line) => prefix + line).join('\n')
+}
+
+/** Project a full HostInventory down to the compact baseline shape. */
+export function toBaselineHost(inv: HostInventory): BaselineHost {
+  return {
+    target: inv.target,
+    hostname: inv.hostname,
+    reachable: inv.reachable,
+    error: inv.error,
+    os: inv.os.name !== null ? [inv.os.name, inv.os.version].filter(Boolean).join(' ') : null,
+    kernel: inv.kernel,
+    cores: inv.cores,
+    memoryTotalMb: inv.memory.totalMb,
+    memoryUsedPct: inv.memory.usedPct,
+    load: inv.load,
+    disks: inv.disks.map((d) => ({ mount: d.mount, usePct: d.usePct })),
+    listening: inv.listening.map((l) => ({ port: l.port, process: l.process })),
+    services: inv.services,
+    roles: inv.roles,
+  }
+}
+
+/** Compact model-facing projection of a baseline drift report. */
+export function renderDrift(drift: DriftResult, warnings: string[] = []): string {
+  const lines: string[] = []
+  lines.push(
+    'ok baseline=' + drift.baseline + ' createdAt=' + drift.createdAt + ' comparedAt=' + drift.comparedAt +
+      ' changed=' + String(drift.changed) + ' unchanged=' + String(drift.unchanged) + ' unreachable=' + String(drift.unreachable),
+  )
+  for (const warning of warnings) lines.push('note: ' + warning)
+  if (drift.changed === 0 && drift.unreachable === 0) {
+    lines.push('(未检测到漂移：所有目标状态与基线一致)')
+  }
+  for (const host of drift.hosts) {
+    if (host.status === 'unchanged') continue
+    lines.push('')
+    lines.push('== ' + host.target + ' [' + host.status + '] ==')
+    for (const change of host.changes) {
+      lines.push('  ' + change.field + ': ' + change.before + '  ->  ' + change.after)
+    }
+  }
+  if (drift.unchanged > 0) {
+    const unchanged = drift.hosts.filter((h) => h.status === 'unchanged').map((h) => h.target)
+    lines.push('')
+    lines.push('未变化: ' + unchanged.join(', '))
+  }
+  return lines.join('\n')
+}
+
+/** Compact model-facing projection of a comparison. */
+export function renderCompare(result: CompareResult): string {
+  const lines: string[] = []
+  lines.push(
+    'ok compare mode=' + result.mode + ' source=' + redactCommandSecrets(result.source) +
+      ' targets=' + String(result.targets) + ' ok=' + String(result.succeeded) + ' failed=' + String(result.failed) +
+      ' distinct=' + String(result.distinct) +
+      (result.distinct <= 1 ? ' (全部一致)' : ' (' + String(result.distinct) + ' 组差异)') +
+      ' durationMs=' + String(result.durationMs),
+  )
+  for (const warning of result.warnings) lines.push('note: ' + warning)
+  if (result.succeeded === 0) {
+    lines.push('(没有可比对的目标：全部失败)')
+    return lines.join('\n')
+  }
+  result.groups.forEach((group, index) => {
+    lines.push('')
+    lines.push('--- 组 ' + String(index + 1) + (index === 0 ? ' (多数派)' : '') + ' 目标: ' +
+      (group.outliers.length > 0 ? group.outliers.map((o) => o.target).join(', ') : '(多数派全部成员)') +
+      ' 共 ' + String(group.signature.length) + ' 行 ---')
+    const shown = group.signature.slice(0, 40)
+    for (const line of shown) lines.push('  ' + line)
+    if (group.signature.length > shown.length) lines.push('  ... 省略 ' + String(group.signature.length - shown.length) + ' 行')
+    for (const outlier of group.outliers) {
+      lines.push('  [' + outlier.target + '] 差异:')
+      for (const line of outlier.missing.slice(0, 20)) lines.push('    - ' + line)
+      for (const line of outlier.extra.slice(0, 20)) lines.push('    + ' + line)
+      const hidden = Math.max(0, outlier.missing.length - 20) + Math.max(0, outlier.extra.length - 20)
+      if (hidden > 0) lines.push('    ... 省略 ' + String(hidden) + ' 行差异')
+    }
+  })
+  const failures = result.results.filter((r) => !r.ok)
+  if (failures.length > 0) {
+    lines.push('')
+    lines.push('--- 失败目标 ---')
+    for (const failure of failures) {
+      lines.push('  ' + failure.target + ': ' + (failure.error !== null ? failure.error.code + ': ' + failure.error.message : '?'))
+    }
+  }
   return lines.join('\n')
 }
 
