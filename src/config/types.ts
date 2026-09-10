@@ -101,6 +101,30 @@ export interface AssetGroupDef {
 }
 
 /**
+ * V0.4.2: one assertion attached to a runbook step.
+ *
+ * Assertions turn a runbook from "collect and eyeball" into "collect and
+ * judge": each step's captured output is checked against these rules and the
+ * runbook reports PASS / FAIL per target. All rules must hold (AND).
+ */
+export interface RunbookExpect {
+  /** Output must contain this substring (case-insensitive). */
+  contains?: string
+  /** Output must NOT contain this substring (case-insensitive). */
+  notContains?: string
+  /** Output must match this regular expression (case-insensitive, no /flags form). */
+  matches?: string
+  /** Exit code must equal this value (default: only checked when set). */
+  exitCode?: number
+  /** Output must be non-empty after trimming. */
+  notEmpty?: boolean
+  /** Output must have at least this many lines. */
+  minLines?: number
+  /** Human note echoed into the report when this assertion fails. */
+  message?: string
+}
+
+/**
  * V0.4.1: one named runbook step.
  *
  * A step is EITHER an inspect profile (the connector supplies the reviewed
@@ -120,6 +144,8 @@ export interface RunbookStep {
   command?: string
   /** Per-step timeout in seconds. */
   timeout?: number
+  /** V0.4.2: assertions evaluated against this step's output. */
+  expect?: RunbookExpect
 }
 
 /** V0.4.1: a named runbook = an ordered list of read-only steps. */

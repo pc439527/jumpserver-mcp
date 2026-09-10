@@ -15,10 +15,16 @@
   "runbooks": {
     "oa-health": {
       "title": "OA 集群健康巡检",
-      "description": "主机基础 + 网络监听 + 进程，逐台执行同样的只读检查。",
+      "description": "主机基础 + 网络监听 + 进程，逐台执行同样的只读检查；带断言，自动给出 PASS/FAIL 结论。",
       "steps": [
-        { "id": "host", "title": "主机基础", "profile": "basic" },
-        { "id": "net", "title": "监听端口", "profile": "network" },
+        { "id": "host", "title": "主机基础", "profile": "basic", "expect": { "notEmpty": true, "minLines": 3 } },
+        { "id": "net", "title": "监听端口", "profile": "network", "expect": { "contains": "LISTEN" } },
+        {
+          "id": "nginx",
+          "title": "nginx 是否在跑",
+          "command": "ps -ef | grep -c [n]ginx",
+          "expect": { "notContains": " 0", "exitCode": 0, "message": "nginx 未运行" }
+        },
         { "id": "proc", "title": "进程 TOP", "profile": "process" }
       ]
     }
@@ -27,6 +33,7 @@
     "enabled": true,
     "port": 8765,
     "autoOpen": true,
-    "portFallback": true
+    "portFallback": true,
+    "tokenTtlMinutes": 720
   }
 }

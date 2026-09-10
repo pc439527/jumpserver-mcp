@@ -20,7 +20,7 @@ import { JumpServerError } from './errors.js'
 import { mapWithConcurrency } from './concurrency.js'
 import { isInspectProfile, resolveProfile } from './profiles.js'
 import type { BatchCommandRequest, SessionManager, TargetBatchResult } from './session-manager.js'
-import type { RunbookDef, RunbookStep } from '../config/types.js'
+import type { RunbookDef, RunbookExpect, RunbookStep } from '../config/types.js'
 
 /** A runbook may not walk the whole estate in one call. */
 export const MAX_RUNBOOK_TARGETS = 20
@@ -36,6 +36,8 @@ export interface RunbookStepPlan {
   /** Why the step is skipped (null when runnable). */
   skipped: { reason: string; risk: string; ruleId: string } | null
   timeoutMs: number | null
+  /** V0.4.2: assertions this step carries (null when it asserts nothing). */
+  expect: RunbookExpect | null
 }
 
 export interface RunbookPlan {
@@ -44,12 +46,16 @@ export interface RunbookPlan {
   steps: RunbookStepPlan[]
   runnable: number
   skipped: number
+  /** V0.4.2: how many runnable steps carry at least one assertion. */
+  asserted: number
 }
 
 export interface RunbookTargetResult {
   target: string
   hostname: string | null
   error: { code: string; message: string } | null
+  /** V0.4.2: overall verdict for this target (null when no step asserted). */
+  verdict: RunbookVerdict | null
   steps: Array<{
     id: string
     title: string | null
@@ -59,7 +65,82 @@ export interface RunbookTargetResult {
     truncated: boolean
     durationMs: number
     error: { code: string; message: string } | null
+    /** V0.4.2: assertion outcome for this step (null when the step asserts nothing). */
+    check: RunbookCheck | null
   }>
+}
+
+/** V0.4.2: 'pass' = every assertion held; 'fail' = at least one broke. */
+export type RunbookVerdict = 'pass' | 'fail'
+
+export interface RunbookCheck {
+  verdict: RunbookVerdict
+  /** One line per failed assertion, already human-readable. */
+  failures: string[]
+}
+
+/**
+ * V0.4.2: evaluate a step's captured output against its `expect` block.
+ * Pure and side-effect free so it can be unit-tested without a bastion.
+ * Returns null when the step carries no assertions (nothing to judge).
+ */
+export function evaluateExpect(
+  expect: RunbookExpect | undefined,
+  outcome: { output: string; exitCode: number | null; error: { code: string; message: string } | null },
+): RunbookCheck | null {
+  if (expect === undefined) return null
+  const failures: string[] = []
+  const note = expect.message !== undefined && expect.message.length > 0 ? ' (' + expect.message + ')' : ''
+  const output = outcome.output ?? ''
+  const haystack = output.toLowerCase()
+
+  // A step that could not run at all can never satisfy an assertion.
+  if (outcome.error !== null) {
+    return { verdict: 'fail', failures: ['step did not run: ' + outcome.error.code + ' ' + outcome.error.message + note] }
+  }
+
+  if (expect.contains !== undefined && expect.contains.length > 0) {
+    if (!haystack.includes(expect.contains.toLowerCase())) failures.push('missing "' + expect.contains + '"' + note)
+  }
+  if (expect.notContains !== undefined && expect.notContains.length > 0) {
+    if (haystack.includes(expect.notContains.toLowerCase())) failures.push('unexpected "' + expect.notContains + '" present' + note)
+  }
+  if (expect.matches !== undefined && expect.matches.length > 0) {
+    let re: RegExp | null = null
+    try {
+      re = new RegExp(expect.matches, 'i')
+    } catch {
+      failures.push('invalid regex "' + expect.matches + '"' + note)
+    }
+    if (re !== null && !re.test(output)) failures.push('no match for /' + expect.matches + '/i' + note)
+  }
+  if (expect.exitCode !== undefined) {
+    if (outcome.exitCode !== expect.exitCode) {
+      failures.push('exit code ' + String(outcome.exitCode) + ' != ' + String(expect.exitCode) + note)
+    }
+  }
+  if (expect.notEmpty === true) {
+    if (output.trim().length === 0) failures.push('output is empty' + note)
+  }
+  if (expect.minLines !== undefined && expect.minLines > 0) {
+    const lines = output.split('\n').filter((l) => l.trim().length > 0).length
+    if (lines < expect.minLines) failures.push('only ' + String(lines) + ' lines, expected >= ' + String(expect.minLines) + note)
+  }
+
+  return failures.length === 0 ? { verdict: 'pass', failures: [] } : { verdict: 'fail', failures }
+}
+
+/** Fold per-step checks into one target verdict (null when nothing asserted). */
+function foldVerdict(checks: Array<RunbookCheck | null>): RunbookVerdict | null {
+  let seen = false
+  let failed = false
+  for (const check of checks) {
+    if (check === null) continue
+    seen = true
+    if (check.verdict === 'fail') failed = true
+  }
+  if (!seen) return null
+  return failed ? 'fail' : 'pass'
 }
 
 export interface RunbookResult {
@@ -71,6 +152,10 @@ export interface RunbookResult {
   results: RunbookTargetResult[]
   durationMs: number
   warnings: string[]
+  /** V0.4.2: assertion roll-up (null when no step asserted anything). */
+  verdict: RunbookVerdict | null
+  passed: number
+  failed: number
 }
 
 export interface RunbookOptions {
@@ -89,18 +174,24 @@ export function planRunbook(name: string, def: RunbookDef): RunbookPlan {
   const steps: RunbookStepPlan[] = []
   let runnable = 0
   let skipped = 0
+  let asserted = 0
   for (const step of def.steps) {
     const planned = planStep(step)
     steps.push(planned)
-    if (planned.skipped === null && planned.commands.length > 0) runnable += 1
-    else skipped += 1
+    if (planned.skipped === null && planned.commands.length > 0) {
+      runnable += 1
+      if (planned.expect !== null) asserted += 1
+    } else {
+      skipped += 1
+    }
   }
-  return { name, title: def.title ?? null, steps, runnable, skipped }
+  return { name, title: def.title ?? null, steps, runnable, skipped, asserted }
 }
 
 function planStep(step: RunbookStep): RunbookStepPlan {
   const timeoutMs = step.timeout !== undefined && step.timeout > 0 ? step.timeout * 1000 : null
-  const base = { id: step.id, title: step.title ?? null, timeoutMs }
+  const expect = step.expect ?? null
+  const base = { id: step.id, title: step.title ?? null, timeoutMs, expect }
 
   const hasProfile = step.profile !== undefined && step.profile.length > 0
   const hasCommand = step.command !== undefined && step.command.trim().length > 0
@@ -257,7 +348,11 @@ export async function runRunbook(
         batchId: options.batchId,
       })
       if (batch.error !== null) {
-        return { target, hostname: batch.hostname, error: batch.error, steps: [] }
+        // The target never ran: any assertion it carried is an automatic fail.
+        const unreachableCheck = plan.steps.some((s) => s.skipped === null && s.expect !== null)
+          ? { verdict: 'fail' as const, failures: ['target unreachable: ' + batch.error.code + ' ' + batch.error.message] }
+          : null
+        return { target, hostname: batch.hostname, error: batch.error, verdict: unreachableCheck !== null ? 'fail' : null, steps: [] }
       }
       const steps: RunbookTargetResult['steps'] = []
       batch.commands.forEach((cmd, index) => {
@@ -272,12 +367,22 @@ export async function runRunbook(
           truncated: cmd.truncated,
           durationMs: cmd.durationMs,
           error: cmd.error,
+          check: evaluateExpect(step?.expect ?? undefined, { output: cmd.output, exitCode: cmd.exitCode, error: cmd.error }),
         })
       })
-      return { target, hostname: batch.hostname, error: null, steps }
+      return { target, hostname: batch.hostname, error: null, verdict: foldVerdict(steps.map((s) => s.check)), steps }
     },
     { concurrency: options.concurrency ?? 1, signal: options.signal },
   )
+
+  const judged = results.filter((r) => r.verdict !== null)
+  const failed = judged.filter((r) => r.verdict === 'fail').length
+  const verdict: RunbookVerdict | null = judged.length === 0 ? null : failed > 0 ? 'fail' : 'pass'
+  for (const r of judged) {
+    if (r.verdict !== 'fail') continue
+    const details = r.steps.flatMap((s) => (s.check?.verdict === 'fail' ? s.check.failures.map((f) => s.id + ': ' + f) : []))
+    warnings.push('assertion FAIL on ' + r.target + (details.length > 0 ? ' -> ' + details.join('; ') : ' (target unreachable)'))
+  }
 
   return {
     runbook: name,
@@ -288,5 +393,8 @@ export async function runRunbook(
     results,
     durationMs: Date.now() - started,
     warnings,
+    verdict,
+    passed: judged.length - failed,
+    failed,
   }
 }

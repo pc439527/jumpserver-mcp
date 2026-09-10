@@ -8,7 +8,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { planRunbook, resolveRunbook } from '../../lib/jumpserver/runbook.js'
+import { evaluateExpect, planRunbook, resolveRunbook } from '../../lib/jumpserver/runbook.js'
 import { JumpServerError } from '../../lib/jumpserver/errors.js'
 
 test('planRunbook: profile step expands into READ probes only', () => {
@@ -88,4 +88,76 @@ test('resolveRunbook: no runbooks configured errors clearly', () => {
     () => resolveRunbook(undefined, 'x'),
     (error) => error instanceof JumpServerError && error.code === 'UNKNOWN_RUNBOOK',
   )
+})
+
+/* ------------------------------------------------------------------ V0.4.2 */
+/* evaluateExpect: turn collected output into a PASS/FAIL judgement. */
+
+const OK = { output: 'up\nnginx 1\nLISTEN 0 128\n', exitCode: 0, error: null }
+
+test('evaluateExpect: null expect means nothing is judged', () => {
+  assert.equal(evaluateExpect(undefined, OK), null)
+})
+
+test('evaluateExpect: contains / notContains are case-insensitive', () => {
+  assert.equal(evaluateExpect({ contains: 'LISTEN' }, OK).verdict, 'pass')
+  assert.equal(evaluateExpect({ contains: 'listen' }, OK).verdict, 'pass')
+  const miss = evaluateExpect({ contains: 'nginx' }, { ...OK, output: 'nothing here' })
+  assert.equal(miss.verdict, 'fail')
+  assert.match(miss.failures[0], /missing "nginx"/)
+  assert.equal(evaluateExpect({ notContains: 'ERROR' }, OK).verdict, 'pass')
+  assert.equal(evaluateExpect({ notContains: 'listen' }, OK).verdict, 'fail')
+})
+
+test('evaluateExpect: regex matching, and a bad regex is a failure not a throw', () => {
+  assert.equal(evaluateExpect({ matches: 'listen[ ]+0' }, OK).verdict, 'pass')
+  const bad = evaluateExpect({ matches: '([' }, OK)
+  assert.equal(bad.verdict, 'fail')
+  assert.match(bad.failures[0], /invalid regex/)
+})
+
+test('evaluateExpect: exitCode is compared exactly', () => {
+  assert.equal(evaluateExpect({ exitCode: 0 }, OK).verdict, 'pass')
+  assert.equal(evaluateExpect({ exitCode: 1 }, OK).verdict, 'fail')
+  // exitCode null (timed out / unknown) never equals a number
+  assert.equal(evaluateExpect({ exitCode: 0 }, { ...OK, exitCode: null }).verdict, 'fail')
+})
+
+test('evaluateExpect: notEmpty and minLines count non-blank lines', () => {
+  assert.equal(evaluateExpect({ notEmpty: true }, OK).verdict, 'pass')
+  assert.equal(evaluateExpect({ notEmpty: true }, { ...OK, output: '   \n\n' }).verdict, 'fail')
+  assert.equal(evaluateExpect({ minLines: 3 }, OK).verdict, 'pass')
+  assert.equal(evaluateExpect({ minLines: 4 }, OK).verdict, 'fail')
+})
+
+test('evaluateExpect: a step that could not run always fails its assertions', () => {
+  const check = evaluateExpect({ contains: 'anything' }, { output: '', exitCode: null, error: { code: 'TIMEOUT', message: 'took too long' } })
+  assert.equal(check.verdict, 'fail')
+  assert.match(check.failures[0], /did not run/)
+})
+
+test('evaluateExpect: all rules must hold (AND), and every failure is reported', () => {
+  const check = evaluateExpect({ contains: 'nginx', notContains: 'ERROR', exitCode: 0 }, { ...OK, output: 'ERROR nginx down', exitCode: 2 })
+  assert.equal(check.verdict, 'fail')
+  assert.equal(check.failures.length, 2)
+})
+
+test('evaluateExpect: the message note is appended to each failure', () => {
+  const check = evaluateExpect({ contains: 'nginx', message: 'nginx 未运行' }, { ...OK, output: 'nothing' })
+  assert.match(check.failures[0], /nginx 未运行/)
+})
+
+test('planRunbook: asserted counts only runnable steps carrying expect', () => {
+  const plan = planRunbook('rb', {
+    steps: [
+      { id: 'a', profile: 'basic', expect: { notEmpty: true } },
+      { id: 'b', command: 'uptime' },
+      { id: 'c', command: 'rm -rf /', expect: { exitCode: 0 } },
+    ],
+  })
+  assert.equal(plan.runnable, 2)
+  assert.equal(plan.skipped, 1)
+  assert.equal(plan.asserted, 1)
+  assert.equal(plan.steps[0].expect.notEmpty, true)
+  assert.equal(plan.steps[1].expect, null)
 })

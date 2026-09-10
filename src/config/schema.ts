@@ -26,6 +26,8 @@ export interface AuditViewerConfig {
   autoOpen: boolean
   /** EADDRINUSE => ephemeral port so each conversation keeps its own console (default true). */
   portFallback: boolean
+  /** V0.4.2: console access-token lifetime in minutes (default 720; 0 = never expires). */
+  tokenTtlMinutes: number
 }
 
 export type McpConfig = JumpServerConfig & {
@@ -68,6 +70,18 @@ const configSchema = z.object({
               profile: z.string().optional(),
               command: z.string().optional(),
               timeout: z.number().optional(),
+              // V0.4.2: assertions evaluated against the step output.
+              expect: z
+                .object({
+                  contains: z.string().optional(),
+                  notContains: z.string().optional(),
+                  matches: z.string().optional(),
+                  exitCode: z.number().int().optional(),
+                  notEmpty: z.boolean().optional(),
+                  minLines: z.number().int().min(0).optional(),
+                  message: z.string().optional(),
+                })
+                .optional(),
             }),
           )
           .min(1),
@@ -83,6 +97,8 @@ const configSchema = z.object({
       port: z.number().int().min(1).max(65535).optional(),
       autoOpen: z.boolean().optional(),
       portFallback: z.boolean().optional(),
+      // V0.4.2: console access-token lifetime in minutes (0 = never expires).
+      tokenTtlMinutes: z.number().int().min(0).max(10080).optional(),
     })
     .optional(),
   requireArm: z.boolean().optional(),
@@ -121,6 +137,7 @@ export function parseConfig(input: unknown): McpConfig {
       port: raw.auditViewer?.port ?? 8765,
       autoOpen: raw.auditViewer?.autoOpen ?? true,
       portFallback: raw.auditViewer?.portFallback ?? true,
+      tokenTtlMinutes: raw.auditViewer?.tokenTtlMinutes ?? 720,
     },
   }
   if (raw.auditPath !== undefined && raw.auditPath.length > 0) cfg.auditPath = raw.auditPath

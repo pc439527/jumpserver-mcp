@@ -469,18 +469,32 @@ export function renderRunbook(result: RunbookResult): string {
       ' targets=' + String(result.targets) + ' reachable=' + String(result.reachable) +
       ' durationMs=' + String(result.durationMs),
   )
+  if (result.verdict !== null) {
+    lines.push(
+      'verdict: ' + result.verdict.toUpperCase() +
+        ' (asserted steps=' + String(result.plan.asserted) +
+        ', targets passed=' + String(result.passed) + ' failed=' + String(result.failed) + ')',
+    )
+  }
   for (const warning of result.warnings) lines.push('note: ' + warning)
   for (const target of result.results) {
     lines.push('')
-    lines.push('== ' + target.target + (target.hostname !== null ? '  ' + target.hostname : '') + ' ==')
+    lines.push(
+      '== ' + target.target + (target.hostname !== null ? '  ' + target.hostname : '') +
+        (target.verdict !== null ? '  [' + target.verdict.toUpperCase() + ']' : '') + ' ==',
+    )
     if (target.error !== null) {
       lines.push('  !! 失败: ' + target.error.code + ': ' + target.error.message)
       continue
     }
     for (const step of target.steps) {
       const head = '  [' + step.id + ']' + (step.title !== null ? ' ' + step.title : '') +
-        ' exit=' + (step.exitCode ?? '?') + ' ' + step.durationMs + 'ms' + (step.truncated ? ' (truncated)' : '')
+        ' exit=' + (step.exitCode ?? '?') + ' ' + step.durationMs + 'ms' + (step.truncated ? ' (truncated)' : '') +
+        (step.check !== null ? ' -> ' + step.check.verdict.toUpperCase() : '')
       lines.push(head)
+      if (step.check !== null && step.check.verdict === 'fail') {
+        for (const failure of step.check.failures) lines.push('    x ' + failure)
+      }
       if (step.error !== null) {
         lines.push('    !! ' + step.error.code + ': ' + step.error.message)
         continue

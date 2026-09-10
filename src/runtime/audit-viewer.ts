@@ -40,6 +40,11 @@ export interface AuditViewerOptions {
   autoOpen: boolean
   /** EADDRINUSE => take an ephemeral port instead of sharing another process's console (default true). */
   portFallback: boolean
+  /**
+   * V0.4.2: minutes the console access token stays valid (default 720 = 12h).
+   * Set 0 to disable expiry. An expired token forces a fresh handover URL.
+   */
+  tokenTtlMinutes?: number
 }
 
 export interface AuditViewerServices {
@@ -66,6 +71,9 @@ let viewerUrl: string | null = null
 /** Discovery-file dir + our own file, written on every heartbeat. */
 let consoleDir: string | null = null
 let consoleFile: string | null = null
+/** Bound port + start time, kept for discovery-file rewrites on rotation. */
+let consolePort = 0
+let consoleStartedAt = new Date().toISOString()
 /** Whether this process hands its console URL to the model (config: auditViewer.autoOpen). */
 let hintEnabled = true
 /**
@@ -74,17 +82,43 @@ let hintEnabled = true
  * drive /api/interrupt. Every request must carry ?token=… (or the X-Console-Token
  * header); requests without it get 403. The token lives only in memory and in
  * the handover URL, never in a log.
+ *
+ * V0.4.2: the token now EXPIRES (default 12h, configurable via
+ * auditViewer.tokenTtlMinutes; 0 disables expiry) and can be ROTATED on demand.
+ * An expired token is treated exactly like a wrong one — the page shows a
+ * "console expired, ask the model to reopen it" overlay instead of silently
+ * failing. Rotation invalidates the old token immediately and rewrites the
+ * discovery file so the next handover URL carries the new one.
  */
 let consoleToken: string | null = null
+/** Epoch ms when the current token stops being valid; null = never expires. */
+let consoleTokenExpiresAt: number | null = null
+/** Token lifetime in ms (0 = no expiry). Set from config at start. */
+let consoleTokenTtlMs = 12 * 60 * 60 * 1000
 const TOKEN_HEADER = 'x-console-token'
 
 /** Constant-time-ish compare (length is public; content comparison is cheap and adequate here). */
 function tokenMatches(candidate: string | null): boolean {
   if (consoleToken === null) return true
+  if (consoleTokenExpiresAt !== null && Date.now() >= consoleTokenExpiresAt) return false
   if (candidate === null || candidate.length !== consoleToken.length) return false
   let diff = 0
   for (let i = 0; i < candidate.length; i += 1) diff |= candidate.charCodeAt(i) ^ consoleToken.charCodeAt(i)
   return diff === 0
+}
+
+/** True when a token exists but has passed its expiry (drives the page overlay). */
+function consoleTokenExpired(): boolean {
+  return consoleToken !== null && consoleTokenExpiresAt !== null && Date.now() >= consoleTokenExpiresAt
+}
+
+/** Mint a fresh token, set its expiry, and refresh the handover URL + discovery file. */
+function rotateConsoleToken(): string {
+  consoleToken = randomBytes(16).toString('hex')
+  consoleTokenExpiresAt = consoleTokenTtlMs > 0 ? Date.now() + consoleTokenTtlMs : null
+  if (consolePort > 0) viewerUrl = consoleUrl(consolePort)
+  writeConsoleFile()
+  return consoleToken
 }
 
 /** Parse the JSONL audit sink; a missing or partially written file yields what is readable. */
@@ -181,6 +215,9 @@ tr:hover td{background:#1d1d1d}
 #dead{position:fixed;inset:0;background:rgba(10,10,10,.92);z-index:50;display:none;align-items:center;justify-content:center;flex-direction:column;gap:14px}
 #dead .t{font-size:16px;color:#e8a86a}
 #dead .d{color:#999;font-size:13px;max-width:420px;text-align:center}
+#expired{position:fixed;inset:0;background:rgba(10,10,10,.92);z-index:51;display:none;align-items:center;justify-content:center;flex-direction:column;gap:14px}
+#expired .t{font-size:16px;color:#e8a86a}
+#expired .d{color:#999;font-size:13px;max-width:460px;text-align:center;line-height:1.6}
 @media (max-width:720px){
   header h1{display:none}
   #stat{display:none}
@@ -289,12 +326,13 @@ tr:hover td{background:#1d1d1d}
 
 </main>
 <div id="dead"><div class="t">工作台已失效</div><div class="d">对应的对话已结束，服务进程已退出。本页不会再更新，可以关闭。</div><button class="act" id="dead-close">关闭本页</button></div>
+<div id="expired"><div class="t">控制台令牌已过期</div><div class="d">出于安全考虑，本地控制台的访问令牌有时效。请让 AI 重新调用一次 jumpserver_status（或任意工具），然后用新的链接打开控制台。</div><button class="act" id="expired-close">关闭本页</button></div>
 <script>
 var TZ = ${JSON.stringify(timeZone)};
 var tab = (location.hash || '#audit').slice(1);
 var auditAll = [], lastCount = -1;
 var trackedSeq = {}, currentSess = null, sessStatus = {}, termLines = 0;
-var failCount = 0, deadShown = false;
+var failCount = 0, deadShown = false, expiredShown = false;
 var topo = null, topoPick = null, jobPick = null;
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
@@ -316,7 +354,12 @@ function showDead(){
   if (deadShown) return; deadShown = true;
   $('dead').style.display = 'flex';
 }
+function showExpired(){
+  if (expiredShown) return; expiredShown = true;
+  $('expired').style.display = 'flex';
+}
 $('dead-close').addEventListener('click', function(){ window.close(); });
+$('expired-close').addEventListener('click', function(){ window.close(); });
 /* fetch wrapper: any success resets the dead-counter; N misses => expired overlay */
 /* V0.4.1: every request must carry the console access token from the URL. */
 var TOKEN = (new URLSearchParams(location.search)).get('token') || '';
@@ -325,7 +368,12 @@ function withToken(u){
   return u + (u.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
 }
 function F(u,o){
-  return fetch(withToken(u),o).then(function(r){failCount=0;return r;}).catch(function(e){failCount++;if(failCount>=${DEAD_AFTER_FAILURES})showDead();throw e;});
+  return fetch(withToken(u),o).then(function(r){
+    /* V0.4.2: a 403 marked expired means the token aged out — stop polling and
+       tell the user to reopen the console rather than retrying forever. */
+    if (r.status === 403 && r.headers.get('x-console-token-expired') === '1') { showExpired(); }
+    failCount=0;return r;
+  }).catch(function(e){failCount++;if(failCount>=${DEAD_AFTER_FAILURES})showDead();throw e;});
 }
 function POST(u,body){
   return F(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
@@ -779,7 +827,11 @@ export function startAuditViewer(
   if (opts.enabled !== true) return null
   hintEnabled = opts.autoOpen
   consoleDir = join(dirname(auditPath), 'consoles')
-  consoleToken = randomBytes(16).toString('hex')
+  consoleStartedAt = new Date().toISOString()
+  const ttlMinutes = opts.tokenTtlMinutes
+  // undefined => keep the 12h default; an explicit 0 disables expiry.
+  consoleTokenTtlMs = ttlMinutes === undefined || !Number.isFinite(ttlMinutes) || ttlMinutes <= 0 ? (ttlMinutes === 0 ? 0 : 12 * 60 * 60 * 1000) : ttlMinutes * 60_000
+  rotateConsoleToken()
   const audit = services.audit ?? null
   const assets = services.assets ?? null
   const baselines = services.baselines ?? null
@@ -790,11 +842,15 @@ export function startAuditViewer(
       const href = target.split('?')[0] ?? '/'
       const query = new URLSearchParams(target.split('?')[1] ?? '')
       // V0.4.1: every request must present the token (query or header).
+      // V0.4.2: an expired token is rejected with a distinct marker so the page
+      // can show "console expired" instead of a generic failure.
       const presented = query.get('token') ?? (typeof req.headers[TOKEN_HEADER] === 'string' ? (req.headers[TOKEN_HEADER] as string) : null)
       if (!tokenMatches(presented)) {
+        const expired = consoleTokenExpired()
         res.statusCode = 403
         res.setHeader('content-type', 'text/plain; charset=utf-8')
-        res.end('forbidden: missing or invalid console token')
+        if (expired) res.setHeader('x-console-token-expired', '1')
+        res.end(expired ? 'console token expired: ask the model to reopen the console' : 'forbidden: missing or invalid console token')
         return
       }
       const entries = (): Record<string, unknown>[] => (audit !== null ? audit.list() : readAuditEntries(auditPath))
@@ -1008,33 +1064,35 @@ function consoleUrl(port: number): string {
  * Stale files (heartbeat older than 20s => the conversation/process is gone)
  * are pruned, so external tools can enumerate live consoles by listing the dir.
  */
+/** Best-effort write of this process's discovery file (heartbeat + rotation). */
+function writeConsoleFile(): void {
+  if (consoleFile === null) return
+  try {
+    writeFileSync(consoleFile, JSON.stringify({
+      pid: process.pid,
+      port: consolePort,
+      url: viewerUrl,
+      startedAt: consoleStartedAt,
+      heartbeatAt: new Date().toISOString(),
+      tokenExpiresAt: consoleTokenExpiresAt !== null ? new Date(consoleTokenExpiresAt).toISOString() : null,
+    }) + '\n', 'utf8')
+  } catch {
+    /* discovery file is best-effort */
+  }
+}
+
 function startHeartbeat(port: number): void {
   if (consoleDir === null || viewerUrl === null) return
-  const startedAt = new Date().toISOString()
-  const pid = process.pid
+  consolePort = port
   try {
     mkdirSync(consoleDir, { recursive: true })
-    consoleFile = join(consoleDir, String(pid) + '.json')
+    consoleFile = join(consoleDir, String(process.pid) + '.json')
   } catch {
     return
   }
-  const write = (): void => {
-    if (consoleFile === null) return
-    try {
-      writeFileSync(consoleFile, JSON.stringify({
-        pid,
-        port,
-        url: viewerUrl,
-        startedAt,
-        heartbeatAt: new Date().toISOString(),
-      }) + '\n', 'utf8')
-    } catch {
-      /* discovery file is best-effort */
-    }
-  }
-  write()
+  writeConsoleFile()
   const timer = setInterval(() => {
-    write()
+    writeConsoleFile()
     pruneStale()
   }, 5_000)
   timer.unref?.()
@@ -1080,4 +1138,33 @@ export function notifyAuditRecord(): void {
 /** Current console URL (null until the listener is bound / when disabled). */
 export function auditViewerUrl(): string | null {
   return viewerUrl
+}
+
+/**
+ * V0.4.2: issue a fresh token for a running console and return the new URL.
+ * The previous token stops working immediately, so the caller must hand the new
+ * URL to the user. Returns null when no console is running.
+ */
+export function rotateConsoleAccessToken(): string | null {
+  if (consolePort <= 0 || consoleToken === null) return null
+  rotateConsoleToken()
+  return viewerUrl
+}
+
+/** V0.4.2: token lifetime + expiry, for status output. */
+export function consoleTokenInfo(): { ttlMinutes: number; expiresAt: string | null; expired: boolean } {
+  return {
+    ttlMinutes: consoleTokenTtlMs > 0 ? Math.round(consoleTokenTtlMs / 60_000) : 0,
+    expiresAt: consoleTokenExpiresAt !== null ? new Date(consoleTokenExpiresAt).toISOString() : null,
+    expired: consoleTokenExpired(),
+  }
+}
+
+/**
+ * V0.4.2: force the current token past its expiry. Exported for tests so the
+ * expiry path can be exercised without waiting out a real TTL.
+ */
+export function forceExpireConsoleToken(): void {
+  if (consoleToken === null) return
+  consoleTokenExpiresAt = Date.now() - 1
 }

@@ -1,12 +1,12 @@
 # jumpserver-mcp
 
-JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server. Ported from `dsh-jumpserver` (v0.3.1) core. From v0.4.0 it is no longer just "AI safely executes JumpServer commands" — it is an **AI infrastructure investigation / fault-analysis platform**: fixed read-only probes, structured host inventory, evidence-annotated topology, streaming job model, and an embedded ops console (7 tabs). v0.4.1 adds the fleet layer: bounded-concurrency surveys, config-driven runbooks, multi-host diffing, baseline drift detection, an assets tab, and console access tokens.
+JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server. Ported from `dsh-jumpserver` (v0.3.1) core. From v0.4.0 it is no longer just "AI safely executes JumpServer commands" — it is an **AI infrastructure investigation / fault-analysis platform**: fixed read-only probes, structured host inventory, evidence-annotated topology, streaming job model, and an embedded ops console (7 tabs). v0.4.1 adds the fleet layer: bounded-concurrency surveys, config-driven runbooks, multi-host diffing, baseline drift detection, an assets tab, and console access tokens. v0.4.2 adds assertions (runbooks return a verdict), scope checks at session entry, and console-token expiry + rotation.
 
 ## Tools (22)
 
 | Tool | Purpose |
 |---|---|
-| `jumpserver_status` | Session state / gateway / current target / permission mode / runtime version |
+| `jumpserver_status` | Session state / gateway / current target / permission mode / runtime version; live console URL + token expiry (`rotateConsoleToken: true` mints a new token) |
 | `jumpserver_connect` | Establish the persistent SSH/PTY session, wait for the KoKo menu |
 | `jumpserver_enter` | Enter an asset through the KoKo menu (verified by probe) |
 | `jumpserver_assets` | List authorized assets (`p` only — read-only, footer-verified, cached) |
@@ -19,7 +19,7 @@ JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server. Ported
 | `jumpserver_audit` | Read recent audit entries (in-chat; time displayed in the configured zone) |
 | `jumpserver_inspect` | Fixed read-only profile probes -> structured HostInventory |
 | `jumpserver_topology` | Build an evidence-annotated relationship graph between hosts |
-| `jumpserver_profile_run` | Run a NAMED runbook (config `runbooks`) across targets — same steps, every host |
+| `jumpserver_profile_run` | Run a NAMED runbook (config `runbooks`) across targets — same steps, every host; `expect` assertions yield PASS/FAIL |
 | `jumpserver_compare` | Run one command/profile on N hosts and report the DIFF (groups + outliers) |
 | `jumpserver_baseline_capture` | Snapshot a named baseline to `data/baselines/<name>.json` |
 | `jumpserver_baseline_compare` | Re-inspect and report DRIFT vs a saved baseline |
@@ -40,13 +40,15 @@ When `requireArm: true`, `jumpserver_arm` / `jumpserver_disarm` (30-minute autho
 - **Streaming jobs (V0.4.0)**: `jumpserver_job_*` covers `tail -f` / `journalctl -f` / `tcpdump` style commands that never end on their own. Output is harvested from the `TerminalObserver` stream, `maxDuration` enforces an upper bound.
 - **Incremental audit (V0.4.0)**: async append + bounded memory ring (5000) + file-offset incremental tail. The console no longer `readFileSync`s the whole JSONL every second.
 - **Audit timezone (V0.4.0)**: JSONL stays UTC; display uses `timeZone` (default `Asia/Shanghai`).
-- **Target scope (V0.4.0)**: `allowedTargets` / `deniedTargets` (substring match); deny always wins; every navigation and every `exec` against an already-entered asset is checked.
+- **Target scope (V0.4.0)**: `allowedTargets` / `deniedTargets` (substring match); deny always wins; every navigation and every `exec` against an already-entered asset is checked. From V0.4.2 the check runs at the ENTRY of `jumpserver_connect` / `jumpserver_enter` too, so a denied target never gets an SSH/PTY session opened at all.
 - **Version single source (V0.4.0)**: `package.json` is the only truth; runtime `PLUGIN_VERSION` reads from there. `npm version` and the runtime can no longer drift.
 - **Bounded-concurrency surveys (V0.4.1)**: `batchConcurrency` (default 1 = strictly sequential) lets inspect / topology / compare / profile_run visit several targets at once. Result order always matches input order; one target's failure never aborts its siblings; a `Semaphore` caps simultaneous bastion sessions at `maxSessions` (default 4).
 - **Runbooks (V0.4.1)**: `jumpserver_profile_run` executes a named, reviewed recipe from config `runbooks`. Each step is an inspect profile or an explicit READ command; a non-READ step (or a typo'd profile) is SKIPPED and reported — never silently executed.
+- **Runbook assertions (V0.4.2)**: a step may carry `expect` (`contains` / `notContains` / `matches` / `exitCode` / `notEmpty` / `minLines` / `message`, all AND). The runbook then reports PASS/FAIL per step, per target, and overall — turning a survey into a verdict. An unreachable target auto-fails any assertion it carried.
 - **Multi-host diff (V0.4.1)**: `jumpserver_compare` runs the SAME read-only command/profile on every target and groups them by signature, reporting each outlier's missing/extra lines versus the majority. Order-insensitive, so `ss`/`ps` line ordering does not create false diffs.
 - **Baseline drift (V0.4.1)**: `jumpserver_baseline_capture` persists a compact state snapshot to `data/baselines/<name>.json`; `jumpserver_baseline_compare` re-inspects and reports real drift (ports, disks, services, roles, kernel, cores; load/memory jitter is suppressed). An unreachable host is reported as unreachable, never as "unchanged".
 - **Console access token (V0.4.1)**: the embedded console binds to 127.0.0.1 but every request must present a per-process random token (`/?token=…` or the `X-Console-Token` header) — otherwise 403. The token is handed over only in the model's console URL.
+- **Token expiry + rotation (V0.4.2)**: the console token now expires (default 12h; `auditViewer.tokenTtlMinutes`, 0 = never). A stale token gets 403 plus an `x-console-token-expired: 1` marker, so the page shows a "token expired — ask the model to reopen the console" overlay instead of retrying forever. `jumpserver_status` returns the live `consoleUrl` + expiry, and `rotateConsoleToken=true` mints a new token on demand (the old link dies immediately).
 
 ## Configuration
 
@@ -63,9 +65,10 @@ Copy `config.example.json` to `config.json`, fill `host` / `username`. The passw
 | `batchConcurrency` | `1` | Targets surveyed at once per batch/inspect/compare call (1..8; 1 = sequential) |
 | `maxSessions` | `4` | Cap on simultaneous bastion sessions (1..16) |
 | `assetGroups` | `{}` | Named group -> keywords, used by `jumpserver_assets` |
-| `runbooks` | `{}` | Named runbook -> `{ title, steps[] }`; each step is a `profile` or a READ `command` |
+| `runbooks` | `{}` | Named runbook -> `{ title, steps[] }`; each step is a `profile` or a READ `command`, optionally with `expect` assertions |
 | `auditPath` | `<root>/data/audit.jsonl` | JSONL audit sink |
 | `auditViewer.{enabled,port,autoOpen,portFallback}` | `true/8765/true/true` | Embedded console |
+| `auditViewer.tokenTtlMinutes` | `720` | Console access-token lifetime in minutes (0 = never expires) |
 | `requireArm` | `false` | Require `jumpserver_arm` before any tool runs |
 
 ## Register with WorkBuddy
@@ -78,7 +81,7 @@ Copy `config.example.json` to `config.json`, fill `host` / `username`. The passw
       "command": "node",
       "args": ["C:/Users/114976/WorkBuddy/jumpserver-mcp/lib/server.js"],
       "env": { "JUMPSERVER_PASSWORD": "..." },
-      "description": "JumpServer MCP v0.4.1: fixed probes, host inventory, evidence topology, streaming jobs, runbooks, compare, baselines"
+      "description": "JumpServer MCP v0.4.2: fixed probes, host inventory, evidence topology, streaming jobs, runbooks+assertions, compare, baselines"
     }
   }
 }
@@ -118,6 +121,7 @@ Test coverage (`tests/`):
 
 - `security/command-classifier.test.mjs` — the classifier matrix (incl. every fixed case from the review).
 - `security/permission-gate.test.mjs` — 3 modes x 5 risks + target allow/deny.
+- `security/target-scope.test.mjs` — deny beats allow, substring/IP-prefix matching, blank targets never gated.
 - `jumpserver/state-machine.test.mjs` — legal/illegal transitions.
 - `jumpserver/session-abort.test.mjs` — AbortSignal and out-of-band interrupt() must Ctrl+C + re-verify.
 - `jumpserver/asset-list.test.mjs` — `p` parse / footer / filter / groups.
@@ -125,10 +129,10 @@ Test coverage (`tests/`):
 - `jumpserver/topology.test.mjs` — edge construction and evidence.
 - `inspect/profile-safety.test.mjs` — every profile command is still READ.
 - `jumpserver/concurrency.test.mjs` — bounded concurrency order/limit, abort, `Semaphore`.
-- `jumpserver/runbook.test.mjs` — non-READ / unknown-profile steps are skipped, never scheduled.
+- `jumpserver/runbook.test.mjs` — non-READ / unknown-profile steps are skipped, never scheduled; `evaluateExpect` PASS/FAIL matrix.
 - `jumpserver/compare.test.mjs` — order-insensitive grouping, outlier missing/extra, failed hosts excluded.
 - `runtime/baseline.test.mjs` — baseline save/load, name safety, drift diff, jitter suppression.
-- `runtime/console-token.test.mjs` — 403 without token, 200 with token / header.
+- `runtime/console-token.test.mjs` — 403 without token, 200 with token / header, TTL expiry marker, rotation.
 - `runtime/audit-store.test.mjs` — async append, ring cap, incremental tail.
 - `runtime/time.test.mjs` — timezone formatting.
 

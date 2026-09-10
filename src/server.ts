@@ -17,7 +17,7 @@ import { gateCommand, gateCommandForNavigation, gateCommandsForNavigation, type 
 import { JUMPSERVER_NOT_ARMED, NOT_ARMED_MESSAGE, type SessionGrant } from './security/grant.js'
 import { redactCommandSecrets } from './security/command-redaction.js'
 import { createRuntime, type Runtime } from './runtime/runtime.js'
-import { auditViewerUrl, readAuditEntries } from './runtime/audit-viewer.js'
+import { auditViewerUrl, consoleTokenInfo, readAuditEntries, rotateConsoleAccessToken } from './runtime/audit-viewer.js'
 import { registerOpsTools } from './runtime/tools-ops.js'
 import { toolText, toolTextRaw } from './runtime/tool-host.js'
 import { formatAuditTime } from './runtime/time.js'
@@ -80,17 +80,33 @@ async function main(): Promise<void> {
     'jumpserver_status',
     {
       description:
-        'Query the current JumpServer connector state: whether a session exists, which bastion gateway it uses, which target asset is entered (verified via probe), and the current permission mode. Never returns credentials.',
-      inputSchema: {},
+        'Query the current JumpServer connector state: whether a session exists, which bastion gateway it uses, which target asset is entered (verified via probe), and the current permission mode. Also returns the live ops-console URL and its token expiry. Never returns credentials. Pass rotateConsoleToken=true to invalidate the current console token and get a fresh URL (the old link stops working immediately).',
+      inputSchema: {
+        rotateConsoleToken: z
+          .boolean()
+          .optional()
+          .describe('Issue a new console access token and return the new URL; the previous link stops working. Use when the console shows "令牌已过期".'),
+      },
       annotations: { readOnlyHint: true },
     },
-    async (_args, extra) => {
+    async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_status', callId: extra.requestId, signal: extra.signal, confirm: false }
       return text(await guardValue(exec, async () => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
         const bundle = bundleFor(exec, registry)
-        return { ...statusToValue(bundle.manager.status()), ...runtimeVersion() }
+        if (args.rotateConsoleToken === true) rotateConsoleAccessToken()
+        // V0.4.2: surface the live console URL + token expiry so a user whose
+        // console aged out can be handed a fresh link without a restart.
+        const tokenInfo = consoleTokenInfo()
+        return {
+          ...statusToValue(bundle.manager.status()),
+          ...runtimeVersion(),
+          consoleUrl: auditViewerUrl(),
+          consoleTokenTtlMinutes: tokenInfo.ttlMinutes,
+          consoleTokenExpiresAt: tokenInfo.expiresAt,
+          consoleTokenExpired: tokenInfo.expired,
+        }
       }))
     },
   )
@@ -108,6 +124,8 @@ async function main(): Promise<void> {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
         const bundle = bundleFor(exec, registry)
+        // V0.4.2: a session that drifted into a denied asset must not be resumed.
+        requireTargetAllowed(runtime.getConfig(), bundle.manager.status().target)
         return statusToValue(await bundle.manager.connect(exec.signal))
       }))
     },
@@ -127,6 +145,9 @@ async function main(): Promise<void> {
       return text(await guardValue(exec, async () => {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
+        // V0.4.2: scope check BEFORE navigation — a denied target must never
+        // get an SSH/PTY session opened against it.
+        requireTargetAllowed(runtime.getConfig(), args.target)
         const bundle = bundleFor(exec, registry)
         return statusToValue(await bundle.manager.enter(args.target, exec.signal))
       }))
@@ -226,8 +247,9 @@ async function main(): Promise<void> {
         const blocked = requireGrant(grants, runtime, exec)
         if (blocked !== null) return blocked
         const bundle = bundleFor(exec, registry)
-        const gated = await gateCommandForNavigation(servicesFor(bundle), exec, args.command)
+        // V0.4.2: fail fast on out-of-scope targets before any classification work.
         requireTargetAllowed(runtime.getConfig(), args.target)
+        const gated = await gateCommandForNavigation(servicesFor(bundle), exec, args.command)
         const timeoutMs = args.timeout !== undefined ? Math.max(1, args.timeout) * 1000 : undefined
         const result = await bundle.manager.run({
           target: args.target,
