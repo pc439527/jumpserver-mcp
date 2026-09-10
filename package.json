@@ -14,12 +14,32 @@
     "README.md"
   ],
   "license": "MIT",
+  "author": "Kinder Ou <oujianda@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pc439527/jumpserver-mcp.git"
+  },
+  "homepage": "https://github.com/pc439527/jumpserver-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/pc439527/jumpserver-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "jumpserver",
+    "bastion",
+    "ssh",
+    "ai-agent",
+    "ops",
+    "sre"
+  ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
     "start": "node lib/server.js",
     "smoke": "node scripts/smoke.mjs",
     "test": "tsc -p tsconfig.json && node scripts/run-tests.mjs",
