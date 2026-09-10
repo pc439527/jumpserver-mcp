@@ -35,6 +35,20 @@ export interface JumpServerConfig {
   password?: string
   /** Credential-ref (env var name) for the password, resolved per connect. */
   passwordEnv: string
+  /**
+   * V0.5.0: pinned SSH host-key fingerprint, e.g. "SHA256:AbCdEf…".
+   * When set, only a byte-identical host key is accepted and any other key is
+   * refused as HOST_KEY_MISMATCH. When absent, the first contact is trusted
+   * and recorded in `knownHostsPath` (TOFU), and every later contact must
+   * match that record.
+   */
+  hostFingerprint?: string
+  /**
+   * V0.5.0: known_hosts store used by TOFU (default
+   * <project>/data/known_hosts.json). Ignored when hostFingerprint is set —
+   * a match is still recorded there for visibility.
+   */
+  knownHostsPath?: string
   /** Connect timeout in seconds (default 15) */
   connectTimeout: number
   /** Per-command default timeout in seconds (default 60) */

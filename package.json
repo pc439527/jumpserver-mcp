@@ -1,14 +1,17 @@
 {
   "name": "jumpserver-mcp",
-  "version": "0.4.5",
-  "description": "JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server: persistent SSH/PTY session with explicit state machine, asset discovery, permission-gated audited commands, target-affinity batch execution, fixed-profile structured host inventory, evidence-annotated topology, streaming jobs, and an embedded local ops console (live terminal mirror, topology / jobs / audit / stats / session tabs).",
+  "version": "0.5.1",
+  "description": "JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server: persistent SSH/PTY session with explicit state machine, asset discovery, permission-gated audited commands, target-affinity batch execution, fixed-profile structured host inventory, evidence-annotated topology, streaming jobs, SSH host-key verification, and an embedded local ops console (live terminal mirror, topology / jobs / audit / stats / session / settings tabs).",
   "type": "module",
   "main": "lib/server.js",
   "bin": {
     "jumpserver-mcp": "lib/server.js"
   },
   "files": [
-    "lib"
+    "lib",
+    "connector",
+    "LICENSE",
+    "README.md"
   ],
   "license": "MIT",
   "engines": {
@@ -20,7 +23,14 @@
     "start": "node lib/server.js",
     "smoke": "node scripts/smoke.mjs",
     "test": "tsc -p tsconfig.json && node scripts/run-tests.mjs",
-    "test:only": "node scripts/run-tests.mjs"
+    "test:only": "node scripts/run-tests.mjs",
+    "validate:connector": "node scripts/validate-connector.mjs",
+    "pack:connector": "node scripts/validate-connector.mjs && node scripts/pack-connector.mjs",
+    "market:build": "node scripts/local-connector-market.mjs build",
+    "market:serve": "node scripts/local-connector-market.mjs serve",
+    "market:enable": "node scripts/local-connector-market.mjs enable",
+    "market:disable": "node scripts/local-connector-market.mjs disable",
+    "market:status": "node scripts/local-connector-market.mjs status"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",
@@ -30,6 +40,7 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/ssh2": "^1.15.4",
+    "adm-zip": "^0.6.0",
     "typescript": "^5.6.0"
   }
 }

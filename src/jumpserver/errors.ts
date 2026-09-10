@@ -38,6 +38,9 @@ export const JUMP_ERROR_CODES = [
   'UNKNOWN_BASELINE',
   'BASELINE_MISMATCH',
   'INVALID_ARGUMENT',
+  // V0.5.0: the bastion's SSH host key contradicts the pinned fingerprint or
+  // the recorded known_hosts entry — the connection is refused before auth.
+  'HOST_KEY_MISMATCH',
 ] as const
 
 export type JumpServerErrorCode = (typeof JUMP_ERROR_CODES)[number]

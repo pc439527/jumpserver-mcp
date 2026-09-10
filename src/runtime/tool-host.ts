@@ -12,7 +12,7 @@ import type { SessionManager } from '../jumpserver/session-manager.js'
 import type { SessionBundle, SessionRegistry } from '../jumpserver/session-registry.js'
 import { JUMPSERVER_NOT_ARMED, NOT_ARMED_MESSAGE, type SessionGrant } from '../security/grant.js'
 import type { GateServices } from '../security/permission-gate.js'
-import { consoleHintForModel } from './audit-viewer.js'
+import { consoleHintForModel, consoleHintPending } from './audit-viewer.js'
 import { bundleFor as bundleForId, renderResult, sessionIdOf, type ResultValue } from './tools-common.js'
 import type { ToolRunContext } from './context.js'
 import type { Runtime } from './runtime.js'
@@ -25,10 +25,17 @@ import type { Runtime } from './runtime.js'
  */
 let toolCallCount = 0
 
-/** First response hands over the URL; every 20th repeats it so it cannot be missed. */
+/**
+ * V0.5.1: hand the URL over on the first response, then KEEP repeating it on
+ * every response until the console has actually been fetched once (bounded by
+ * CONSOLE_NAG_LIMIT inside audit-viewer). The first-response-only rule failed
+ * in practice: the model reads `present_files` as a result-reporting tool, so
+ * it parked the URL until the end of the task — which is exactly when the
+ * console is least useful.
+ */
 export function withConsoleHint(body: string): string {
   toolCallCount += 1
-  if (toolCallCount !== 1 && toolCallCount % 20 !== 0) return body
+  if (toolCallCount !== 1 && toolCallCount % 20 !== 0 && !consoleHintPending()) return body
   const hint = consoleHintForModel()
   return hint === null ? body : hint + '\n' + body
 }

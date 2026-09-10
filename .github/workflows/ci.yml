@@ -6,16 +6,26 @@ on:
     branches: [main]
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # V0.5.0: Windows is the primary runtime for this connector — WorkBuddy on
+    # Windows spawns the stdio server, the console binds a local HTTP port, and
+    # the SSH/PTY path touches real process and filesystem semantics. A
+    # Linux-only gate let Windows-only regressions ship.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node-version: ['20', '22']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node-version }}
           cache: 'npm'
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
+      - run: npm run validate:connector
       - run: npm run smoke
       - run: npm test

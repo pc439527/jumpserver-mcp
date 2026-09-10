@@ -11,7 +11,17 @@ import { footerComplete, hasPayloadEvidence, looksPaged, parseFooter } from './a
 import { randomHex, sleep } from './timing.js'
 
 export interface WireFactory {
-  (params: { host: string; port: number; username: string; password: string; connectTimeoutMs: number }): Promise<Wire>
+  (params: {
+    host: string
+    port: number
+    username: string
+    password: string
+    connectTimeoutMs: number
+    /** V0.5.0: pinned SSH host-key fingerprint (optional). */
+    hostFingerprint?: string
+    /** V0.5.0: known_hosts store for TOFU. */
+    knownHostsPath?: string
+  }): Promise<Wire>
 }
 
 export interface SessionRuntimeConfig {
@@ -22,6 +32,10 @@ export interface SessionRuntimeConfig {
   /** Test seam: replaces the real ssh2 transport. */
   wireFactory?: WireFactory
   connectTimeoutMs: number
+  /** V0.5.0: pinned SSH host-key fingerprint; when set, only a match is accepted. */
+  hostFingerprint?: string
+  /** V0.5.0: known_hosts store for TOFU when no fingerprint is pinned. */
+  knownHostsPath?: string
   enterAssetMs: number
   probeMs: number
   commandMs: number
@@ -183,6 +197,8 @@ export class JumpServerSession {
             username: this.cfg.username,
             password: this.cfg.password,
             connectTimeoutMs: this.cfg.connectTimeoutMs,
+            hostFingerprint: this.cfg.hostFingerprint,
+            knownHostsPath: this.cfg.knownHostsPath,
           })
         : await SshPtyWire.connect({
             host: this.cfg.host,
@@ -190,6 +206,8 @@ export class JumpServerSession {
             username: this.cfg.username,
             password: this.cfg.password,
             connectTimeoutMs: this.cfg.connectTimeoutMs,
+            hostFingerprint: this.cfg.hostFingerprint,
+            knownHostsPath: this.cfg.knownHostsPath,
           })
       this.attach(wire)
       const menuSeen = await this.waitForScreen(SessionState.JUMPSERVER_MENU, this.cfg.connectTimeoutMs, signal)

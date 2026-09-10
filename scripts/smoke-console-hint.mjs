@@ -5,11 +5,16 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { readdirSync, readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// Resolved from this file, never hardcoded: the repo path is machine-specific.
+const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 const NODE = process.execPath
 const transport = new StdioClientTransport({
   command: NODE,
-  args: ['C:/Users/114976/WorkBuddy/jumpserver-mcp/lib/server.js'],
+  args: [join(root, 'lib', 'server.js')],
   env: process.env,
   stderr: 'inherit',
 })
@@ -30,9 +35,9 @@ const second = await client.callTool({ name: 'jumpserver_audit', arguments: { li
 console.log('hint repeat on 2nd call: ' + second.content[0].text.includes('[jumpserver-console]'))
 
 await new Promise((r) => setTimeout(r, 1200))
-const dir = 'C:/Users/114976/WorkBuddy/jumpserver-mcp/data/consoles'
+const dir = join(root, 'data', 'consoles')
 try {
-  for (const f of readdirSync(dir)) console.log('registry ' + f + ' -> ' + readFileSync(dir + '/' + f, 'utf8').trim())
+  for (const f of readdirSync(dir)) console.log('registry ' + f + ' -> ' + readFileSync(join(dir, f), 'utf8').trim())
 } catch (e) {
   console.log('registry MISSING: ' + e.message)
 }

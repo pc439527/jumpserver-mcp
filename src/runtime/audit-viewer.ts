@@ -7,6 +7,8 @@
  *   审计日志  audit table + filter + JSONL/CSV export (configured timezone)
  *   统计      risk / target / operation / daily aggregates
  *   会话      active sessions + interrupt / disconnect buttons
+ *   设置      V0.5.0: live connection and where every value came from
+ *             (ENV / config.json / default) — password value never shown
  *
  * Behaviour:
  *   - one console per conversation: when the configured port is taken (another
@@ -33,6 +35,7 @@ import type { JobStore } from './job-store.js'
 import type { TopologyStore } from './topology-store.js'
 import type { AssetStore } from './asset-store.js'
 import type { BaselineStore } from './baseline-store.js'
+import type { ConnectionView } from '../config/env.js'
 import { interruptSession } from './interrupt.js'
 
 export interface AuditViewerOptions {
@@ -46,6 +49,22 @@ export interface AuditViewerOptions {
    * Set 0 to disable expiry. An expired token forces a fresh handover URL.
    */
   tokenTtlMinutes?: number
+  /**
+   * V0.5.1: serve the console at a TOKEN-FREE, restart-stable address
+   * (`http://127.0.0.1:<port>/`) and inject the access token into the page
+   * instead of the URL (default true).
+   *
+   * Why: the per-process ephemeral port made every handover URL a dead end.
+   * With two MCP processes alive (a custom `mcp.json` entry plus the installed
+   * connector) the second one hit EADDRINUSE, fell back to a random port and
+   * handed out THAT port's URL — then died on the next config reload, so the
+   * already-open page showed 工作台已失效. A fixed address plus in-page token
+   * injection means one stable URL per workspace that survives restarts.
+   *
+   * Set false to restore v0.5.0 behaviour (?token=… in the URL, ephemeral
+   * fallback port). The token then also guards `GET /`.
+   */
+  stableUrl?: boolean
 }
 
 export interface AuditViewerServices {
@@ -59,6 +78,15 @@ export interface AuditViewerServices {
   baselines?: BaselineStore | null
   /** IANA display zone for audit timestamps (default Asia/Shanghai). */
   timeZone?: string
+  /**
+   * V0.5.0: live connection provenance for the 设置 tab. Absent when the
+   * console runs as an audit-only mirror without a runtime.
+   */
+  connection?: (() => ConnectionView) | null
+  /** V0.5.0: policy knobs shown by the 设置 tab — values only config.json sets. */
+  policy?: (() => Record<string, unknown>) | null
+  /** V0.5.0: known_hosts records (path + entries) for the 设置 tab. */
+  knownHosts?: (() => { path?: string; entries: Record<string, unknown> }) | null
 }
 
 /** Terminal events sent to the page per poll (tail; older events are dropped). */
@@ -80,6 +108,20 @@ let consoleServer: import('node:http').Server | null = null
 let consoleHeartbeatTimer: ReturnType<typeof setInterval> | null = null
 /** Whether this process hands its console URL to the model (config: auditViewer.autoOpen). */
 let hintEnabled = true
+/** V0.5.1: stable token-free address (config: auditViewer.stableUrl). */
+let stableAddress = true
+/** V0.5.1: true while THIS process owns the HTTP listener (false when adopting another's). */
+let consoleBound = false
+/** V0.5.1: true once a browser actually fetched the page (stops the hint nagging). */
+let consoleOpened = false
+/** V0.5.1: hints emitted so far, capped by CONSOLE_NAG_LIMIT. */
+let hintEmitted = 0
+/** V0.5.1: the configured port, kept so the heartbeat can retry a takeover. */
+let consoleRequestedPort = 0
+/** V0.5.1: log "served by another process" once, not on every retry tick. */
+let consoleAdoptLogged = false
+/** V0.5.1: max hints while the console has never been opened. */
+const CONSOLE_NAG_LIMIT = 12
 /**
  * V0.4.1: per-process random access token. The console binds to 127.0.0.1, but
  * any local process (or a browser tab) could otherwise read the audit trail and
@@ -145,7 +187,7 @@ export function readAuditEntries(file: string): Record<string, unknown>[] {
   }
 }
 
-function page(timeZone: string): string {
+function page(timeZone: string, injectedToken: string): string {
   return `<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
 <title>JumpServer MCP 控制台</title>
@@ -240,6 +282,7 @@ tr:hover td{background:#1d1d1d}
     <button data-tab="audit">审计日志</button>
     <button data-tab="stats">统计</button>
     <button data-tab="sessions">会话</button>
+    <button data-tab="settings">设置</button>
   </nav>
   <span id="stat">loading…</span>
 </header>
@@ -329,8 +372,18 @@ tr:hover td{background:#1d1d1d}
   <tbody id="srows"></tbody></table></div>
 </section>
 
+<section id="tab-settings">
+  <div class="sessbar">
+    <button class="act" id="set-refresh">刷新</button>
+    <span style="color:#777;font-size:12px">连接信息来自 WorkBuddy 连接器表单（环境变量）或 config.json。优先级：环境变量 &gt; config.json &gt; 默认值。密码不显示明文。</span>
+  </div>
+  <div class="grp"><h3>当前连接</h3><div id="setconn">加载中…</div></div>
+  <div class="grp"><h3>策略配置（只在 config.json 中设置）</h3><div id="setpolicy">加载中…</div></div>
+  <div class="grp"><h3>已知主机密钥（known_hosts）</h3><div id="sethosts">加载中…</div></div>
+</section>
+
 </main>
-<div id="dead"><div class="t">工作台已失效</div><div class="d">对应的对话已结束，服务进程已退出。本页不会再更新，可以关闭。</div><button class="act" id="dead-close">关闭本页</button></div>
+<div id="dead"><div class="t">工作台已失效</div><div class="d">本地控制台进程已退出。V0.5.1 起工作台会自动重连 —— 若 30 秒内没有恢复，说明这个 MCP 进程已彻底结束，让 AI 重新调用任意一个 jumpserver 工具（例如 jumpserver_status）即可复活。</div><button class="act" id="dead-close">关闭本页</button></div>
 <div id="expired"><div class="t">控制台令牌已过期</div><div class="d">出于安全考虑，本地控制台的访问令牌有时效。请让 AI 重新调用一次 jumpserver_status（或任意工具），然后用新的链接打开控制台。</div><button class="act" id="expired-close">关闭本页</button></div>
 <script>
 var TZ = ${JSON.stringify(timeZone)};
@@ -359,25 +412,38 @@ function showDead(){
   if (deadShown) return; deadShown = true;
   $('dead').style.display = 'flex';
 }
+/* V0.5.1: a successful poll clears the overlay, so the page recovers by itself
+   when a restarted MCP process takes the console address back over. */
+function hideDead(){
+  if (!deadShown) return; deadShown = false;
+  $('dead').style.display = 'none';
+}
 function showExpired(){
   if (expiredShown) return; expiredShown = true;
   $('expired').style.display = 'flex';
 }
 $('dead-close').addEventListener('click', function(){ window.close(); });
 $('expired-close').addEventListener('click', function(){ window.close(); });
-/* fetch wrapper: any success resets the dead-counter; N misses => expired overlay */
-/* V0.4.1: every request must carry the console access token from the URL. */
-var TOKEN = (new URLSearchParams(location.search)).get('token') || '';
+/* fetch wrapper: any success resets the dead-counter; N misses => dead overlay */
+/* V0.4.1: /api/* requires the console access token. V0.5.1: the server injects
+   it into the page, so the token-free stable address still works. */
+var TOKEN = (new URLSearchParams(location.search)).get('token') || ${JSON.stringify(injectedToken)};
 function withToken(u){
   if (!TOKEN) return u;
   return u + (u.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
 }
+var tokenReloads = 0;
+/* V0.5.1: an aged-out token is transparent — reloading fetches a fresh one
+   from the server (which injects the current token into the page). */
+function refreshToken(){
+  if (tokenReloads >= 2) { showExpired(); return; }
+  tokenReloads++; location.reload();
+}
 function F(u,o){
   return fetch(withToken(u),o).then(function(r){
-    /* V0.4.2: a 403 marked expired means the token aged out — stop polling and
-       tell the user to reopen the console rather than retrying forever. */
-    if (r.status === 403 && r.headers.get('x-console-token-expired') === '1') { showExpired(); }
-    failCount=0;return r;
+    /* V0.4.2: a 403 marked expired means the token aged out. */
+    if (r.status === 403 && r.headers.get('x-console-token-expired') === '1') { refreshToken(); }
+    failCount=0; hideDead(); return r;
   }).catch(function(e){failCount++;if(failCount>=${DEAD_AFTER_FAILURES})showDead();throw e;});
 }
 function POST(u,body){
@@ -397,12 +463,13 @@ function showTab(name){
   if (name==='topology') pollTopology();
   if (name==='jobs') pollJobs();
   if (name==='assets') pollAssets();
+  if (name==='settings') pollSettings();
 }
 var navBtns = document.querySelectorAll('nav button');
 for (var b=0;b<navBtns.length;b++){
   (function(btn){btn.addEventListener('click',function(){showTab(btn.getAttribute('data-tab'));});})(navBtns[b]);
 }
-showTab(['terminal','assets','topology','jobs','audit','stats','sessions'].indexOf(tab)>=0?tab:'audit');
+showTab(['terminal','assets','topology','jobs','audit','stats','sessions','settings'].indexOf(tab)>=0?tab:'audit');
 
 /* ---- terminal ---- */
 function renderChips(list){
@@ -545,6 +612,67 @@ function pollAssets(){
 });
 var assRefresh = $('ass-refresh');
 if (assRefresh) assRefresh.addEventListener('click', function(){ pollAssets(); });
+
+/* ---- settings (V0.5.0) ---- */
+function srcLabel(s){
+  if (s==='env') return 'WorkBuddy 环境变量';
+  if (s==='config') return 'config.json';
+  return '默认值';
+}
+function srcChip(s){
+  var color = s==='env' ? '#5c9' : (s==='config' ? '#7ab' : '#888');
+  return '<span style="color:'+color+'">'+srcLabel(s)+'</span>';
+}
+function kvTable(rows){
+  return '<table style="width:auto"><tbody>'+rows.map(function(r){
+    return '<tr><td style="color:#999;padding:2px 16px 2px 0;vertical-align:top">'+esc(r[0])+'</td>'+
+           '<td style="padding:2px 16px 2px 0">'+r[1]+'</td>'+
+           '<td style="padding:2px 0">'+r[2]+'</td></tr>';
+  }).join('')+'</tbody></table>';
+}
+function renderSettings(j){
+  var c = j.connection;
+  if (!c){
+    $('setconn').innerHTML = '<span style="color:#666">控制台没有拿到连接信息（audit-only 模式）。</span>';
+  } else {
+    var pw = c.password.present ? '已配置' : '未配置';
+    var rows = [
+      ['JumpServer 地址', esc(c.host.value||'(未设置)'), srcChip(c.host.source)],
+      ['SSH 端口', esc(c.port.value), srcChip(c.port.source)],
+      ['用户名', esc(c.username.value||'(未设置)'), srcChip(c.username.source)],
+      ['密码', esc(pw)+(c.password.via?' <span style="color:#666">('+esc(c.password.via)+')</span>':''), srcChip(c.password.source)]
+    ];
+    $('setconn').innerHTML = kvTable(rows) +
+      '<div style="color:#777;font-size:12px;margin-top:8px">配置文件：'+esc(c.configPath)+
+      (c.configPresent?' <span style="color:#7ab">已找到</span>':' <span style="color:#a86">不存在 —— 使用环境变量与默认值</span>')+'</div>';
+  }
+  var p = j.policy || {};
+  var keys = Object.keys(p);
+  $('setpolicy').innerHTML = keys.length ? kvTable(keys.map(function(k){
+    var v = p[k];
+    var text = Array.isArray(v) ? (v.length ? v.join(', ') : '（空）') : String(v);
+    return [k, esc(text), ''];
+  })) : '<span style="color:#666">无</span>';
+  var h = (j.knownHosts && j.knownHosts.entries) || {};
+  var hosts = Object.keys(h);
+  if (!j.knownHosts || !j.knownHosts.path){
+    $('sethosts').innerHTML = '<span style="color:#666">未配置 known_hosts 路径。</span>';
+  } else if (!hosts.length){
+    $('sethosts').innerHTML = '<span style="color:#666">暂无记录 —— 首次连接堡垒机时会记录其主机密钥（TOFU）。</span>'+
+      '<div style="color:#777;font-size:12px;margin-top:6px">'+esc(j.knownHosts.path)+'</div>';
+  } else {
+    $('sethosts').innerHTML = kvTable(hosts.map(function(k){
+      var r = h[k];
+      return [k, '<span style="color:#8ab">'+esc(r.fingerprint)+'</span>', '<span style="color:#777">'+esc(r.algorithm||'')+' · '+esc(r.source)+'</span>'];
+    })) + '<div style="color:#777;font-size:12px;margin-top:6px">'+esc(j.knownHosts.path)+'</div>';
+  }
+}
+function pollSettings(){
+  if (tab!=='settings') return;
+  F('/api/settings').then(function(r){return r.json();}).then(function(j){ renderSettings(j); }).catch(function(){});
+}
+var setRefresh = $('set-refresh');
+if (setRefresh) setRefresh.addEventListener('click', function(){ pollSettings(); });
 
 /* ---- topology (V0.4.0) ---- */
 function renderTopology(){
@@ -830,18 +958,30 @@ function topologyRoles(store: TopologyStore | null): Record<string, string[]> {
  */
 
 /**
- * Instruction block handed to the model on the first tool response of this
- * process. `present_files` with a localhost URL opens the WorkBuddy built-in
- * preview panel — that is the ONLY way to surface this console in-app.
+ * Instruction block handed to the model on a tool response. `present_files`
+ * with a localhost URL opens the WorkBuddy built-in preview panel — that is
+ * the ONLY way to surface this console in-app.
+ *
+ * V0.5.1: emitted repeatedly until the page has been fetched once (see
+ * withConsoleHint), and worded to pre-empt the "present_files reports my final
+ * result" reading that made the model park the URL until the task was over.
  */
 export function consoleHintForModel(): string | null {
   const url = auditViewerUrl()
   if (url === null || hintEnabled !== true) return null
+  hintEmitted += 1
   return (
-    '[jumpserver-console] 本对话的 JumpServer 工作台: ' + url + '\n' +
-    '请立即调用 present_files 打开这个 URL（会显示在 WorkBuddy 内置预览面板里，实时终端/资产/拓扑/任务/审计/统计/会话七个页签）。\n' +
-    '禁止改用系统浏览器打开（不要 rundll32 / start / explorer / 外部浏览器），每个对话端口独立，关掉对话即失效。'
+    '[jumpserver-console] JumpServer 工作台（实时终端 / 资产 / 拓扑 / 任务 / 审计 / 统计 / 会话 / 设置）: ' + url + '\n' +
+    '这是「启动阶段」的界面交接，不是任务结果汇报 —— 请在执行第一条远程命令之前就调用 present_files 打开它。' +
+    '等到任务快结束才打开就晚了：那时进程可能已经退出，页面只会显示「工作台已失效」。\n' +
+    '地址固定（V0.5.1 起不含令牌、也不随进程退出而失效），可以直接打开或收藏。\n' +
+    '禁止改用系统浏览器打开（不要 rundll32 / start / explorer / 外部浏览器）。'
   )
+}
+
+/** V0.5.1: true while a console exists that no browser has opened yet. */
+export function consoleHintPending(): boolean {
+  return hintEnabled === true && viewerUrl !== null && consoleOpened !== true && hintEmitted < CONSOLE_NAG_LIMIT
 }
 
 /**
@@ -858,6 +998,10 @@ export function startAuditViewer(
 ): string | null {
   if (opts.enabled !== true) return null
   hintEnabled = opts.autoOpen
+  stableAddress = opts.stableUrl !== false
+  consoleOpened = false
+  hintEmitted = 0
+  consoleBound = false
   consoleDir = join(dirname(auditPath), 'consoles')
   consoleStartedAt = new Date().toISOString()
   const ttlMinutes = opts.tokenTtlMinutes
@@ -873,16 +1017,27 @@ export function startAuditViewer(
       const target = req.url ?? '/'
       const href = target.split('?')[0] ?? '/'
       const query = new URLSearchParams(target.split('?')[1] ?? '')
-      // V0.4.1: every request must present the token (query or header).
+      // V0.4.1: /api/* must present the token (query or header).
       // V0.4.2: an expired token is rejected with a distinct marker so the page
       // can show "console expired" instead of a generic failure.
+      // V0.5.1: in stable-address mode `GET /` is exempt — the page is static
+      // and carries no audit data, and it receives the token as an injected
+      // constant rather than a query parameter. Cross-origin callers are still
+      // refused outright, so a web page in the local browser cannot read the
+      // audit trail or reach /api/interrupt.
       const presented = query.get('token') ?? (typeof req.headers[TOKEN_HEADER] === 'string' ? (req.headers[TOKEN_HEADER] as string) : null)
-      if (!tokenMatches(presented)) {
+      const isPageLoad = (req.method === 'GET' || req.method === 'HEAD') && (href === '/' || href === '/index.html')
+      const origin = req.headers['origin']
+      const reqHost = typeof req.headers['host'] === 'string' ? (req.headers['host'] as string) : ''
+      const crossOrigin =
+        typeof origin === 'string' && origin.length > 0 && origin !== 'http://' + reqHost && origin !== 'https://' + reqHost
+      const pageExempt = stableAddress && isPageLoad && !crossOrigin
+      if (!pageExempt && !tokenMatches(presented)) {
         const expired = consoleTokenExpired()
         res.statusCode = 403
         res.setHeader('content-type', 'text/plain; charset=utf-8')
         if (expired) res.setHeader('x-console-token-expired', '1')
-        res.end(expired ? 'console token expired: ask the model to reopen the console' : 'forbidden: missing or invalid console token')
+        res.end(expired ? 'console token expired: reload the page to get a fresh one' : 'forbidden: missing or invalid console token')
         return
       }
       const entries = (): Record<string, unknown>[] => (audit !== null ? audit.list() : readAuditEntries(auditPath))
@@ -1030,6 +1185,19 @@ export function startAuditViewer(
         sendJson(res, { sessions })
         return
       }
+      if (href === '/api/settings') {
+        // V0.5.0: one read for the 设置 tab. The connection view carries the
+        // password SOURCE only; no credential value is ever serialized here.
+        const conn = services.connection !== undefined && services.connection !== null
+          ? services.connection()
+          : null
+        const policy = services.policy !== undefined && services.policy !== null ? services.policy() : {}
+        const knownHosts = services.knownHosts !== undefined && services.knownHosts !== null
+          ? services.knownHosts()
+          : { entries: {} }
+        sendJson(res, { connection: conn, policy, knownHosts })
+        return
+      }
       if (href === '/api/topology') {
         sendJson(res, services.topology?.get() ?? { nodes: [], edges: [], warnings: [] })
         return
@@ -1054,7 +1222,9 @@ export function startAuditViewer(
         return
       }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      res.end(page(timeZone))
+      res.end(page(timeZone, consoleToken ?? ''))
+      // V0.5.1: the page has been fetched — stop nagging the model about it.
+      consoleOpened = true
     })().catch(() => {
       try {
         res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
@@ -1064,31 +1234,58 @@ export function startAuditViewer(
       }
     })
   })
+  consoleRequestedPort = opts.port
+  // V0.5.1: a random fallback port is what made handover URLs go stale, so it
+  // only applies in the legacy (token-in-URL) mode.
+  const allowEphemeralFallback = opts.portFallback !== false && !stableAddress
   server.on('error', (error) => {
     const code = (error as NodeJS.ErrnoException).code
-    if (code === 'EADDRINUSE' && opts.portFallback !== false) {
-      // Another conversation holds the configured port — take an ephemeral one
-      // so THIS conversation keeps its own live console.
-      try {
-        server.listen(0, '127.0.0.1')
-      } catch {
-        console.error('[jumpserver-mcp] ops console: fallback listen failed')
+    if (code === 'EADDRINUSE') {
+      if (allowEphemeralFallback) {
+        // Legacy mode: another conversation holds the configured port — take an
+        // ephemeral one so THIS conversation keeps its own live console.
+        try {
+          server.listen(0, '127.0.0.1')
+        } catch {
+          console.error('[jumpserver-mcp] ops console: fallback listen failed')
+        }
+        return
+      }
+      // Stable mode: the address is shared on purpose. Hand over the SAME URL
+      // the owner serves, and let the heartbeat take the listener over as soon
+      // as that process exits.
+      viewerUrl = consoleUrl(opts.port)
+      if (!consoleAdoptLogged) {
+        consoleAdoptLogged = true
+        console.error(
+          '[jumpserver-mcp] ops console: 127.0.0.1:' +
+            String(opts.port) +
+            ' is already served by another MCP process; adopting that address (will take over when it exits)',
+        )
       }
       return
     }
     console.error('[jumpserver-mcp] ops console: ' + (error instanceof Error ? error.message : String(error)))
   })
   server.on('listening', () => {
+    consoleBound = true
+    consoleAdoptLogged = false
     const address = server.address()
     const port = typeof address === 'object' && address !== null ? address.port : opts.port
+    consolePort = port
+    consoleStartedAt = new Date().toISOString()
     viewerUrl = consoleUrl(port)
     if (port !== opts.port) {
       console.error('[jumpserver-mcp] ops console: port ' + String(opts.port) + ' busy, using port ' + String(port))
     } else {
-      console.error('[jumpserver-mcp] ops console: port ' + String(port))
+      console.error('[jumpserver-mcp] ops console: ' + viewerUrl)
     }
-    startHeartbeat(port)
+    writeConsoleFile()
   })
+  server.on('close', () => {
+    consoleBound = false
+  })
+  startHeartbeat()
   try {
     server.listen(opts.port, '127.0.0.1')
   } catch (error) {
@@ -1118,17 +1315,34 @@ export function stopAuditViewer(): void {
     try { consoleServer.close() } catch { /* already closed */ }
     consoleServer = null
   }
+  // V0.5.0: the exit handler registered by startHeartbeat() has to come off
+  // with the console. startHeartbeat() registers with process.once(), and each
+  // registration is a NEW wrapper, so repeated start/stop cycles in one process
+  // accumulate listeners until Node emits a MaxListenersExceededWarning. The
+  // V0.4.4 comment claimed this removal already happened; it did not.
+  process.removeListener('exit', onProcessExit)
   viewerUrl = null
   consoleDir = null
   consolePort = 0
   consoleToken = null
   consoleTokenExpiresAt = null
+  // V0.5.1 state, so a following startAuditViewer() begins clean.
+  consoleBound = false
+  consoleAdoptLogged = false
+  consoleRequestedPort = 0
+  consoleOpened = false
+  hintEmitted = 0
 }
 
-/** V0.4.1: the console URL always carries the access token. */
+/**
+ * V0.4.1: the console URL carries the access token.
+ * V0.5.1: in stable mode the token moves into the served page instead, so the
+ * address is short, bookmarkable and identical in every process.
+ */
 function consoleUrl(port: number): string {
-  const token = consoleToken !== null ? '?token=' + consoleToken : ''
-  return 'http://127.0.0.1:' + String(port) + '/' + token
+  const base = 'http://127.0.0.1:' + String(port) + '/'
+  if (stableAddress) return base
+  return consoleToken !== null ? base + '?token=' + consoleToken : base
 }
 
 /**
@@ -1144,7 +1358,7 @@ function consoleUrl(port: number): string {
  * the MCP response (consoleHintForModel).
  */
 function writeConsoleFile(): void {
-  if (consoleFile === null) return
+  if (consoleFile === null || consolePort <= 0) return
   try {
     writeFileSync(consoleFile, JSON.stringify({
       pid: process.pid,
@@ -1158,26 +1372,52 @@ function writeConsoleFile(): void {
   }
 }
 
-function startHeartbeat(port: number): void {
-  if (consoleDir === null || viewerUrl === null) return
-  consolePort = port
+/**
+ * V0.4.4: heartbeat timer + discovery file registration, independent of whether
+ * this process owns the listener.
+ * V0.5.1: started BEFORE the bind attempt, because when the address is already
+ * served by another process the same timer drives the takeover retry.
+ */
+function startHeartbeat(): void {
+  if (consoleDir === null) return
   try {
     mkdirSync(consoleDir, { recursive: true })
     consoleFile = join(consoleDir, String(process.pid) + '.json')
   } catch {
     return
   }
-  writeConsoleFile()
   const timer = setInterval(() => {
-    writeConsoleFile()
+    if (consolePort > 0) writeConsoleFile()
     pruneStale()
+    attemptConsoleTakeover()
   }, 5_000)
   timer.unref?.()
   consoleHeartbeatTimer = timer
   process.once('exit', onProcessExit)
 }
 
-/** V0.4.4: named exit handler so stopAuditViewer can actually remove it. */
+/**
+ * V0.5.1: in stable mode the console address outlives any single process. If
+ * another MCP held it at boot we adopted its URL; because we then own no
+ * listener, keep probing so this process serves that same address the moment
+ * it frees up — an already-open page recovers without the user doing anything.
+ */
+function attemptConsoleTakeover(): void {
+  if (consoleBound) return
+  const server = consoleServer
+  if (server === null) return
+  try {
+    server.listen(consoleRequestedPort, '127.0.0.1')
+  } catch {
+    /* still busy, or shutting down — the next tick retries */
+  }
+}
+
+/**
+ * Named exit handler so stopAuditViewer() can remove it: `process.once()` with
+ * an anonymous arrow would be unreachable afterwards, and each registration
+ * wraps the handler afresh — hence the explicit removeListener on teardown.
+ */
 function onProcessExit(): void {
   if (consoleFile !== null) {
     try { unlinkSync(consoleFile) } catch { /* already gone */ }
@@ -1225,7 +1465,9 @@ export function auditViewerUrl(): string | null {
  * URL to the user. Returns null when no console is running.
  */
 export function rotateConsoleAccessToken(): string | null {
-  if (consolePort <= 0 || consoleToken === null) return null
+  // V0.5.1: not gated on consolePort — in stable mode a process that adopted
+  // another's address still owns a token and must be able to rotate it.
+  if (consoleToken === null) return null
   rotateConsoleToken()
   return viewerUrl
 }

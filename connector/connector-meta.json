@@ -1,0 +1,25 @@
+{
+  "name": "JumpServer 堡垒机",
+  "name_zh": "JumpServer 堡垒机",
+  "name_en": "JumpServer Bastion",
+  "description": "Connect to a JumpServer bastion host and run permission-gated, audited commands on your internal assets.",
+  "description_zh": "连接 JumpServer 堡垒机，在权限管控与全量审计的前提下对内网资产执行运维命令、采集拓扑与执行 Runbook。",
+  "description_en": "Connect to a JumpServer bastion host and run permission-gated, audited operations on internal assets.",
+  "source": "jumpserver",
+  "type": "mcp",
+  "version": "0.5.1",
+  "auth_mode": "token",
+  "minWorkbuddyVersion": "5.0.0",
+  "examples_zh": [
+    "连接堡垒机，列出我有权限访问的资产",
+    "看看 oa-app-01 上的磁盘和内存使用情况",
+    "对 OA 组的所有服务器执行一次健康巡检 Runbook",
+    "把刚才的审计记录导出成 CSV"
+  ],
+  "examples_en": [
+    "Connect to the bastion and list the assets I can access",
+    "Check disk and memory usage on oa-app-01",
+    "Run the health-check runbook against the OA asset group",
+    "Export the recent audit records as CSV"
+  ]
+}

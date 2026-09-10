@@ -81,7 +81,7 @@ async function main(): Promise<void> {
     'jumpserver_status',
     {
       description:
-        'Query the current JumpServer connector state: whether a session exists, which bastion gateway it uses, which target asset is entered (verified via probe), and the current permission mode. Also returns the live ops-console URL and its token expiry. Never returns credentials. This tool is strictly READ-ONLY — to invalidate the console token use jumpserver_console_rotate_token.',
+        'Query the current JumpServer connector state: whether a session exists, which bastion gateway it uses, which target asset is entered (verified via probe), and the current permission mode. Also returns the live ops-console URL (V0.5.1: a stable address that survives process restarts) and its token expiry. Never returns credentials. This tool is strictly READ-ONLY — to invalidate the console token use jumpserver_console_rotate_token.',
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
@@ -120,7 +120,7 @@ async function main(): Promise<void> {
     'jumpserver_console_rotate_token',
     {
       description:
-        'Invalidate the current ops-console access token and issue a fresh one, returning the new console URL. The previous link stops working immediately, so hand the new URL to the user. Use this when the console shows "令牌已过期" and you cannot restart the MCP process. Has a side effect (the old token is revoked) — not a read-only operation.',
+        'Invalidate the current ops-console access token and issue a fresh one. In stable mode (the default) the console address does not change — tell the user to reload the page and it picks the new token up on its own; when auditViewer.stableUrl is false the returned URL differs and the old link stops working immediately. Use this when the console shows "令牌已过期". Has a side effect (the old token is revoked) — not a read-only operation.',
       inputSchema: {},
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },

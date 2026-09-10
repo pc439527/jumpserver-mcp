@@ -180,6 +180,8 @@ export function toRuntimeConfig(cfg: JumpServerConfig, password: string, wireFac
     username: cfg.username,
     password,
     connectTimeoutMs: cfg.connectTimeout * 1000,
+    hostFingerprint: cfg.hostFingerprint,
+    knownHostsPath: cfg.knownHostsPath,
     enterAssetMs: DEFAULT_TIMEOUTS.enterAsset,
     probeMs: DEFAULT_TIMEOUTS.probe,
     commandMs: cfg.commandTimeout * 1000,

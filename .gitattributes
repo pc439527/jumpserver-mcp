@@ -1,0 +1,12 @@
+# Normalize line endings to LF in the repository AND the working tree.
+#
+# The global core.autocrlf=true rewrites every text file to CRLF on checkout,
+# which turns into a full-file diff on every Windows edit and silently changes
+# the bytes of files that are line-ending sensitive (CI workflow, .mjs, .json).
+* text=auto eol=lf
+
+# Binary assets must never be normalized.
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary

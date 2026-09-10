@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="JumpServer">
+  <title>JumpServer 堡垒机连接器</title>
+  <path d="M32 4 56 13.2v19.6C56 48.2 45.6 57.6 32 60 18.4 57.6 8 48.2 8 32.8V13.2L32 4z" fill="#2F6FED"/>
+  <path d="M32 10.6 50 17.5v15.3c0 11.6-7.6 19.1-18 21.5-10.4-2.4-18-9.9-18-21.5V17.5L32 10.6z" fill="#1B4FBF"/>
+  <path d="M23.5 26.5 29.5 32.5 23.5 38.5" fill="none" stroke="#FFFFFF" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M34.5 39h7.5" fill="none" stroke="#FFFFFF" stroke-width="3.6" stroke-linecap="round"/>
+</svg>

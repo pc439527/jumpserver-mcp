@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "jumpserver": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "jumpserver-mcp"],
+      "runtime": {
+        "type": "node",
+        "version": "20"
+      },
+      "npmRegistries": [
+        "https://registry.npmmirror.com",
+        "https://registry.npmjs.org"
+      ],
+      "env": {
+        "JUMPSERVER_HOST": "${JUMPSERVER_HOST}",
+        "JUMPSERVER_PORT": "${JUMPSERVER_PORT}",
+        "JUMPSERVER_USERNAME": "${JUMPSERVER_USERNAME}",
+        "JUMPSERVER_PASSWORD": "${JUMPSERVER_PASSWORD}"
+      }
+    }
+  }
+}

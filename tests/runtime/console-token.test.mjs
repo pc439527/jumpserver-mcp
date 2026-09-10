@@ -43,7 +43,10 @@ async function boot(opts = {}) {
   currentAuditPath = join(dir, 'audit.jsonl')
   startAuditViewer(
     currentAuditPath,
-    { enabled: true, port, autoOpen: false, portFallback: true, ...opts },
+    // V0.5.1: these cases exercise the LEGACY delivery path (?token=… in the
+    // URL) on purpose — that is where the token mechanism is observable. The
+    // default stable mode is covered by console-stable-url.test.mjs.
+    { enabled: true, port, autoOpen: false, portFallback: true, stableUrl: false, ...opts },
     null,
     { audit: null, timeZone: 'Asia/Shanghai' },
   )

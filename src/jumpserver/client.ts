@@ -1,5 +1,6 @@
 import { Client, type ClientChannel } from 'ssh2'
 import { JumpServerError } from './errors.js'
+import { createHostKeyGuard, describeHostKeyRefusal, type HostKeyDecision } from './host-key.js'
 
 /** Testable wire seam: everything the session core needs from the transport. */
 export interface Wire {
@@ -16,6 +17,12 @@ export interface WireConnectParams {
   username: string
   password: string
   connectTimeoutMs: number
+  /** V0.5.0: operator-pinned SHA256/MD5 host-key fingerprint (optional). */
+  hostFingerprint?: string
+  /** V0.5.0: known_hosts store path — enables TOFU when no fingerprint is pinned. */
+  knownHostsPath?: string
+  /** V0.5.0: notified for every host-key decision (audit / diagnostics). */
+  onHostKey?: (decision: HostKeyDecision) => void
 }
 
 const AUTH_FAILED_PATTERN = /authentication|permission denied|password.*incorrect|incorrect.*password|keyboard-interactive/i
@@ -24,6 +31,9 @@ const AUTH_FAILED_PATTERN = /authentication|permission denied|password.*incorrec
  * Live ssh2 adapter: one SSH connection with one interactive PTY shell.
  * The entire JumpServer session (menu -> asset -> commands) reuses this
  * single channel; nothing reconnects per command.
+ *
+ * V0.5.0: the handshake now verifies the bastion's host key before the
+ * password is transmitted (see host-key.ts).
  */
 export class SshPtyWire implements Wire {
   private client?: Client
@@ -40,6 +50,17 @@ export class SshPtyWire implements Wire {
       const client = new Client()
       const wire = new SshPtyWire()
       wire.client = client
+
+      // V0.5.0: built before `fail` so a refused key can be reported with its
+      // actual fingerprint instead of ssh2's generic verification error.
+      const guard = createHostKeyGuard({
+        host: params.host,
+        port: params.port,
+        fingerprint: params.hostFingerprint,
+        storePath: params.knownHostsPath,
+        onDecision: params.onHostKey,
+      })
+
       let timer: NodeJS.Timeout | undefined = setTimeout(() => {
         client.destroy()
         if (!wire.settled) {
@@ -55,6 +76,19 @@ export class SshPtyWire implements Wire {
         }
         wire.settled = true
         clearTimeout(timer)
+
+        // A refused host key must never be reported as "wrong password" — the
+        // two call for completely different operator responses.
+        const decision = guard.last()
+        if (decision !== undefined && !decision.accept) {
+          reject(new JumpServerError(
+            'HOST_KEY_MISMATCH',
+            'JumpServer host key verification failed',
+            describeHostKeyRefusal(decision),
+          ))
+          return
+        }
+
         const code = AUTH_FAILED_PATTERN.test(err.message)
           ? 'AUTH_FAILED'
           : 'CONNECTION_LOST'
@@ -95,7 +129,12 @@ export class SshPtyWire implements Wire {
         readyTimeout: params.connectTimeoutMs,
         keepaliveInterval: 10000,
         keepaliveCountMax: 3,
-        algorithms: { serverHostKey: ['ssh-rsa', 'rsa-sha2-256', 'rsa-sha2-512'] },
+        hostVerifier: guard.verifier,
+        // V0.5.0: the previous `algorithms.serverHostKey` override listed RSA
+        // variants only, so any bastion offering just an ed25519 or ecdsa host
+        // key failed to negotiate. kex / cipher / MAC were already at library
+        // defaults; dropping this override restores the full modern set on all
+        // four axes instead of pinning one of them to a subset.
       })
     })
   }

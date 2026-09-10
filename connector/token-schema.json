@@ -1,0 +1,45 @@
+{
+  "title": "JumpServer 连接配置",
+  "title_en": "JumpServer Connection",
+  "description": "填写堡垒机连接信息即可使用。凭证仅保存在本机 ~/.workbuddy 目录下，不会上传云端，也不会写入 config.json。",
+  "description_en": "Enter your bastion connection details. Credentials are stored locally under ~/.workbuddy only and never written to config.json.",
+  "docUrl": "https://github.com/pc439527/jumpserver-mcp#register-with-workbuddy",
+  "docLabel": "不知道填什么？查看安装说明",
+  "fields": [
+    {
+      "key": "JUMPSERVER_HOST",
+      "label": "JumpServer 地址",
+      "label_en": "JumpServer host",
+      "type": "text",
+      "required": true,
+      "placeholder": "例如 jumpserver.example.com 或 203.0.113.10",
+      "description": "堡垒机网关地址（KoKo 入口），只填主机名或 IP，不要带 http:// 或 https:// 前缀。"
+    },
+    {
+      "key": "JUMPSERVER_PORT",
+      "label": "SSH 端口",
+      "label_en": "SSH port",
+      "type": "text",
+      "required": true,
+      "defaultValue": "2222",
+      "description": "JumpServer 的 SSH 网关端口，默认 2222。"
+    },
+    {
+      "key": "JUMPSERVER_USERNAME",
+      "label": "用户名",
+      "label_en": "Username",
+      "type": "text",
+      "required": true,
+      "placeholder": "例如 IT00123",
+      "description": "你在 JumpServer 上的登录账号。"
+    },
+    {
+      "key": "JUMPSERVER_PASSWORD",
+      "label": "密码",
+      "label_en": "Password",
+      "type": "password",
+      "required": true,
+      "description": "连接时通过环境变量注入，仅保存在本机，不会出现在日志或其他配置文件中。"
+    }
+  ]
+}
