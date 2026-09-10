@@ -369,7 +369,11 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
             normalizedCommand: gated.classification.normalizedCommand,
           },
           approvalRequired: gated.approvalRequired,
-          approvalResult: gated.approvalRequired ? 'approved' : 'none',
+          // V0.4.4: forward the deferred gate and let the SessionManager
+          // derive the real approval outcome. Pre-stamping `approved` here
+          // (the V0.4.3 bug) wrote "approved" to the audit while the user
+          // was never actually asked, because beforeExec was discarded.
+          beforeExec: gated.beforeExec,
         })
         return {
           ok: true,

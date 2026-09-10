@@ -51,6 +51,13 @@ export interface JobStartOptions {
   /** V0.4.3: approval outcome recorded in the audit. */
   approvalRequired?: boolean
   approvalResult?: string
+  /**
+   * V0.4.4: deferred permission gate. The SessionManager runs this INSIDE its
+   * queue, AFTER the target is navigated but BEFORE the command is written to
+   * the PTY. When this throws COMMAND_APPROVAL_REQUIRED, the manager writes
+   * a `denied` audit and refuses to claim the PTY.
+   */
+  beforeExec?: () => Promise<void>
 }
 
 export class JobStore {
@@ -79,7 +86,11 @@ export class JobStore {
       toolCallId: options.toolCallId,
       classification: options.classification,
       approvalRequired: options.approvalRequired,
-      approvalResult: options.approvalResult,
+      // V0.4.4: the manager decides the real approval outcome (approved vs
+      // denied) based on whether beforeExec threw. tools-ops must NOT
+      // pre-decide this from a synchronous flag.
+      approvalResult: undefined,
+      beforeExec: options.beforeExec,
     })
     const record: JobRecord = {
       id,

@@ -1,6 +1,6 @@
 {
   "name": "jumpserver-mcp",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server: persistent SSH/PTY session with explicit state machine, asset discovery, permission-gated audited commands, target-affinity batch execution, fixed-profile structured host inventory, evidence-annotated topology, streaming jobs, and an embedded local ops console (live terminal mirror, topology / jobs / audit / stats / session tabs).",
   "type": "module",
   "main": "lib/server.js",

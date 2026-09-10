@@ -74,6 +74,9 @@ let consoleFile: string | null = null
 /** Bound port + start time, kept for discovery-file rewrites on rotation. */
 let consolePort = 0
 let consoleStartedAt = new Date().toISOString()
+/** V0.4.4: bound HTTP server and heartbeat timer, exposed via stopAuditViewer. */
+let consoleServer: import('node:http').Server | null = null
+let consoleHeartbeatTimer: ReturnType<typeof setInterval> | null = null
 /** Whether this process hands its console URL to the model (config: auditViewer.autoOpen). */
 let hintEnabled = true
 /**
@@ -1091,7 +1094,34 @@ export function startAuditViewer(
     console.error('[jumpserver-mcp] ops console: ' + (error instanceof Error ? error.message : String(error)))
   }
   server.unref?.()
+  consoleServer = server
   return consoleUrl(opts.port)
+}
+
+/**
+ * V0.4.4: tear the console down so tests can run one per case without
+ * leaking HTTP listeners and heartbeat intervals. Production code leaves
+ * the console running for the life of the MCP process; this is purely a
+ * test seam.
+ */
+export function stopAuditViewer(): void {
+  if (consoleHeartbeatTimer !== null) {
+    clearInterval(consoleHeartbeatTimer)
+    consoleHeartbeatTimer = null
+  }
+  if (consoleFile !== null) {
+    try { unlinkSync(consoleFile) } catch { /* already gone */ }
+    consoleFile = null
+  }
+  if (consoleServer !== null) {
+    try { consoleServer.close() } catch { /* already closed */ }
+    consoleServer = null
+  }
+  viewerUrl = null
+  consoleDir = null
+  consolePort = 0
+  consoleToken = null
+  consoleTokenExpiresAt = null
 }
 
 /** V0.4.1: the console URL always carries the access token. */
@@ -1142,13 +1172,15 @@ function startHeartbeat(port: number): void {
     pruneStale()
   }, 5_000)
   timer.unref?.()
-  process.once('exit', () => {
-    try {
-      if (consoleFile !== null) unlinkSync(consoleFile)
-    } catch {
-      /* already gone */
-    }
-  })
+  consoleHeartbeatTimer = timer
+  process.once('exit', onProcessExit)
+}
+
+/** V0.4.4: named exit handler so stopAuditViewer can actually remove it. */
+function onProcessExit(): void {
+  if (consoleFile !== null) {
+    try { unlinkSync(consoleFile) } catch { /* already gone */ }
+  }
 }
 
 function pruneStale(): void {

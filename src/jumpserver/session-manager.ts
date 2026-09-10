@@ -510,7 +510,15 @@ export class SessionManager {
     classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
     /** V0.4.3: approval outcome recorded in the audit. */
     approvalRequired?: boolean
+    /** V0.4.3: ignored when beforeExec is supplied — the manager derives the
+     *  outcome from the gate run, not from a caller-provided string. */
     approvalResult?: string
+    /**
+     * V0.4.4: deferred permission gate. Runs after navigation, BEFORE the
+     * remote writeLine. Throwing COMMAND_APPROVAL_REQUIRED aborts the start
+     * with a `denied` audit and the PTY is left untouched.
+     */
+    beforeExec?: () => Promise<void>
   }): Promise<{ target: string | null; hostname: string | null; state: string; startSeq: number }> {
     return this.queue(async () => {
       this.assertNoActiveJob()
@@ -519,6 +527,37 @@ export class SessionManager {
       if (!cfg.host || !cfg.username) throw new JumpServerError('NOT_CONFIGURED', 'JumpServer is not configured')
       const session = await this.ensureConnectedLocked(request.signal)
       const st = await this.navigateToTarget(session, request.target, request.signal)
+
+      // V0.4.4: gate runs AFTER navigateToTarget and BEFORE the PTY write.
+      // COMMAND_APPROVAL_REQUIRED is the only expected rejection — anything
+      // else is rethrown so the caller can react.
+      if (typeof request.beforeExec === 'function') {
+        try {
+          await request.beforeExec()
+        } catch (err) {
+          if (err instanceof JumpServerError && err.code === 'COMMAND_APPROVAL_REQUIRED') {
+            await this.audit({
+              operation: 'job-start',
+              target: st.target,
+              hostname: st.hostname,
+              command: request.command,
+              risk: request.classification?.risk ?? 'UNKNOWN',
+              classification: request.classification,
+              actor: 'AGENT',
+              approvalRequired: request.approvalRequired ?? false,
+              approvalResult: 'denied',
+              taskId: request.jobId,
+              toolCallId: request.toolCallId,
+              result: 'DENIED',
+              exitCode: null,
+              durationMs: null,
+            })
+            throw err
+          }
+          throw err
+        }
+      }
+
       const startSeq = this.options.observer?.cursorSeq ?? 0
       if (!session.writeLine(request.command)) {
         throw new JumpServerError('CONNECTION_LOST', 'could not write the job command to the PTY')
@@ -535,7 +574,7 @@ export class SessionManager {
         classification: request.classification,
         actor: 'AGENT',
         approvalRequired: request.approvalRequired ?? false,
-        approvalResult: request.approvalResult ?? 'none',
+        approvalResult: 'approved',
         taskId: request.jobId,
         toolCallId: request.toolCallId,
         result: 'RUNNING',

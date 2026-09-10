@@ -1,43 +1,64 @@
 /**
- * Console access token (V0.4.1 / V0.4.2).
+ * Console access token (V0.4.1 / V0.4.2 / V0.4.4-test-fix).
  *
  * The console binds to 127.0.0.1, but any local process could otherwise read
  * the audit trail and drive /api/interrupt. Every request must present the
  * per-process token, which is handed over in the URL only. V0.4.2 adds an
  * expiry (a stale token is rejected with an explicit marker) and rotation.
+ *
+ * V0.4.4 test cleanup:
+ *   - Each case uses a per-test temp dir for the auditPath so the discovery
+ *     file resolves to a path that actually exists on the OS that is running
+ *     the test (the audit-viewer writes to `dirname(auditPath)/consoles/`).
+ *   - Each case tears down its console via stopAuditViewer so we don't leak
+ *     HTTP listeners across cases (the V0.4.3 leak tripped
+ *     MaxListenersExceededWarning in CI).
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import {
   auditViewerUrl,
   consoleTokenInfo,
+  forceExpireConsoleToken,
   rotateConsoleAccessToken,
   startAuditViewer,
+  stopAuditViewer,
 } from '../../lib/runtime/audit-viewer.js'
 
 let portCursor = 18901
+/** Each boot() picks its own temp dir for the auditPath. */
+let currentAuditPath = null
+
 async function boot(opts = {}) {
-  // Try successive ports: earlier consoles in this file stay bound until the
-  // process exits, and an unrelated process may hold one of them.
-  let lastError = null
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const port = portCursor++
-    startAuditViewer(
-      'C:/Users/114976/WorkBuddy/jumpserver-mcp/data/_token_test.jsonl',
-      { enabled: true, port, autoOpen: false, portFallback: false, ...opts },
-      null,
-      { audit: null, timeZone: 'Asia/Shanghai' },
-    )
-    // The real URL is only known once the socket is listening.
-    for (let i = 0; i < 40; i += 1) {
-      const url = auditViewerUrl()
-      if (url !== null && url.includes(':' + port + '/')) return url
-      await new Promise((r) => setTimeout(r, 25))
-    }
-    lastError = new Error('console did not start on port ' + port)
+  // First probe with the configured port; if that port is still held (server
+  // close() in stopAuditViewer is async, so a fast-afterEach backend may see
+  // a "busy" port a frame too early), startAuditViewer falls back to an
+  // ephemeral one when portFallback is true. We never compare ports to the
+  // requested value — the real URL from auditViewerUrl() is what matters.
+  const port = portCursor++
+  const dir = mkdtempSync(join(tmpdir(), 'jumpserver-mcp-console-'))
+  currentAuditPath = join(dir, 'audit.jsonl')
+  startAuditViewer(
+    currentAuditPath,
+    { enabled: true, port, autoOpen: false, portFallback: true, ...opts },
+    null,
+    { audit: null, timeZone: 'Asia/Shanghai' },
+  )
+  for (let i = 0; i < 60; i += 1) {
+    const url = auditViewerUrl()
+    if (url !== null && url.includes('/?token=')) return url
+    await new Promise((r) => setTimeout(r, 25))
   }
-  throw lastError
+  throw new Error('console did not start; no URL was bound within 1.5s')
 }
+
+test.afterEach(() => {
+  stopAuditViewer()
+  currentAuditPath = null
+})
 
 /** The console URL is http://host:port/?token=…; split it into base + token. */
 function parts(url) {
@@ -105,7 +126,6 @@ test('an already-expired token is rejected with the expiry marker', async () => 
   // Expire the token deterministically rather than sleeping a minute.
   const info = consoleTokenInfo()
   assert.equal(info.expired, false)
-  const { forceExpireConsoleToken } = await import('../../lib/runtime/audit-viewer.js')
   forceExpireConsoleToken()
   const stale = await fetch(base + 'api/assets?token=' + token)
   assert.equal(stale.status, 403)
@@ -136,17 +156,33 @@ test('rotation is reflected in auditViewerUrl so the next handover is correct', 
 
 test('the discovery file NEVER contains the token or a tokenized URL', async () => {
   const { token } = parts(await boot())
-  // The heartbeat file is written on boot and refreshed every 5s.
-  const { readFileSync, existsSync } = await import('node:fs')
-  const { join } = await import('node:path')
-  const file = join('data', 'consoles', String(process.pid) + '.json')
-  assert.ok(existsSync(file), 'expected a discovery file at ' + file)
+  // The heartbeat file is written on boot and refreshed every 5s. The
+  // console lives at dirname(auditPath)/consoles/<pid>.json — the same path
+  // startAuditViewer() picks, regardless of the OS it runs on.
+  assert.notEqual(currentAuditPath, null, 'boot() did not record the auditPath')
+  mkdirSync(join(dirname(currentAuditPath), 'consoles'), { recursive: true })
+  const file = join(dirname(currentAuditPath), 'consoles', String(process.pid) + '.json')
+  // First heartbeat fires synchronously inside startAuditViewer — give the
+  // interval one tick to actually flush before reading.
+  await new Promise((r) => setTimeout(r, 25))
   const raw = readFileSync(file, 'utf8')
   const parsed = JSON.parse(raw)
-
   assert.equal(raw.includes(token), false, 'the token must not be readable from disk')
   assert.equal('url' in parsed, false, 'the tokenized URL must not be persisted')
   assert.equal(typeof parsed.port, 'number')
   assert.equal(typeof parsed.pid, 'number')
   assert.ok('startedAt' in parsed && 'heartbeatAt' in parsed)
+})
+
+test('stopAuditViewer() tears the listener + interval down so the next start is clean', async () => {
+  // Two back-to-back boots in one test (with afterEach in between should also
+  // work, but this exercises the dispose hook in a single case).
+  const url1 = await boot()
+  assert.ok(url1.includes('token='))
+  const urlBefore = auditViewerUrl()
+  stopAuditViewer()
+  assert.equal(auditViewerUrl(), null)
+  const url2 = await boot()
+  assert.ok(url2.includes('token='))
+  assert.notEqual(url2, urlBefore)
 })
