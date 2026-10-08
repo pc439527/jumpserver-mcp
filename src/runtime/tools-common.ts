@@ -3,7 +3,7 @@
  * tool-host imports removed (HarnessError/TOOL_ABORTED replaced by plain
  * semantics: abort rethrows, everything else maps to a structured value).
  */
-import { AbortRequestedError, JumpServerError } from '../jumpserver/errors.js'
+import { AbortRequestedError, JumpServerError, UNREACHABLE_STOP_LINE } from '../jumpserver/errors.js'
 // V0.4.5: one shared commandStatus -> error decode (exec + compare + runbook).
 import { commandStatusToError } from '../jumpserver/command-status.js'
 import type { ExecOutcome, SessionStatus } from '../jumpserver/session.js'
@@ -195,7 +195,19 @@ export async function guardValue(exec: ToolRunContext, fn: () => Promise<ResultV
       throw new Error('tool call aborted')
     }
     if (error instanceof JumpServerError) {
-      const value: ResultValue = { ok: false, code: error.code, message: redactSecret(error.message) }
+      // V0.5.3.2: JumpServerError.detail is the structured diagnostic the
+      // session layer attaches to ASSET_ENTER_TIMEOUT / ACCOUNT_SELECTION_REQUIRED
+      // / HOST_KEY_MISMATCH (parsed-account list, detector tail, fingerprint
+      // reason). The whitelist in renderResult hides anything we do not list
+      // here, so we MUST propagate `detail` into ResultValue for the model to
+      // ever see it. Without this the model can only guess why an enter()
+      // timed out, because every diagnostic byte is silently dropped.
+      const value: ResultValue = dropNulls({
+        ok: false,
+        code: error.code,
+        message: redactSecret(error.message),
+        detail: error.detail,
+      })
       return value
     }
     return { ok: false, code: 'FAILED', message: redactSecret(error instanceof Error ? error.message : String(error)) }
@@ -211,7 +223,7 @@ export async function guardText(exec: ToolRunContext, fn: () => Promise<string>)
       throw new Error('tool call aborted')
     }
     if (error instanceof JumpServerError) {
-      return renderResult({ ok: false, code: error.code, message: redactSecret(error.message) })
+      return renderResult(dropNulls({ ok: false, code: error.code, message: redactSecret(error.message), detail: error.detail }))
     }
     return renderResult({ ok: false, code: 'FAILED', message: redactSecret(error instanceof Error ? error.message : String(error)) })
   }
@@ -223,6 +235,39 @@ export function renderResult(value: ResultValue): string {
   if (value.ok === true) lines.push('ok')
   if (value.code !== undefined) lines.push('code: ' + String(value.code))
   if (value.message !== undefined) lines.push(String(value.message))
+  // V0.5.3.2: JumpServerError.detail carries the structured diagnostic
+  // (parsed account list, detector tail, host-key reason). Session-layer
+  // throwers carefully attach it; without this line the model can never
+  // see it because renderResult is a whitelist.
+  if (typeof value.detail === 'string' && value.detail.length > 0) lines.push('detail: ' + value.detail)
+  // V0.5.8: a command that ran WITHOUT a human prompt because the semantic
+  // judge allowed it must say so in the result. Otherwise "no confirm dialog
+  // appeared" is indistinguishable from "the gate did not ask".
+  if (typeof value.riskJudge === 'string' && value.riskJudge.length > 0) lines.push('riskJudge: ' + value.riskJudge)
+  if (value.code === 'ASSET_UNREACHABLE') lines.push(UNREACHABLE_STOP_LINE)
+  // V0.5.2: completeness is the whole point of the deferred refusal, so it has
+  // to reach the model as text. renderResult is a whitelist — a field that is
+  // not listed here is invisible no matter what the tool returns.
+  if (value.connectionComplete !== undefined) {
+    const missing = Array.isArray(value.connectionMissing) ? value.connectionMissing.map((item) => String(item)) : []
+    lines.push(missing.length === 0 ? 'connection: complete' : 'connection: INCOMPLETE — missing ' + missing.join(', '))
+  }
+  // V0.5.11: WHERE the live connection comes from. The console always showed
+  // this; the model could not, so "which bastion account is in effect?" was
+  // unanswerable in chat. Only the explicit source/label fields are rendered —
+  // never the whole password view, whose future fields must not leak by default.
+  if (value.credentialSource !== undefined) {
+    const detail = typeof value.credentialSourceDetail === 'string' && value.credentialSourceDetail.length > 0
+      ? '（' + value.credentialSourceDetail + '）'
+      : ''
+    lines.push('credential: from ' + String(value.credentialSource) + detail)
+  }
+  if (value.hostSource !== undefined || value.usernameSource !== undefined) {
+    const parts: string[] = []
+    if (value.hostSource !== undefined) parts.push('host: from ' + String(value.hostSource))
+    if (value.usernameSource !== undefined) parts.push('username: from ' + String(value.usernameSource))
+    lines.push('connection ' + parts.join(' / '))
+  }
   if (value.state !== undefined) lines.push('state: ' + String(value.state))
   if (value.gateway !== undefined) lines.push('gateway: ' + String(value.gateway))
   if (value.target !== undefined) lines.push('target: ' + String(value.target))
@@ -250,12 +295,19 @@ export function renderBatchResult(tasks: TargetBatchResult[]): ResultValue {
       if (cmd.error !== null || (cmd.exitCode !== null && cmd.exitCode !== 0)) failed += 1
     }
     lines.push('target=' + task.target + ' hostname=' + (task.hostname ?? '?') + ' commands=' + task.commands.length)
-    if (task.error !== null) lines.push('  error=' + task.error.code + ': ' + task.error.message)
+    if (task.error !== null) {
+      lines.push('  error=' + task.error.code + ': ' + task.error.message)
+      // V0.5.12: a nested failure's detail is the whole diagnostic (parsed
+      // account list, detector tail, host-key reason). Dropping it here left
+      // multi-target runs with a one-line code and no way to act on it.
+      if (typeof task.error.detail === 'string' && task.error.detail.length > 0) lines.push('    detail: ' + task.error.detail)
+    }
     for (const cmd of task.commands) {
       const rc = cmd.exitCode !== null ? String(cmd.exitCode) : '?'
       lines.push('  $ ' + redactCommandSecrets(cmd.command))
       if (cmd.error !== null) {
         lines.push('    error=' + cmd.error.code + ': ' + cmd.error.message)
+        if (typeof cmd.error.detail === 'string' && cmd.error.detail.length > 0) lines.push('      detail: ' + cmd.error.detail)
         continue
       }
       lines.push('    exitCode=' + rc + ' status=' + cmd.commandStatus + ' state=' + cmd.executionState + ' durationMs=' + cmd.durationMs)
@@ -342,11 +394,14 @@ export function assetsToValue(
 export function renderAssetsResult(value: ResultValue): string {
   const lines: string[] = []
   // Error values (ok:false) must render as errors — never as "ok count=0".
-  if (value.ok !== true) {
-    lines.push('code: ' + String(value.code ?? 'FAILED'))
-    if (value.message !== undefined) lines.push(String(value.message))
-    return lines.join('\n')
-  }
+  // V0.5.12: delegate to renderResult. This branch used to print code+message
+  // only, which silently dropped the JumpServerError.detail that guardValue()
+  // had attached (and the `connection: INCOMPLETE — missing …` line) — so a
+  // rejected login reached the model as a bare AUTH_FAILED with no server
+  // reason, and a missing config field was invisible. renderResult is the
+  // single source of truth for this projection; hand-writing it here is how
+  // the detail got lost in the first place.
+  if (value.ok !== true) return renderResult(value)
   const filter = value['filter']
   const assets = value['assets'] instanceof Array ? (value['assets'] as Array<Record<string, unknown>>) : []
   const group = value['group']

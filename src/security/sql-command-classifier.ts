@@ -3,16 +3,25 @@ import { CLASSIFIER_VERSION } from './command-classifier.js'
 import type { CommandRisk } from '../config/types.js'
 
 /**
- * Semantic classifier for mysql/mariadb CLI commands.
+ * Semantic classifier for database CLIs.
  *
  * The generic shell classifier intentionally treats unknown executables as
  * UNKNOWN. That is safe, but it caused every routine `mysql -e "SELECT ..."`
- * diagnostic to prompt in AUTO mode. This module adds a narrow allow-list for
- * SQL query forms while keeping all ambiguous SQL fail-closed.
+ * diagnostic to prompt in AUTO mode. This module adds narrow allow-lists for
+ * the query forms that can be PROVEN read-only, while keeping all ambiguous
+ * SQL fail-closed.
  *
- * Only non-interactive -e/--execute invocations are classified here. Interactive
- * mysql, stdin scripts and commands with shell chaining/redirection are left to
- * the generic classifier as UNKNOWN/MODIFY.
+ * Covered:
+ *  - mysql / mariadb (`-e` / `--execute`)          -> classifyMysqlCli
+ *  - SAP HANA `hdbsql` (positional statement)      -> classifyHanaCli
+ *
+ * Only non-interactive invocations are classified here. Interactive shells,
+ * stdin scripts, file-driven input and commands with shell chaining or
+ * redirection fall through to the generic classifier as UNKNOWN.
+ *
+ * Every rule here is a SECURITY boundary: a wrong READ verdict means an
+ * AUTO-mode deployment runs a mutating statement without asking. So the
+ * failure direction is always "prompt the human", never "assume it is fine".
  */
 
 const ORDER: Record<CommandRisk, number> = {
@@ -209,6 +218,207 @@ export function classifyMysqlCli(command: string): Classification | null {
   let worst = classifyStatement(statements[0]!)
   for (const statement of statements.slice(1)) {
     const next = classifyStatement(statement)
+    if (ORDER[next.risk] > ORDER[worst.risk]) worst = next
+  }
+  return result(trimmed, worst.risk, worst.ruleId, worst.reason, worst.confidence ?? 'HIGH')
+}
+
+/**
+ * SAP HANA `hdbsql` (V0.5.2).
+ *
+ * WHY THIS EXISTS: HANA has no `-e`. hdbsql takes the statement as a POSITIONAL
+ * argument, so `hdbsql -n host:30013 -u SYSTEM -p *** -d SAPHANADB "SELECT ..."`.
+ * Every such call was an unknown executable, so a BASIS reading CSKS / COSS /
+ * COSP / ACDOCA was prompted for confirmation on every single query — which is
+ * exactly the daily verification work the connector exists to serve.
+ *
+ * WHAT STAYS FAIL-CLOSED, and why it must:
+ *  - `-o` / `-I` / `-O` / `-L`: hdbsql writes or reads a FILE with these. A file
+ *    target turns "read-only query" into a side effect, so the verdict is
+ *    UNKNOWN rather than trying to reason about what the file is used for.
+ *  - no positional statement: interactive or script-driven; nothing to classify.
+ *  - any statement type not explicitly proven read-only below.
+ *
+ * Shell-level chaining (`; rm -rf`, pipes, redirection, `$(...)`) is already
+ * rejected by `shellTokens`, so quoting cannot smuggle a second command in.
+ */
+
+/** hdbsql flags that consume the FOLLOWING token as their value. */
+const HANA_VALUE_FLAGS = new Set([
+  '-n', // host:port
+  '-i', // instance number
+  '-d', // database name
+  '-u', // user
+  '-p', // password
+  '-U', // user-store key
+  '-c', // (reserved value-taking form)
+  '-t', // (reserved value-taking form)
+  '-C', // (reserved value-taking form)
+  '-s', // (reserved value-taking form)
+])
+
+/** hdbsql flags that touch the filesystem: never provable as read-only. */
+const HANA_FILE_FLAGS = new Set(['-o', '-O', '-I', '-L'])
+
+/** `\s`, `\dt`, `\du` … — hdbsql's OWN meta-commands, not SQL. */
+const HANA_READ_META = new Set(['\\S', '\\D', '\\DT', '\\DV', '\\DS', '\\DU', '\\L', '\\Q', '\\?', '\\H'])
+
+/**
+ * Statement types that change data, schema, privileges or session state.
+ * `CALL` / `DO` / `WITH` are deliberately NOT here: they are neither provably
+ * read-only nor obviously mutating, so they are reported UNKNOWN (which
+ * prompts) instead of MODIFY (which also prompts, but with a wrong reason).
+ */
+const HANA_MODIFY_KEYWORDS = new Set([
+  'INSERT', 'UPDATE', 'DELETE', 'UPSERT', 'REPLACE', 'MERGE',
+  'CREATE', 'ALTER', 'RENAME', 'COMMENT',
+  'GRANT', 'REVOKE',
+  'IMPORT', 'EXPORT', 'LOAD', 'UNLOAD',
+  'SET', 'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'RELEASE', 'START', 'ABORT',
+  'CONNECT', 'RECONFIGURE', 'CHECKPOINT',
+])
+
+function classifyHanaStatement(statement: string): { risk: CommandRisk; ruleId: string; reason: string; confidence?: 'HIGH' | 'LOW' } {
+  const normalized = statement.trim().replace(/\s+/g, ' ')
+  const upper = normalized.toUpperCase()
+
+  if (upper.startsWith('\\')) {
+    const meta = upper.split(/\s+/)[0] ?? ''
+    if (HANA_READ_META.has(meta)) {
+      return { risk: 'READ', ruleId: 'hana.meta.list', reason: 'hdbsql meta-command ' + meta + ' only reports metadata' }
+    }
+    return {
+      risk: 'UNKNOWN',
+      ruleId: 'hana.meta.other',
+      reason: 'hdbsql meta-command ' + meta + ' is not in the verified read-only set',
+      confidence: 'LOW',
+    }
+  }
+
+  const first = upper.match(/^([A-Z]+)/)?.[1]
+  if (first === undefined) {
+    return { risk: 'UNKNOWN', ruleId: 'hana.sql.unknown', reason: 'SAP HANA statement could not be parsed', confidence: 'LOW' }
+  }
+
+  if (first === 'SELECT') {
+    // A locking SELECT changes transaction state; do not auto-approve.
+    if (/\bFOR\s+UPDATE\b/i.test(normalized)) {
+      return {
+        risk: 'UNKNOWN',
+        ruleId: 'hana.sql.select-lock',
+        reason: 'locking SELECT changes transaction state; automatic read-only confirmation is not safe',
+        confidence: 'LOW',
+      }
+    }
+    return { risk: 'READ', ruleId: 'hana.sql.select', reason: 'SAP HANA SELECT query is read-only' }
+  }
+
+  // EXPLAIN PLAN FOR <select> only compiles the plan. Anything else under
+  // EXPLAIN (e.g. PLAN FOR an UPDATE) is not proven side-effect free.
+  if (first === 'EXPLAIN') {
+    if (/^EXPLAIN\s+(?:PLAN\s+)?FOR\s+SELECT\b/i.test(normalized)) {
+      return { risk: 'READ', ruleId: 'hana.sql.explain-select', reason: 'EXPLAIN PLAN FOR a SELECT compiles a plan and does not execute it' }
+    }
+    return {
+      risk: 'UNKNOWN',
+      ruleId: 'hana.sql.explain-other',
+      reason: 'EXPLAIN of a non-SELECT statement is not proven side-effect free',
+      confidence: 'LOW',
+    }
+  }
+
+  if (first === 'DROP' || first === 'TRUNCATE') {
+    return { risk: 'DANGEROUS', ruleId: 'hana.sql.' + first.toLowerCase(), reason: 'SAP HANA ' + first + ' is destructive' }
+  }
+
+  if (HANA_MODIFY_KEYWORDS.has(first)) {
+    return { risk: 'MODIFY', ruleId: 'hana.sql.' + first.toLowerCase(), reason: 'SAP HANA ' + first + ' changes data, schema, privileges or session state' }
+  }
+
+  if (first === 'CALL' || first === 'DO' || first === 'WITH') {
+    return {
+      risk: 'UNKNOWN',
+      ruleId: 'hana.sql.' + first.toLowerCase(),
+      reason: 'SAP HANA ' + first + ' semantics may include side effects',
+      confidence: 'LOW',
+    }
+  }
+
+  return {
+    risk: 'UNKNOWN',
+    ruleId: 'hana.sql.unknown',
+    reason: 'SAP HANA statement type ' + first + ' is not in the verified read-only set',
+    confidence: 'LOW',
+  }
+}
+
+/**
+ * The first NON-flag token after the executable, which is where hdbsql expects
+ * the statement. Flags are skipped; the value of a known value-taking flag is
+ * skipped with it.
+ *
+ * Misjudging a flag only ever costs accuracy: a value mistaken for SQL fails to
+ * match any statement keyword and lands on UNKNOWN, and a flag mistaken for a
+ * value hides the statement, which also lands on UNKNOWN.
+ */
+function extractHanaStatement(cliTokens: string[]): string | null {
+  for (let i = 1; i < cliTokens.length; i++) {
+    const token = cliTokens[i]!
+    if (token.startsWith('-')) {
+      if (token.includes('=')) continue // --host=...
+      if (HANA_VALUE_FLAGS.has(token)) i++ // its value is not the statement
+      continue
+    }
+    return token
+  }
+  return null
+}
+
+/** Return null when the command is not an `hdbsql` invocation. */
+export function classifyHanaCli(command: string): Classification | null {
+  const trimmed = command.trim()
+  if (trimmed.length === 0) return null
+
+  const tokens = shellTokens(trimmed)
+  if (tokens === null || tokens.length === 0) return null
+  let executableIndex = 0
+  while (['env', 'sudo', 'timeout', 'nice'].includes(tokens[executableIndex] ?? '')) executableIndex++
+  const executable = (tokens[executableIndex] ?? '').split('/').at(-1)?.toLowerCase()
+  if (executable !== 'hdbsql') return null
+
+  const cliTokens = tokens.slice(executableIndex)
+
+  for (const token of cliTokens.slice(1)) {
+    if (HANA_FILE_FLAGS.has(token)) {
+      return result(
+        trimmed,
+        'UNKNOWN',
+        'hana.cli.file-io',
+        'hdbsql ' + token + ' reads or writes a file, so a read-only verdict cannot be given',
+        'LOW',
+      )
+    }
+  }
+
+  const statement = extractHanaStatement(cliTokens)
+  if (statement === null || statement.trim().length === 0) {
+    return result(
+      trimmed,
+      'UNKNOWN',
+      'hana.cli.no-statement',
+      'hdbsql without a positional statement is interactive or script-driven; read-only cannot be confirmed',
+      'LOW',
+    )
+  }
+
+  const statements = splitSqlStatements(statement)
+  if (statements === null || statements.length === 0) {
+    return result(trimmed, 'UNKNOWN', 'hana.sql.parse', 'SAP HANA statement could not be safely parsed', 'LOW')
+  }
+
+  let worst = classifyHanaStatement(statements[0]!)
+  for (const item of statements.slice(1)) {
+    const next = classifyHanaStatement(item)
     if (ORDER[next.risk] > ORDER[worst.risk]) worst = next
   }
   return result(trimmed, worst.risk, worst.ruleId, worst.reason, worst.confidence ?? 'HIGH')

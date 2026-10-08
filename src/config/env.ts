@@ -38,8 +38,12 @@ export const LIFECYCLE_ENV_KEYS = {
  * Where a resolved connection value came from. Surfaced in the console's
  * 设置 tab so an operator can see whether the running process is fed by the
  * WorkBuddy form or by a hand-edited config.json.
+ *
+ * V0.5.11: `profile` marks a credential taken from the locally selected
+ * multi-account profile (see profile-store.ts), which outranks both the
+ * connector form and config.json.
  */
-export type ConnectionSource = 'env' | 'config' | 'default'
+export type ConnectionSource = 'env' | 'config' | 'default' | 'profile'
 
 export interface EnvConnection {
   host?: string

@@ -627,6 +627,49 @@ function semanticV21(segment: string): SemanticVerdict | null {
     if (args.some((t) => t === '-n' || t === '--console-level' || t.startsWith('--console-level='))) return verdict('MODIFY', 'dmesg.console-level', 'dmesg console-level changes kernel console state')
     return semanticRead('dmesg.read', 'dmesg query form is read-only')
   }
+  // V0.5.9: verb-aware rules for the DB / middleware probes that used to fall
+  // through to UNKNOWN (they are extremely common on SAP and Oracle estates).
+  // Every one of them is fail-closed: an unrecognised verb returns null, which
+  // keeps the UNKNOWN verdict rather than guessing.
+  if (command === 'sapcontrol') {
+    const at = args.findIndex((t) => t === '-function' || t === '--function')
+    const fn = at >= 0 ? (args[at + 1] ?? '').toLowerCase() : ''
+    if (fn.length === 0) return null
+    if (['getprocesslist','getsysteminstancelist','getversioninfo','getalerttree','getqueuestatistic','getprocessparameter','parametervalue','getinstanceproperties','getstartprofiles','getenvironment'].includes(fn)) {
+      return semanticRead('sap.sapcontrol.read.' + fn, 'sapcontrol -function ' + fn + ' only reports instance state')
+    }
+    if (['start','stop','restart','instancesstart','instancesstop','instancestart','instancestop','restartinstance','startsystem','stopsystem','setprocessparameter','softshutdown'].includes(fn)) {
+      return verdict('MODIFY', 'sap.sapcontrol.mutate.' + fn, 'sapcontrol -function ' + fn + ' changes SAP instance state')
+    }
+    return null
+  }
+  if (command === 'hdb' || command === 'HDB') {
+    const verb = lower.find((t) => !t.startsWith('-'))
+    if (verb === undefined) return null
+    if (['info','version','status','proc','getsysteminfo'].includes(verb)) return semanticRead('sap.hdb.' + verb, 'HDB ' + verb + ' only reports HANA instance state')
+    if (['start','stop','restart','kill','recover'].includes(verb)) return verdict('MODIFY', 'sap.hdb.mutate.' + verb, 'HDB ' + verb + ' changes the HANA instance')
+    return null
+  }
+  if (command === 'lsnrctl') {
+    const verb = lower.find((t) => !t.startsWith('-'))
+    // A bare `lsnrctl` opens an interactive shell that can do anything.
+    if (verb === undefined) return null
+    if (['status','services','version','show','help'].includes(verb)) return semanticRead('oracle.lsnrctl.' + verb, 'lsnrctl ' + verb + ' only queries listener state')
+    if (['start','stop','reload','restart','set','save_config','trace'].includes(verb)) return verdict('MODIFY', 'oracle.lsnrctl.mutate.' + verb, 'lsnrctl ' + verb + ' changes listener state or configuration')
+    return null
+  }
+  if (command === 'showmount') {
+    const known = ['-e','--exports','-a','--all','-d','--directories','-h','--help','-v','--version','--no-headers']
+    if (args.some((t) => t.startsWith('-') && !known.includes(t))) return null
+    return semanticRead('nfs.showmount.read', 'showmount only queries the NFS export table')
+  }
+  if (command === 'jstack') {
+    // -F force-attaches and can suspend the JVM; -m needs a debugger attach.
+    if (args.some((t) => t === '-F')) return verdict('MODIFY', 'jvm.jstack.force', 'jstack -F force-attaches to a JVM and can pause the target')
+    if (args.some((t) => t === '-m')) return verdict('UNKNOWN', 'jvm.jstack.mixed', 'jstack -m needs a debugger attach that can suspend the target', 'LOW')
+    if (args.some((t) => t.startsWith('-') && !['-l','-h','-help'].includes(t))) return null
+    return semanticRead('jvm.jstack.thread-dump', 'jstack attaches read-only and dumps thread stacks')
+  }
   if (command === 'sysctl') {
     if (args.some((t) => ['-w', '--write', '--system', '-p', '--load'].includes(t) || t.startsWith('--load=') || (!t.startsWith('-') && t.includes('=')))) return verdict('MODIFY', 'sysctl.write', 'sysctl write/load form changes kernel runtime parameters')
     return semanticRead('sysctl.read', 'sysctl query form is read-only')

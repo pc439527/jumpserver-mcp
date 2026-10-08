@@ -8,7 +8,7 @@
  */
 import { classifyCommand } from '../security/permission.js'
 import { requireTargetAllowed } from '../security/target-scope.js'
-import { JumpServerError } from './errors.js'
+import { JumpServerError, renderFailureLines } from './errors.js'
 import { mapWithConcurrency } from './concurrency.js'
 import { applyProbe, detectRoles, emptyInventory, type HostInventory } from './host-parse.js'
 import { resolveProfile } from './profiles.js'
@@ -25,6 +25,10 @@ export interface InspectOptions {
   batchId?: string
   /** V0.4.1: how many targets to survey at once (default 1 = sequential). */
   concurrency?: number
+  /** V0.5.2: called as each target settles, for MCP progress reporting. */
+  onTarget?: (done: number, total: number, target: string) => void
+  /** V0.5.3: 0-based accountIndex per target for the KoKo `ID>` prompt. */
+  accountByTarget?: Record<string, number>
 }
 
 export interface SkippedProbe {
@@ -105,9 +109,13 @@ export async function inspectTargets(
         signal: options.signal,
         toolCallId: options.toolCallId,
         batchId: options.batchId,
+        accountIndex: options.accountByTarget?.[target],
       })
       if (result.error !== null) {
-        return emptyInventory(target, used, result.error.code + ': ' + result.error.message)
+        // V0.5.5: keep the KoKo banner and the STOP line. `renderInventory`
+        // prints this string verbatim under `!! 不可达`, so a multi-line
+        // reason reaches the model instead of a bare `code: message`.
+        return emptyInventory(target, used, renderFailureLines(result.error).join('\n  '))
       }
       const inventory = emptyInventory(target, used)
       result.commands.forEach((cmd, index) => {
@@ -120,7 +128,7 @@ export async function inspectTargets(
       inventory.roles = detectRoles(inventory)
       return inventory
     },
-    { concurrency: options.concurrency ?? 1, signal: options.signal },
+    { concurrency: options.concurrency ?? 1, signal: options.signal, onSettled: options.onTarget },
   )
   inventories.push(...perTarget)
 

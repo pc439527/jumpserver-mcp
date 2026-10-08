@@ -15,7 +15,19 @@ export const LEGAL_TRANSITIONS: Record<SessionState, ReadonlySet<SessionState>> 
   [SessionState.DISCONNECTED]: new Set([SessionState.CONNECTING]),
   [SessionState.CONNECTING]: new Set([SessionState.JUMPSERVER_MENU, SessionState.ERROR]),
   [SessionState.JUMPSERVER_MENU]: new Set([SessionState.ENTERING_ASSET, SessionState.DISCONNECTED]),
-  [SessionState.ENTERING_ASSET]: new Set([SessionState.ASSET_SHELL, SessionState.UNKNOWN, SessionState.ERROR]),
+  // V0.5.5: ENTERING_ASSET is not a one-way door. KoKo bounces back to its own
+  // menu prompt when it cannot dial the asset (`... error: 网络不通（连接超时）`
+  // followed by `[Host]> `), and the transport can also die mid-dial. Both are
+  // real screens/states, not illegal moves: without them a single unreachable
+  // asset collapsed the session to UNKNOWN and forced a full reconnect before
+  // the model could look at any other asset.
+  [SessionState.ENTERING_ASSET]: new Set([
+    SessionState.ASSET_SHELL,
+    SessionState.JUMPSERVER_MENU,
+    SessionState.DISCONNECTED,
+    SessionState.UNKNOWN,
+    SessionState.ERROR,
+  ]),
   [SessionState.ASSET_SHELL]: new Set([
     SessionState.COMMAND_RUNNING,
     SessionState.JUMPSERVER_MENU,

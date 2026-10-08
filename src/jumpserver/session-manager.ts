@@ -1,6 +1,6 @@
 import { DEFAULT_ASSET_CACHE_TTL_SECONDS, DEFAULT_TIMEOUTS, type JumpServerConfig, type PermissionMode } from '../config/types.js'
 import type { TerminalObserver } from './terminal-observer.js'
-import { AbortRequestedError, JumpServerError } from './errors.js'
+import { AbortRequestedError, APPROVAL_DENIED_REASON, JumpServerError } from './errors.js'
 import { filterAssets, filterAssetsByGroup, parseAssetList, resolveGroupKeywords, type AssetEntry, type AssetHealth, type AssetListResult } from './asset-list.js'
 import { cleanAnsi } from './output-buffer.js'
 import { MAX_ASSET_CAPTURE_BYTES } from '../config/types.js'
@@ -36,6 +36,19 @@ export interface AuditRecord {
   approvalRequired: boolean
   /** V0.3.1: 'none' | 'approved' | 'denied' — the gate outcome. */
   approvalResult: string
+  /**
+   * V0.5.8: one line recording what the semantic judge (Jev) said about a
+   * command the rule classifier could not rule on, prefixed AUTO_ALLOWED when
+   * that opinion let the command run without a human round-trip. Absent for
+   * every command the classifier decided on its own.
+   */
+  riskJudge?: string
+  /**
+   * V0.5.9: why a refused command was refused. Present on `BLOCKED` records
+   * (the rules refused it) and `DENIED` records (nobody approved it). Without
+   * it the trail says something was stopped but not why.
+   */
+  refusalReason?: string
   /** V0.4.0: MCP request id that produced this record (AI task correlation). */
   toolCallId?: string
   /** V0.4.0: one id per jumpserver_batch / inspect / topology call. */
@@ -85,6 +98,8 @@ export interface ExecRequest {
   /** V0.3.1: approval outcomes from the gate. */
   approvalRequired?: boolean
   approvalResult?: string
+  /** V0.5.8: audit line for the judge decision behind this command, when there was one. */
+  riskJudge?: string
   /** V0.4.0: MCP request id (audit correlation). */
   toolCallId?: string
   /** V0.4.0: batch/inspect run id (audit correlation). */
@@ -104,10 +119,15 @@ export interface RunRequest {
   classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
   approvalRequired?: boolean
   approvalResult?: string
+  /** V0.5.8: audit line for the judge decision behind this command, when there was one. */
+  riskJudge?: string
   /** V0.4.0: MCP request id (audit correlation). */
   toolCallId?: string
   /** V0.4.0: batch/inspect run id (audit correlation). */
   batchId?: string
+  /** V0.5.3: 0-based accountIndex to select a user on KoKo's `ID>` prompt.
+   *  Required only when the target has more than one bastion user. */
+  accountIndex?: number
   /** Runs right after navigation (target verified) and immediately before exec. */
   beforeExec?: () => Promise<void>
 }
@@ -123,6 +143,8 @@ export interface BatchCommandRequest {
   classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
   approvalRequired?: boolean
   approvalResult?: string
+  /** V0.5.8: audit line for the judge decision behind this command, when there was one. */
+  riskJudge?: string
   /** V0.4.0: MCP request id (audit correlation). */
   toolCallId?: string
   /** V0.4.0: batch/inspect run id (audit correlation). */
@@ -142,6 +164,21 @@ export interface TargetBatchRequest {
   toolCallId?: string
   /** V0.4.0: one id for the whole batch run (inspect/topology/batch). */
   batchId?: string
+  /** V0.5.3: 0-based accountIndex for the target's `ID>` prompt (when multiple users). */
+  accountIndex?: number
+}
+
+/**
+ * V0.5.12: the nested failure shape produced by errorDetail(). The interfaces
+ * below used to declare `{ code, message }` only, so even though errorDetail()
+ * attached `detail` at runtime, the renderers were typed out of seeing it —
+ * the compiler blessed a projection that silently dropped every diagnostic.
+ */
+export interface NestedFailure {
+  code: string
+  message: string
+  /** Structured diagnostic: parsed account list, detector tail, host-key reason. */
+  detail?: string
 }
 
 export interface BatchCommandResult {
@@ -156,14 +193,14 @@ export interface BatchCommandResult {
   output: string
   truncated: boolean
   durationMs: number
-  error: { code: string; message: string } | null
+  error: NestedFailure | null
 }
 
 export interface TargetBatchResult {
   target: string
   hostname: string | null
   /** Navigation-level failure (enter/menu problems): commands stay empty. */
-  error: { code: string; message: string } | null
+  error: NestedFailure | null
   commands: BatchCommandResult[]
 }
 
@@ -444,10 +481,10 @@ export class SessionManager {
     return this.status()
   }
 
-  async enter(target: string, signal?: AbortSignal): Promise<ManagerStatus> {
+  async enter(target: string, accountIndex?: number, signal?: AbortSignal): Promise<ManagerStatus> {
     return this.queue(async () => {
       const session = this.requireLiveSession()
-      await session.enter(target, signal)
+      await session.enter(target, accountIndex, signal)
       await this.audit({ operation: 'enter', target, hostname: session.currentHostname, command: null, risk: 'READ', result: 'ok', exitCode: null, durationMs: null })
       return this.status()
     }, signal)
@@ -473,6 +510,7 @@ export class SessionManager {
         classification: request.classification,
         approvalRequired: request.approvalRequired,
         approvalResult: request.approvalResult,
+        riskJudge: request.riskJudge,
         toolCallId: request.toolCallId,
         batchId: request.batchId,
         result: outcome.commandStatus,
@@ -491,8 +529,31 @@ export class SessionManager {
       }
       const session = await this.ensureConnectedLocked(request.signal)
       this.assertNoActiveJob()
-      const st = await this.navigateToTarget(session, request.target, request.signal)
-      if (request.beforeExec !== undefined) await request.beforeExec()
+      const st = await this.navigateToTarget(session, request.target, request.accountIndex, request.signal)
+      if (request.beforeExec !== undefined) {
+        try {
+          await request.beforeExec()
+        } catch (error) {
+          // V0.5.9: a command the human did not approve is audited as DENIED,
+          // then rethrown untouched — same contract as startJob.
+          if (error instanceof JumpServerError && error.code === 'COMMAND_APPROVAL_REQUIRED') {
+            await this.recordDenied({
+              operation: 'run',
+              target: st.target,
+              hostname: st.hostname,
+              command: request.command,
+              risk: request.classification?.risk ?? request.risk,
+              classification: request.classification,
+              reason: APPROVAL_DENIED_REASON,
+              kind: 'denied',
+              riskJudge: request.riskJudge,
+              toolCallId: request.toolCallId,
+              batchId: request.batchId,
+            })
+          }
+          throw error
+        }
+      }
       const started = Date.now()
       const outcome = await session.exec(request.command, { timeoutMs: request.timeoutMs, signal: request.signal })
       const durationMs = Date.now() - started
@@ -506,6 +567,7 @@ export class SessionManager {
         classification: request.classification,
         approvalRequired: request.approvalRequired,
         approvalResult: request.approvalResult,
+        riskJudge: request.riskJudge,
         toolCallId: request.toolCallId,
         batchId: request.batchId,
         result: outcome.commandStatus,
@@ -517,7 +579,7 @@ export class SessionManager {
   }
 
   /** Shared navigation: menu -> enter(target) -> verified status. */
-  private async navigateToTarget(session: JumpServerSession, target: string, signal?: AbortSignal): Promise<SessionStatus> {
+  private async navigateToTarget(session: JumpServerSession, target: string, accountIndex?: number, signal?: AbortSignal): Promise<SessionStatus> {
     let st = session.status()
     if (st.state === SessionState.ASSET_SHELL && st.target === target) return st
     if (st.state === SessionState.ASSET_SHELL) {
@@ -527,13 +589,21 @@ export class SessionManager {
         throw new JumpServerError('UNKNOWN_STATE', 'not reliably at the JumpServer menu after leaving an asset')
       }
     }
-    if (st.state === SessionState.UNKNOWN || st.state === SessionState.ERROR) {
-      throw new JumpServerError('UNKNOWN_STATE', 'current session state is not reliably navigable; reconnect and retry')
+    // V0.5.6: a session parked on KoKo's `ID>` prompt for THIS target is live
+    // and answerable — `accountIndex` completes a navigation that already
+    // started, so the menu precondition does not apply. Every other state
+    // keeps the original fail-closed answer. (Before this, the caller's answer
+    // to the prompt was rejected here with NOT_AT_MENU / CONNECTION_LOST and
+    // the only way forward was a full reconnect.)
+    if (!session.canResumeAccountSelection(target, accountIndex)) {
+      if (st.state === SessionState.UNKNOWN || st.state === SessionState.ERROR) {
+        throw new JumpServerError('UNKNOWN_STATE', 'current session state is not reliably navigable; reconnect and retry')
+      }
+      if (st.state !== SessionState.JUMPSERVER_MENU) {
+        throw new JumpServerError('NOT_AT_MENU', 'cannot navigate: session is in state ' + st.state)
+      }
     }
-    if (st.state !== SessionState.JUMPSERVER_MENU) {
-      throw new JumpServerError('NOT_AT_MENU', 'cannot navigate: session is in state ' + st.state)
-    }
-    await session.enter(target, signal)
+    await session.enter(target, accountIndex, signal)
     return session.status()
   }
 
@@ -549,6 +619,9 @@ export class SessionManager {
     command: string
     signal?: AbortSignal
     toolCallId?: string
+    /** V0.5.3: 0-based accountIndex to select a user on KoKo's `ID>` prompt
+     *  when the target has multiple authorised bastion users. */
+    accountIndex?: number
     /** V0.4.3: real classification — the audit must NOT hardcode READ. */
     classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
     /** V0.4.3: approval outcome recorded in the audit. */
@@ -556,6 +629,8 @@ export class SessionManager {
     /** V0.4.3: ignored when beforeExec is supplied — the manager derives the
      *  outcome from the gate run, not from a caller-provided string. */
     approvalResult?: string
+    /** V0.5.8: audit line for the judge decision behind this job's command. */
+    riskJudge?: string
     /**
      * V0.4.4: deferred permission gate. Runs after navigation, BEFORE the
      * remote writeLine. Throwing COMMAND_APPROVAL_REQUIRED aborts the start
@@ -569,7 +644,7 @@ export class SessionManager {
       if (cfg.enabled === false) throw new JumpServerError('DISABLED', 'JumpServer is disabled in settings')
       if (!cfg.host || !cfg.username) throw new JumpServerError('NOT_CONFIGURED', 'JumpServer is not configured')
       const session = await this.ensureConnectedLocked(request.signal)
-      const st = await this.navigateToTarget(session, request.target, request.signal)
+      const st = await this.navigateToTarget(session, request.target, request.accountIndex, request.signal)
 
       // V0.4.4: gate runs AFTER navigateToTarget and BEFORE the PTY write.
       // COMMAND_APPROVAL_REQUIRED is the only expected rejection — anything
@@ -586,9 +661,11 @@ export class SessionManager {
               command: request.command,
               risk: request.classification?.risk ?? 'UNKNOWN',
               classification: request.classification,
+              riskJudge: request.riskJudge,
               actor: 'AGENT',
               approvalRequired: request.approvalRequired ?? false,
               approvalResult: 'denied',
+              refusalReason: APPROVAL_DENIED_REASON,
               taskId: request.jobId,
               toolCallId: request.toolCallId,
               result: 'DENIED',
@@ -616,6 +693,7 @@ export class SessionManager {
         risk: request.classification?.risk ?? 'UNKNOWN',
         classification: request.classification,
           actor: 'AGENT',
+        riskJudge: request.riskJudge,
         approvalRequired: request.approvalRequired ?? false,
         // V0.4.5: a READ job that never needed approval must not be audited as
         // `approved` — that made every tail -f look like a human decision.
@@ -725,7 +803,7 @@ export class SessionManager {
       }
       let st: SessionStatus
       try {
-        st = await this.navigateToTarget(session, request.target, request.signal)
+        st = await this.navigateToTarget(session, request.target, request.accountIndex, request.signal)
       } catch (error) {
         return { target: request.target, hostname: session.currentHostname, error: this.errorDetail(error), commands: [] }
       }
@@ -762,6 +840,7 @@ export class SessionManager {
             classification: item.classification,
             approvalRequired: item.approvalRequired,
             approvalResult: item.approvalResult,
+            riskJudge: item.riskJudge,
             toolCallId: item.toolCallId ?? request.toolCallId,
             batchId: item.batchId ?? request.batchId,
             batchIndex: item.batchIndex,
@@ -770,6 +849,9 @@ export class SessionManager {
             durationMs,
           })
         } catch (error) {
+          // V0.5.9: a refusal must be distinguishable from a failure — "was it
+          // stopped, or did it break?" has to be answerable from the audit.
+          const denied = error instanceof JumpServerError && error.code === 'COMMAND_APPROVAL_REQUIRED'
           results.push({
             command: item.command,
             executionState: 'ERROR',
@@ -788,12 +870,14 @@ export class SessionManager {
             risk: item.risk,
             actor: item.actor,
             classification: item.classification,
-            approvalRequired: item.approvalRequired,
-            approvalResult: item.approvalResult,
+            approvalRequired: denied ? true : item.approvalRequired,
+            approvalResult: denied ? 'denied' : item.approvalResult,
+            riskJudge: item.riskJudge,
+            refusalReason: denied ? APPROVAL_DENIED_REASON : undefined,
             toolCallId: item.toolCallId ?? request.toolCallId,
             batchId: item.batchId ?? request.batchId,
             batchIndex: item.batchIndex,
-            result: 'error',
+            result: denied ? 'DENIED' : 'error',
             exitCode: null,
             durationMs: null,
           })
@@ -810,9 +894,18 @@ export class SessionManager {
     }, request.signal)
   }
 
-  private errorDetail(error: unknown): { code: string; message: string } {
+  /**
+   * V0.5.5: `detail` is now part of the projection. It used to be dropped
+   * here, so every multi-target tool (batch / runbook / inspect / compare /
+   * baseline) reported a bare `code: message` — the KoKo banner, the parsed
+   * account list and the retryAfterMs hint were all lost between the session
+   * and the model, which is precisely where the retry loop was fed.
+   */
+  private errorDetail(error: unknown): NestedFailure {
     if (error instanceof JumpServerError) {
-      return { code: error.code, message: error.message }
+      return error.detail === undefined
+        ? { code: error.code, message: error.message }
+        : { code: error.code, message: error.message, detail: error.detail }
     }
     return { code: 'FAILED', message: error instanceof Error ? error.message : String(error) }
   }
@@ -1078,6 +1171,54 @@ export class SessionManager {
     this.reconnectTimer = null
   }
 
+  /**
+   * V0.5.9: record a command that was REFUSED — either by the rule gate itself
+   * (`COMMAND_BLOCKED`) or because nobody approved it (`DENIED`).
+   *
+   * Why this exists: before V0.5.9 the audit trail only contained commands that
+   * actually ran, so "who tried to run what, and was stopped" was invisible —
+   * a compliance blind spot, not a cosmetic one.
+   *
+   * Best-effort by construction: audit() swallows sink failures, so a broken
+   * audit sink can never turn a refusal into an execution.
+   */
+  async recordDenied(input: {
+    operation: string
+    command: string | null
+    risk: string
+    classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
+    /** Why it was refused — the gate's own reason, not the classifier's. */
+    reason: string
+    /** 'blocked' = the rules refused it outright; 'denied' = no human approval. */
+    kind: 'blocked' | 'denied'
+    target?: string | null
+    hostname?: string | null
+    riskJudge?: string
+    toolCallId?: string
+    batchId?: string
+    batchIndex?: number
+  }): Promise<void> {
+    const session = this.session
+    await this.audit({
+      operation: input.operation,
+      target: input.target === undefined ? (session?.currentTarget ?? null) : input.target,
+      hostname: input.hostname === undefined ? (session?.currentHostname ?? null) : input.hostname,
+      command: input.command,
+      risk: input.risk,
+      classification: input.classification,
+      approvalRequired: input.kind === 'denied',
+      approvalResult: input.kind === 'denied' ? 'denied' : 'none',
+      riskJudge: input.riskJudge,
+      refusalReason: input.reason,
+      toolCallId: input.toolCallId,
+      batchId: input.batchId,
+      batchIndex: input.batchIndex,
+      result: input.kind === 'denied' ? 'DENIED' : 'BLOCKED',
+      exitCode: null,
+      durationMs: null,
+    })
+  }
+
   private async audit(partial: {
     operation: string
     target?: string | null
@@ -1088,6 +1229,10 @@ export class SessionManager {
     classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
     approvalRequired?: boolean
     approvalResult?: string
+    /** V0.5.8: one-line judge record (AUTO_ALLOWED / ADVISORY) — see AuditRecord. */
+    riskJudge?: string
+    /** V0.5.9: why a refused command was refused (BLOCKED / DENIED records). */
+    refusalReason?: string
     /** V0.4.0: MCP request id / batch id / job id (AI task correlation). */
     toolCallId?: string
     batchId?: string
@@ -1125,6 +1270,8 @@ export class SessionManager {
         : undefined,
       approvalRequired: partial.approvalRequired ?? false,
       approvalResult: partial.approvalResult ?? 'none',
+      riskJudge: partial.riskJudge,
+      refusalReason: partial.refusalReason,
       toolCallId: partial.toolCallId,
       batchId: partial.batchId,
       taskId: partial.taskId,

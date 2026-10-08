@@ -40,6 +40,10 @@ export interface CompareOptions {
   toolCallId?: string
   batchId?: string
   concurrency?: number
+  /** V0.5.2: called as each target settles, for MCP progress reporting. */
+  onTarget?: (done: number, total: number, target: string) => void
+  /** V0.5.3: 0-based accountIndex per target for the KoKo `ID>` prompt. */
+  accountByTarget?: Record<string, number>
 }
 
 export interface CompareTarget {
@@ -265,6 +269,7 @@ export async function compareTargets(
         signal: options.signal,
         toolCallId: options.toolCallId,
         batchId: options.batchId,
+        accountIndex: options.accountByTarget?.[target],
       })
       if (batch.error !== null) {
         return { target, hostname: batch.hostname, ok: false, exitCode: null, error: batch.error, durationMs: 0, lines: [], truncated: false }
@@ -307,7 +312,7 @@ export async function compareTargets(
       })
       return { target, hostname: batch.hostname, ok: true, exitCode: 0, error: null, durationMs, lines, truncated }
     },
-    { concurrency: options.concurrency ?? 1, signal: options.signal },
+    { concurrency: options.concurrency ?? 1, signal: options.signal, onSettled: options.onTarget },
   )
 
   const succeeded = results.filter((r) => r.ok).length

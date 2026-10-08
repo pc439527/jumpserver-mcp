@@ -32,13 +32,38 @@
       ]
     }
   },
+  "riskJudge": {
+    "_comment": "V0.5.7：仅对规则分类器判为 UNKNOWN 的命令，向 TypeSafe Jev 要一份结构化语义判定（只读概率 / 影响面 / 风险分 / 置信度），只写进审批文案，绝不参与放行判定。enabled=true 前需要有一份可用的 API key：优先读环境变量 apiKeyEnv，读不到再读 apiKeyFile（默认 ~/.workbuddy/typesafe/api_key，即本机 TypeSafe 包装器用的同一个文件）。默认关闭——关闭时没有任何命令会外发；命令在离开进程前会脱敏（凭据必掩，IP/主机名/家目录默认掩，系统路径保留）。",
+    "enabled": false,
+    "endpoint": "https://api.typesafe.ai/v1/systemone",
+    "apiKeyEnv": "TYPESAFE_API_KEY",
+    "apiKeyFile": "~/.workbuddy/typesafe/api_key",
+    "model": "jev-latest",
+    "timeoutMs": 1500,
+    "cacheTtlSeconds": 3600,
+    "redactNetwork": true,
+    "autoAllow": {
+      "_comment": "V0.5.8：唯一能让判定改变门禁结果的地方——对「规则分类器判不了、门禁结论又是要问人」的 UNKNOWN 命令，若 Jev 的判定全部达到下面的阈值，就免人工审批直接执行（采集类命令不再逐台弹确认）。硬性排除：不透明 shell 语法（$(...) / 反引号 / sh -c）、组合命令（管道 / 分号 / && / ||）、多行、解释器与远程执行类命令名；READ / PRIVILEGED_READ / MODIFY / DANGEROUS 从不外发，也不受影响。任何一项不达标都退回原来的审批提示，并在提示里写明「自动放行未通过：<原因>」。默认关闭。",
+      "enabled": false,
+      "minReadOnly": 0.9,
+      "minConfidence": 0.7,
+      "maxRiskScore": 1,
+      "minSafeProbability": 0.85,
+      "maxNeedsPrivilege": 0.3
+    }
+  },
   "auditViewer": {
-    "_comment": "stableUrl=true 时控制台固定在 http://127.0.0.1:8765/（地址不含令牌，令牌由服务端注入页面），进程重启后同一地址仍可访问；此时 portFallback 被忽略，端口被占用时本进程改为\"接管\"而不是降级到随机端口。",
+    "_comment": "stableUrl=true 时控制台固定在 http://127.0.0.1:8765/（地址不含令牌，令牌由服务端注入页面），进程重启后同一地址仍可访问；此时 portFallback 被忽略，端口被占用时本进程改为\"接管\"而不是降级到随机端口。allowCredentialWrite（默认 true）决定本机控制台能否新增/修改/删除 JumpServer 账号凭据：控制台只监听 127.0.0.1 且每个请求都要带访问令牌，凭据以 AES-256-GCM 加密保存在 ~/.workbuddy/jumpserver-mcp/profiles.json（密钥 vault.key），不回显、不上传；若不希望提供这个入口，设为 false，设置页会退化为只读列表（写接口一律拒绝）。",
     "enabled": true,
     "port": 8765,
     "autoOpen": true,
     "stableUrl": true,
     "portFallback": false,
-    "tokenTtlMinutes": 720
+    "tokenTtlMinutes": 720,
+    "allowCredentialWrite": true,
+    "tabs": {
+      "_comment": "控制台导航 tab 的显示开关（V0.5.9，全部默认开启）：只影响控制台里的导航显示与该 tab 自己的前端轮询，不影响后台审计写入（审计始终落盘）、也不影响权限门禁（每个 /api 仍由控制台令牌与同源校验保护）。可填 terminal / assets / topology / jobs / audit / stats / sessions / settings；省略即显示，填 false 即隐藏。settings 是唯一的说明与诊断入口、也是本开关自身的说明页，因此无法被隐藏——填 false 也会被忽略。V0.5.13：控制台「设置」页现在自带勾选开关，勾选结果写在 ~/.workbuddy/jumpserver-mcp/console-prefs.json。优先级为：本文件里显式写过的值（true 或 false）> 控制台勾选 > 默认显示；因此这里写过的项在设置页会显示为「已固定」且不可改。示例：关掉「统计」tab。",
+      "stats": false
+    }
   }
 }

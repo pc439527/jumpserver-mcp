@@ -1,6 +1,6 @@
 import type { CommandRisk, PermissionMode } from '../config/types.js'
 import { classifyCommand as classifyBaseCommand, type Classification } from './command-classifier.js'
-import { classifyMysqlCli } from './sql-command-classifier.js'
+import { classifyHanaCli, classifyMysqlCli } from './sql-command-classifier.js'
 import { JumpServerError } from '../jumpserver/errors.js'
 
 export type GateDecision =
@@ -8,12 +8,15 @@ export type GateDecision =
   | { kind: 'deny'; code: 'COMMAND_BLOCKED' | 'COMMAND_APPROVAL_REQUIRED'; reason: string }
 
 /**
- * Authoritative classifier used by permission gates. Database CLIs with a
- * verified non-interactive SQL form are classified before falling back to the
- * generic shell classifier. Unknown/ambiguous SQL remains fail-closed.
+ * Authoritative classifier used by permission gates.
+ *
+ * Order is deliberate: a database CLI with a verified non-interactive query
+ * form (mysql `-e`, HANA `hdbsql` positional) is classified BEFORE the generic
+ * shell classifier, which would otherwise report every one of them as UNKNOWN.
+ * Unknown or ambiguous SQL remains fail-closed.
  */
 export function classifyCommand(command: string): Classification {
-  return classifyMysqlCli(command) ?? classifyBaseCommand(command)
+  return classifyMysqlCli(command) ?? classifyHanaCli(command) ?? classifyBaseCommand(command)
 }
 
 export function isReadOnlyAllowed(command: string): { allowed: boolean; reason?: string } {

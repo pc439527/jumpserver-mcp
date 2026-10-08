@@ -80,11 +80,15 @@ export interface JobStartOptions {
   maxDurationMs?: number
   signal?: AbortSignal
   toolCallId?: string
+  /** V0.5.3: 0-based accountIndex for the target's KoKo `ID>` prompt. */
+  accountIndex?: number
   /** V0.4.3: real classification — the audit must NOT hardcode READ. */
   classification?: { risk: string; reason?: string; ruleId?: string; confidence?: string; classifierVersion?: number; normalizedCommand?: string }
   /** V0.4.3: approval outcome recorded in the audit. */
   approvalRequired?: boolean
   approvalResult?: string
+  /** V0.5.8: audit line for the judge decision behind this job's command. */
+  riskJudge?: string
   /**
    * V0.4.4: deferred permission gate. The SessionManager runs this INSIDE its
    * queue, AFTER the target is navigated but BEFORE the command is written to
@@ -136,12 +140,14 @@ export class JobStore {
       command: options.command,
       signal: options.signal,
       toolCallId: options.toolCallId,
+      accountIndex: options.accountIndex,
       classification: options.classification,
       approvalRequired: options.approvalRequired,
       // V0.4.4: the manager decides the real approval outcome (approved vs
       // denied) based on whether beforeExec threw. tools-ops must NOT
       // pre-decide this from a synchronous flag.
       approvalResult: undefined,
+      riskJudge: options.riskJudge,
       beforeExec: options.beforeExec,
     })
     const record: JobRecord = {

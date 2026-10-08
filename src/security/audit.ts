@@ -23,6 +23,18 @@ export const auditRecordSchema = z.object({
   /** V0.3.1: approval gate outcomes. */
   approvalRequired: z.boolean().default(false),
   approvalResult: z.string().default('none'),
+  /**
+   * V0.5.8: the semantic judge's verdict on a command the rule classifier
+   * could not rule on. Prefixed AUTO_ALLOWED when that verdict let the command
+   * run without a human round-trip — the audit must show not only what ran but
+   * WHO decided it was safe.
+   */
+  riskJudge: z.string().optional(),
+  /**
+   * V0.5.9: why a refused command was refused. Set on BLOCKED (the rules said
+   * no) and DENIED (no human approval) records.
+   */
+  refusalReason: z.string().optional(),
   /** V0.4.0: AI task correlation (one MCP request / batch / job). */
   toolCallId: z.string().optional(),
   batchId: z.string().optional(),

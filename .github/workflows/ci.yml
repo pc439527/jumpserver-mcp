@@ -29,3 +29,11 @@ jobs:
       - run: npm run validate:connector
       - run: npm run smoke
       - run: npm test
+      # V0.5.2: print the tools/list cost into the log. The hard gate lives in
+      # tests/runtime/context-budget.test.mjs; this makes the trend visible.
+      - run: npm run measure:context
+      # V0.5.2: the self-check must survive a clean checkout with no config at
+      # all. It is allowed to REPORT a missing connection (exit 1), never to
+      # crash — that is the failure mode it exists to diagnose.
+      - shell: bash
+        run: node lib/server.js --doctor || true

@@ -59,11 +59,13 @@ test('process inspection is READ', () => {
   ])
 })
 
-test('jstack is UNKNOWN — KNOWN GAP', () => {
-  // jstack only dumps thread stacks; it belongs with `jps` as READ. It is a
-  // gap, not a hazard: UNKNOWN keeps READ_ONLY mode closed, so the cost is an
-  // extra approval, never an unguarded execution.
-  check([['UNKNOWN', 'jstack 12345']])
+test('jstack thread dumps are READ, but -F / -m are not', () => {
+  // V0.5.9: the KNOWN GAP is closed. A plain jstack attaches read-only; the
+  // force and mixed modes are the reason a blanket rule would have been wrong.
+  check([['READ', 'jstack 12345'], ['READ', 'jstack -l 12345']])
+  check([['MODIFY', 'jstack -F 12345']])
+  const mixed = classifyCommand('jstack -m 12345').risk
+  assert.equal(mixed, 'UNKNOWN', 'jstack -m needs a debugger attach, so it stays unconfirmed')
 })
 
 test('storage inspection is READ', () => {
@@ -75,9 +77,9 @@ test('storage inspection is READ', () => {
   ])
 })
 
-test('showmount is UNKNOWN — KNOWN GAP', () => {
-  // `showmount -e` is a read-only NFS export listing; `showmount -a` is too.
-  check([['UNKNOWN', 'showmount -e 10.0.0.5']])
+test('showmount export listings are READ', () => {
+  // V0.5.9: the KNOWN GAP is closed — showmount only queries the export table.
+  check([['READ', 'showmount -e 10.0.0.5'], ['READ', 'showmount -a'], ['READ', 'showmount']])
 })
 
 test('filesystem-formatting commands are DANGEROUS, not merely MODIFY', () => {

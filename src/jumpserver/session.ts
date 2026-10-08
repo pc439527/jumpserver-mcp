@@ -3,7 +3,7 @@ import { AbortRequestedError, JumpServerError } from './errors.js'
 import { MarkerWatcher } from './output-buffer.js'
 import { cleanAnsi } from './output-buffer.js'
 import { nextState, SessionState } from './state-machine.js'
-import { ScreenDetector, type ScreenState } from './detector.js'
+import { looksLikeAccountSelection, looksLikeMenuPrompt, ScreenDetector, type ScreenState } from './detector.js'
 import { buildDoneScript, buildProbeScript, cleanCommandOutput, parseDoneLine, PROBE_PREFIX } from './command-runner.js'
 import { parseProbeOutput } from './probe.js'
 import { MAX_ASSET_CAPTURE_BYTES, MAX_OUTPUT_BYTES } from '../config/types.js'
@@ -116,6 +116,63 @@ const EXEC_RECOVERY_MS = 3000
 const ENTER_FAILURE_PATTERN = /连接失败|无法连接|连接超时|未找到|不存在|无权限|无资产|permission denied|ssh:\s*connect|host\s+key|timed\s*out|error|失败/i
 
 /**
+ * V0.5.5: the SUBSET of those markers that means "the bastion cannot reach the
+ * asset at all". Real KoKo banner (captured from a live session):
+ *
+ *   开始连接到 root(root)@10.0.0.10 error: 网络不通（连接超时）
+ *
+ * Kept separate from {@link ENTER_FAILURE_PATTERN} because the two need
+ * different answers: a generic failure is worth a diagnostic, but an
+ * unreachable asset is a STOP — the credentials, the account index and the
+ * tool arguments are all irrelevant, so retrying can only burn another KoKo
+ * dial timeout (measured: ~15 s per attempt) and another model round-trip.
+ */
+const ENTER_UNREACHABLE_PATTERN =
+  /网络不通|网络不可达|无法访问|无法连接|连接超时|连接失败|连接被拒绝|拒绝连接|连接被重置|no route to host|network is unreachable|connection (?:timed out|refused|reset|closed)|connect(?:ion)? refused|unable to connect|dial tcp/i
+
+/**
+ * V0.5.5: how long a target that just failed to dial is refused outright (ms).
+ * Long enough to break a model's retry loop, short enough that a real network
+ * fix does not need a connector restart. Every refusal reports the remaining
+ * window in `detail` so the caller knows it is a cooldown, not a new failure.
+ */
+const UNREACHABLE_COOLDOWN_MS = 120000
+
+/**
+ * V0.5.6: the sentence that tells the caller the prompt it just saw is still
+ * answerable. Without it the model reads ACCOUNT_SELECTION_REQUIRED as "the
+ * session is broken", reconnects, and only then reaches the real failure —
+ * measured: one full SSH handshake + menu round trip plus a model round trip
+ * (~40 s) spent on a PTY that was still waiting for the answer.
+ */
+const ACCOUNT_PROMPT_STAYS_LIVE =
+  ' — the session stays live at the KoKo ID> prompt: call again with accountIndex to answer it (no reconnect needed)'
+
+/**
+ * V0.5.5: the KoKo line that explains why an entry failed.
+ *
+ * Scans the tail for the last line carrying a failure MARKER rather than just
+ * taking the last line — KoKo prints its prompt immediately BELOW the reason:
+ *
+ *   开始连接到 root(root)@10.0.0.10 error: 网络不通（连接超时）
+ *   [Host]> _
+ *
+ * Pre-V0.5.5 the `detail` carried the regex MATCH ("error"), which told the
+ * model nothing and is why it kept guessing arguments instead of reporting.
+ */
+function failureBanner(text: string, pattern: RegExp, max = 300): string {
+  const lines = text.split('\n')
+  let fallback = ''
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const flat = lines[i]!.replace(/[\s\u3000]{2,}/g, ' ').trim()
+    if (flat.length === 0) continue
+    if (fallback === '') fallback = flat
+    if (flat.length <= max && pattern.test(flat)) return flat
+  }
+  return fallback.length > max ? fallback.slice(0, max) + '…' : fallback
+}
+
+/**
  * One persistent JumpServer session: a single SSH/PTY transport whose logical
  * state is tracked by {@link SessionState}. Transport host (gateway) and the
  * current asset target are kept strictly separate. Never guesses: ambiguity
@@ -140,6 +197,40 @@ export class JumpServerSession {
    */
   private menuCapturePayloadAt: number | null = null
   private menuCaptureLastPayloadAt: number | null = null
+  /**
+   * V0.5.5 fail-fast cache: target -> "the bastion could not dial this asset
+   * until <timestamp>, KoKo said <reason>". Deliberately NOT cleared on
+   * reconnect: the gateway being re-established says nothing about the asset's
+   * network path, which is the thing that actually failed.
+   */
+  private unreachable = new Map<string, { until: number; reason: string }>()
+  /**
+   * V0.5.6: set while the session is parked on KoKo's `ID>` account-selection
+   * prompt — i.e. after ACCOUNT_SELECTION_REQUIRED, until the caller answers.
+   *
+   * The session deliberately STAYS LIVE there instead of collapsing to UNKNOWN.
+   * Collapsing was meant to be fail-closed, but it broke the only way to answer:
+   * `requireLiveSession()` / `ensureConnectedLocked()` refuse a non-live
+   * session, so the very next call — the one carrying the `accountIndex` the
+   * connector had just asked for — was rejected with CONNECTION_LOST. The
+   * caller had no choice but to reconnect (fresh SSH handshake + fresh menu)
+   * before it could answer a prompt on a PTY that was never dead.
+   *
+   * Real transcript (2026-09-14, console pid 36612), 3m56s for one dead asset:
+   *
+   *   enter(no session)     CONNECTION_LOST
+   *   connect               ok
+   *   enter                 ACCOUNT_SELECTION_REQUIRED   <- prompt raised
+   *   enter(accountIndex=1) CONNECTION_LOST              <- answer refused
+   *   connect               (reconnect, second SSH dial)
+   *   enter(accountIndex=1) ASSET_UNREACHABLE            <- the real failure
+   *
+   * `pendingAccountChoice` removes the detour: the second call answers the
+   * prompt that is already painted, and only then does KoKo dial the asset.
+   *
+   * Never auto-picked — only an explicit `accountIndex` answers this prompt.
+   */
+  private pendingAccountChoice: { target: string; accounts: string } | null = null
 
   currentTarget: string | null = null
   currentHostname: string | null = null
@@ -170,6 +261,30 @@ export class JumpServerSession {
 
   hasPendingOp(): boolean {
     return this.opWatcher !== null
+  }
+
+  /**
+   * V0.5.6: true when this session is LIVE on KoKo's `ID>` prompt for `target`
+   * and the caller is now supplying the `accountIndex` it asked for. Only then
+   * may a caller skip the "must be at the menu" precondition: the target line
+   * was already written, the numbered list is still painted, and the only byte
+   * missing is the chosen ID.
+   *
+   * The live-session requirement is what fails closed — if KoKo timed the
+   * selection out, the transport died, or the session moved on, this returns
+   * false and the normal preconditions apply (reconnect and re-enter).
+   */
+  canResumeAccountSelection(target: string, accountIndex?: number): boolean {
+    if (accountIndex === undefined) return false
+    if (!this.parkedOnAccountPrompt(target)) return false
+    if (this.wire === null || this.wireClosed) return false
+    return looksLikeAccountSelection(this.detector.tailPreview(2048)).detected
+  }
+
+  /** V0.5.6: a previous call left this session waiting on KoKo's `ID>` prompt for `target`. */
+  private parkedOnAccountPrompt(target: string): boolean {
+    const pending = this.pendingAccountChoice
+    return pending !== null && pending.target === target && this.stateValue === SessionState.ENTERING_ASSET
   }
 
   status(): SessionStatus {
@@ -225,32 +340,164 @@ export class JumpServerSession {
     }
   }
 
-  async enter(target: string, signal?: AbortSignal): Promise<void> {
-    this.assertState(SessionState.JUMPSERVER_MENU, 'NOT_AT_MENU', 'enter(target) requires the JumpServer menu')
+  /**
+   * Enter a target asset through the JumpServer KoKo menu.
+   *
+   * @param target       Asset IP or name (must already exist on the menu).
+   * @param accountIndex The account ID displayed by KoKo on the `ID>` selection
+   *                    screen. Required only when the target has more than one
+   *                    authorised bastion user — KoKo paints a numbered list
+   *                    ending in `ID>` and waits. The value passed here is the
+   *                    number shown on that screen (usually 1 or 2), NOT a
+   *                    0-based array position. When omitted on a multi-user
+   *                    asset this throws ACCOUNT_SELECTION_REQUIRED with the
+   *                    parsed account list in `detail`. Single-user assets
+   *                    auto-login and ignore this argument.
+   * @param signal       Abort signal (the menu-loop polls every ~120ms).
+   */
+  async enter(target: string, accountIndex?: number, signal?: AbortSignal): Promise<void> {
     if (!TARGET_PATTERN.test(target)) {
       throw new JumpServerError('ASSET_NOT_FOUND', 'invalid target: ' + target)
     }
-    this.currentTarget = target
-    this.currentHostname = null
-    this.currentUser = null
-    this.currentPwd = null
-    this.setState(SessionState.ENTERING_ASSET)
+    if (accountIndex !== undefined && (!Number.isInteger(accountIndex) || accountIndex < 0)) {
+      throw new JumpServerError('INVALID_ARGUMENT', 'accountIndex must be the non-negative integer shown by KoKo')
+    }
+    // V0.5.6: this call may be the ANSWER to a prompt we raised a moment ago.
+    // Check that before the menu precondition — the session is not at the menu,
+    // it is (truthfully) still mid-entry, sitting on KoKo's `ID>` prompt.
+    if (this.parkedOnAccountPrompt(target)) {
+      const sel = looksLikeAccountSelection(this.detector.tailPreview(2048))
+      if (!sel.detected) {
+        // The prompt that was on screen is gone: KoKo timed the selection out,
+        // or the transport died underneath it. Nothing can be answered here, so
+        // fail closed instead of typing an index into an unknown screen.
+        this.pendingAccountChoice = null
+        this.setState(this.wireClosed || this.wire === null ? SessionState.DISCONNECTED : SessionState.UNKNOWN)
+        throw new JumpServerError(
+          'ACCOUNT_SELECTION_EXPIRED',
+          'the KoKo account-selection prompt for ' + target + ' is no longer on the session — reconnect and enter again',
+        )
+      }
+      if (accountIndex === undefined) {
+        throw new JumpServerError(
+          'ACCOUNT_SELECTION_REQUIRED',
+          'target ' + target + ' has ' + sel.options.length + ' accounts; pass accountIndex in jumpserver_enter/jumpserver_run/jumpserver_batch',
+          'accounts=' + sel.preview.join(' | '),
+        )
+      }
+    }
+    // True only when the prompt is still painted on a LIVE session AND the
+    // caller supplied the index — see canResumeAccountSelection().
+    const resuming = this.canResumeAccountSelection(target, accountIndex)
+    if (!resuming) {
+      this.assertState(SessionState.JUMPSERVER_MENU, 'NOT_AT_MENU', 'enter(target) requires the JumpServer menu')
+      // V0.5.5 fail-fast: a target the bastion could not dial seconds ago is
+      // refused here, BEFORE any byte reaches the PTY. KoKo would otherwise
+      // spend another ~15 s on the same dead dial and report the same banner,
+      // which is exactly the loop that burned 2m53s of a real conversation.
+      const cooldown = this.unreachable.get(target)
+      if (cooldown !== undefined) {
+        const remainingMs = cooldown.until - Date.now()
+        if (remainingMs > 0) {
+          throw new JumpServerError(
+            'ASSET_UNREACHABLE',
+            'asset ' + target + ' was unreachable from the bastion moments ago — not retried (fail-fast, no PTY write)',
+            'koko=' + cooldown.reason + ' retryAfterMs=' + remainingMs,
+          )
+        }
+        this.unreachable.delete(target)
+      }
+      this.currentTarget = target
+      this.currentHostname = null
+      this.currentUser = null
+      this.currentPwd = null
+      this.setState(SessionState.ENTERING_ASSET)
+    }
     try {
-      this.wire!.write(target + '\n')
-    this.callbacks.onInput?.(target) // the user-visible target line
-      // KoKo dials the asset with a progress banner; watch for the prompt,
-      // a connection-failure message, the wire closing, or the deadline.
+      if (resuming) {
+        // The list is still on screen and KoKo is still waiting: answer it in
+        // place. Deliberately NO detector reset (it would wipe the rows we are
+        // about to read) and no second target line (KoKo would read the IP as
+        // the account ID).
+        this.callbacks.onLog?.('answering the pending KoKo account prompt for ' + target + ' on the live session')
+      } else {
+        // V0.5.5: everything the enter loop concludes must come from THIS dial.
+        // KoKo paints the failure banner just above its own prompt and we only
+        // look 400 chars back, so a banner left over from a previous failed
+        // attempt used to be re-matched against a perfectly healthy new one —
+        // a false "failure" that is impossible to diagnose from the result.
+        this.detector.reset()
+        this.wire!.write(target + '\n')
+        this.callbacks.onInput?.(target) // the user-visible target line
+      }
+      // KoKo dials the asset with a progress banner. There are four terminal
+      // shapes the wait may resolve into:
+      //   1. ASSET_SHELL prompt — success, probe next;
+      //   2. multi-user `ID>` selection — write accountIndex, then keep waiting;
+      //   3. a connection-failure banner — bail with the visible failure text;
+      //   4. wire closed or deadline reached — bail with ASSET_ENTER_TIMEOUT.
+      // accountChoiceWritten makes sure we only fire the index ONCE per enter,
+      // even if KoKo redraws the list (or our detector briefly flickers).
       const deadline = Date.now() + this.cfg.enterAssetMs
       let shellSeen = false
       let failureText: string | undefined
+      let accountChoiceWritten = accountIndex === undefined ? true : false
       for (;;) {
         const screen = this.detector.detect()
         if (screen === 'ASSET_SHELL') {
           shellSeen = true
           break
         }
-        const tail = this.detector.tailPreview(400)
-        const failure = ENTER_FAILURE_PATTERN.exec(tail)
+        // Multi-username selection — detect before the failure pattern so we
+        // never mistake a numbered "0) admin" row for a "failed" connection.
+        if (!accountChoiceWritten) {
+          const tail = this.detector.tailPreview(2048)
+          const sel = looksLikeAccountSelection(tail)
+          if (sel.detected) {
+            if (accountIndex === undefined) {
+              // Will not happen given the assignment above, but be explicit:
+              // never auto-pick an account on the operator's behalf.
+              this.pendingAccountChoice = { target, accounts: sel.preview.join(' | ') }
+              throw new JumpServerError(
+                'ACCOUNT_SELECTION_REQUIRED',
+                'target ' + target + ' has ' + sel.options.length + ' accounts; pass accountIndex in jumpserver_enter/jumpserver_run/jumpserver_batch' + ACCOUNT_PROMPT_STAYS_LIVE,
+                'accounts=' + sel.preview.join(' | '),
+              )
+            }
+            const chosen = sel.options.find((o) => o.index === accountIndex)
+            if (chosen === undefined) {
+              this.pendingAccountChoice = { target, accounts: sel.preview.join(' | ') }
+              throw new JumpServerError(
+                'ACCOUNT_SELECTION_REQUIRED',
+                'target ' + target + ' has ' + sel.options.length + ' accounts; accountIndex=' + accountIndex + ' is not one of the displayed IDs' + ACCOUNT_PROMPT_STAYS_LIVE,
+                'accounts=' + sel.preview.join(' | ') + ' (requested accountIndex=' + accountIndex + ')',
+              )
+            }
+            const line = String(chosen.index) + '\n'
+            this.wire!.write(line)
+            this.callbacks.onInput?.(String(chosen.index))
+            accountChoiceWritten = true
+            // KoKo needs a beat to repaint the shell banner — give it the
+            // same 120ms cadence the rest of the loop uses, then re-detect.
+            await sleep(120)
+            continue
+          }
+        } else if (accountIndex === undefined) {
+          // Caller did not supply accountIndex; if KoKo raises the selection
+          // screen we MUST surface it rather than auto-pick.
+          const tail = this.detector.tailPreview(2048)
+          const sel = looksLikeAccountSelection(tail)
+          if (sel.detected) {
+            this.pendingAccountChoice = { target, accounts: sel.preview.join(' | ') }
+            throw new JumpServerError(
+              'ACCOUNT_SELECTION_REQUIRED',
+              'target ' + target + ' has ' + sel.options.length + ' accounts; pass accountIndex in jumpserver_enter/jumpserver_run/jumpserver_batch' + ACCOUNT_PROMPT_STAYS_LIVE,
+              'accounts=' + sel.preview.join(' | '),
+            )
+          }
+        }
+        const failureTail = this.detector.tailPreview(400)
+        const failure = ENTER_FAILURE_PATTERN.exec(failureTail)
         if (failure !== null) {
           failureText = failure[0]
           break
@@ -261,12 +508,29 @@ export class JumpServerSession {
         await sleep(120)
       }
       if (failureText !== undefined) {
-        this.setState(SessionState.UNKNOWN)
-        throw new JumpServerError('ASSET_ENTER_TIMEOUT', 'asset connection reported failure while entering ' + target, failureText)
+        // V0.5.5: the banner is a full SENTENCE ("开始连接到 root(root)@10.0.0.10
+        // error: 网络不通（连接超时）"), not the regex token that happened to
+        // match first. Reporting the token gave the model `detail: error` and
+        // no way to tell a dead asset from a wrong accountIndex.
+        const banner = failureBanner(this.detector.tailPreview(2000), ENTER_FAILURE_PATTERN) || failureText
+        if (ENTER_UNREACHABLE_PATTERN.test(banner)) {
+          this.unreachable.set(target, { until: Date.now() + UNREACHABLE_COOLDOWN_MS, reason: banner })
+          throw new JumpServerError(
+            'ASSET_UNREACHABLE',
+            'asset ' + target + ' is unreachable from the bastion — KoKo reported a network-level failure. This is NOT a configuration, credential or accountIndex problem.',
+            'koko=' + banner + ' retryAfterMs=' + UNREACHABLE_COOLDOWN_MS,
+          )
+        }
+        throw new JumpServerError('ASSET_ENTER_TIMEOUT', 'asset connection reported failure while entering ' + target, 'koko=' + banner)
       }
       if (!shellSeen) {
-        this.setState(SessionState.UNKNOWN)
-        throw new JumpServerError('ASSET_ENTER_TIMEOUT', 'asset shell for ' + target + ' was not detected within the enter timeout')
+        const tail = this.detector.tailPreview(2048)
+        const sel = looksLikeAccountSelection(tail)
+        throw new JumpServerError(
+          'ASSET_ENTER_TIMEOUT',
+          'asset shell for ' + target + ' was not detected within the enter timeout',
+          'detected=' + sel.detected + ' options=' + (sel.preview.join(' | ') || 'none') + ' tail=' + tail.slice(-500),
+        )
       }
       const marker = randomHex(6)
       const probeScript = buildProbeScript(marker)
@@ -288,10 +552,16 @@ export class JumpServerSession {
       this.currentUser = info.user
       this.currentPwd = info.pwd
       this.callbacks.onTarget?.(target, info.hostname, info.user, info.pwd)
+      this.unreachable.delete(target)
+      this.pendingAccountChoice = null
       this.setState(SessionState.ASSET_SHELL)
       this.touch()
     } catch (error) {
-      if (this.stateValue === SessionState.ENTERING_ASSET && !this.wireClosed) this.setState(SessionState.UNKNOWN)
+      this.recoverAfterFailedEnter()
+      // V0.5.6: a prompt still painted stays answerable; on every other exit
+      // the screen it referred to is gone, so the answer must go through a
+      // fresh enter() (and that one reconnects if it has to).
+      if (this.stateValue !== SessionState.ENTERING_ASSET) this.pendingAccountChoice = null
       throw error
     }
   }
@@ -573,6 +843,13 @@ export class JumpServerSession {
     this.connectedAt = null
     this.lastActivityAt = null
     this.detector.reset()
+    // V0.5.5: an explicit close is the operator saying "start over" (the reason
+    // they closed is usually that the network was just fixed), so the
+    // unreachable cooldown must not outlive it. A plain reconnect() does NOT
+    // clear it — re-establishing the gateway says nothing about the asset.
+    this.unreachable.clear()
+    // V0.5.6: same for a pending account prompt — the PTY it lived on is gone.
+    this.pendingAccountChoice = null
     this.setState(SessionState.DISCONNECTED)
   }
 
@@ -749,6 +1026,55 @@ export class JumpServerSession {
     }
     this.stateValue = resolved
     this.callbacks.onStateChange?.(resolved)
+  }
+
+  /**
+   * V0.5.5: leave the session in a state that is ACTUALLY true after a failed
+   * asset entry.
+   *
+   * When KoKo cannot dial the asset it prints the reason and re-paints its own
+   * menu prompt one line below, so the bastion session is intact and every
+   * other asset is still one `enter()` away. Collapsing to UNKNOWN there was a
+   * lie with a price: the next call needed a full reconnect (fresh SSH
+   * handshake ~14 s + a fresh asset-list capture), and the model — seeing
+   * `state: UNKNOWN` — had no way to know the difference between "dead
+   * session" and "one bad asset". Real transcript: 8 enter/connect cycles,
+   * 2m53s, all of it avoidable.
+   *
+   * The check is tail-anchored and positive (see looksLikeMenuPrompt), and it
+   * deliberately does NOT accept an `ID>` prompt: answering that prompt with an
+   * asset name would be read as an account choice. No prompt → UNKNOWN, as
+   * before. A dead transport is DISCONNECTED, which is what it is.
+   */
+  private recoverAfterFailedEnter(): void {
+    if (this.stateValue !== SessionState.ENTERING_ASSET) return
+    if (this.wireClosed || this.wire === null) {
+      this.setState(SessionState.DISCONNECTED)
+      return
+    }
+    // V0.5.6: KoKo is waiting for an account ID on a LIVE session — we are
+    // still mid-entry, only paused on a prompt, and the caller's next call can
+    // answer it. Stay in ENTERING_ASSET so that call is allowed through.
+    const accountTail = this.detector.tailPreview(2048)
+    if (looksLikeAccountSelection(accountTail).detected) {
+      if (this.currentTarget !== null && this.pendingAccountChoice === null) {
+        this.pendingAccountChoice = {
+          target: this.currentTarget,
+          accounts: looksLikeAccountSelection(accountTail).preview.join(' | '),
+        }
+      }
+      return
+    }
+    if (looksLikeMenuPrompt(this.detector.tailPreview(400))) {
+      this.currentTarget = null
+      this.currentHostname = null
+      this.currentUser = null
+      this.currentPwd = null
+      this.setState(SessionState.JUMPSERVER_MENU)
+      this.touch()
+      return
+    }
+    this.setState(SessionState.UNKNOWN)
   }
 
   private teardownTransport(): void {

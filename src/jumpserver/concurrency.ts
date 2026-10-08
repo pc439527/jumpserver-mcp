@@ -15,10 +15,19 @@
  */
 import { AbortRequestedError } from '../jumpserver/errors.js'
 
-export interface MapOptions {
+export interface MapOptions<T = unknown> {
   /** 1..ceiling; values < 1 are treated as 1. */
   concurrency: number
   signal?: AbortSignal
+  /**
+   * V0.5.2: fired once per item, AFTER it settles, with a running count.
+   *
+   * Exists so a long survey can report progress (MCP notifications/progress)
+   * without every caller re-implementing the bookkeeping. It is strictly
+   * observational: a throwing callback is swallowed, so a broken progress
+   * reporter can never fail the work it is reporting on.
+   */
+  onSettled?: (done: number, total: number, item: T) => void
 }
 
 /**
@@ -30,13 +39,14 @@ export interface MapOptions {
 export async function mapWithConcurrency<T, R>(
   items: readonly T[],
   worker: (item: T, index: number) => Promise<R>,
-  options: MapOptions,
+  options: MapOptions<T>,
 ): Promise<R[]> {
   const limit = Math.max(1, Math.floor(options.concurrency))
   const results = new Array<R>(items.length)
   if (items.length === 0) return results
   let next = 0
   let aborted = false
+  let settled = 0
   const runOne = async (): Promise<void> => {
     for (;;) {
       if (options.signal?.aborted === true) {
@@ -46,7 +56,16 @@ export async function mapWithConcurrency<T, R>(
       const index = next
       next += 1
       if (index >= items.length) return
-      results[index] = await worker(items[index]!, index)
+      const item = items[index]!
+      results[index] = await worker(item, index)
+      settled += 1
+      if (options.onSettled !== undefined) {
+        try {
+          options.onSettled(settled, items.length, item)
+        } catch {
+          /* V0.5.2: observation only — never let it affect the run */
+        }
+      }
     }
   }
   const workers: Array<Promise<void>> = []

@@ -16,7 +16,7 @@
  */
 import { classifyCommand } from '../security/permission.js'
 import { requireTargetAllowed } from '../security/target-scope.js'
-import { JumpServerError } from './errors.js'
+import { JumpServerError, renderFailureLines } from './errors.js'
 import { mapWithConcurrency } from './concurrency.js'
 import { isInspectProfile, resolveProfile } from './profiles.js'
 import type { BatchCommandRequest, SessionManager, TargetBatchResult } from './session-manager.js'
@@ -220,6 +220,10 @@ export interface RunbookOptions {
   toolCallId?: string
   batchId?: string
   concurrency?: number
+  /** V0.5.2: called as each target settles, for MCP progress reporting. */
+  onTarget?: (done: number, total: number, target: string) => void
+  /** V0.5.3: 0-based accountIndex per target for the KoKo `ID>` prompt. */
+  accountByTarget?: Record<string, number>
 }
 
 /**
@@ -428,11 +432,12 @@ export async function runRunbook(
         signal: options.signal,
         toolCallId: options.toolCallId,
         batchId: options.batchId,
+        accountIndex: options.accountByTarget?.[target],
       })
       if (batch.error !== null) {
         // The target never ran: any assertion it carried is an automatic fail.
         const unreachableCheck = plan.steps.some((s) => s.skipped === null && s.expect !== null)
-          ? { verdict: 'fail' as const, failures: ['target unreachable: ' + batch.error.code + ' ' + batch.error.message] }
+          ? { verdict: 'fail' as const, failures: ['target unreachable: ' + renderFailureLines(batch.error).join(' ')] }
           : null
         return { target, hostname: batch.hostname, error: batch.error, verdict: unreachableCheck !== null ? 'fail' : null, steps: [] }
       }
@@ -505,7 +510,7 @@ export async function runRunbook(
       }
       return { target, hostname: batch.hostname, error: null, verdict: foldVerdict(steps.map((s) => s.check)), steps }
     },
-    { concurrency: options.concurrency ?? 1, signal: options.signal },
+    { concurrency: options.concurrency ?? 1, signal: options.signal, onSettled: options.onTarget },
   )
 
   const judged = results.filter((r) => r.verdict !== null)

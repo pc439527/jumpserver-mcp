@@ -27,16 +27,18 @@
 import http from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import type { SessionRegistry } from '../jumpserver/session-registry.js'
 import type { TerminalEvent } from '../jumpserver/terminal-observer.js'
-import type { AuditStore } from './audit-store.js'
+import { DEFAULT_AUDIT_RING_SIZE, type AuditStore } from './audit-store.js'
 import type { JobStore } from './job-store.js'
 import type { TopologyStore } from './topology-store.js'
 import type { AssetStore } from './asset-store.js'
 import type { BaselineStore } from './baseline-store.js'
 import type { ConnectionView } from '../config/env.js'
 import { interruptSession } from './interrupt.js'
+import { consoleTabSources, resolveConsoleTabs, type ConsoleTabSource } from './console-tabs.js'
+import { CONSOLE_TAB_IDS, type ConsoleTabId } from '../config/types.js'
 
 export interface AuditViewerOptions {
   enabled: boolean
@@ -87,6 +89,52 @@ export interface AuditViewerServices {
   policy?: (() => Record<string, unknown>) | null
   /** V0.5.0: known_hosts records (path + entries) for the 设置 tab. */
   knownHosts?: (() => { path?: string; entries: Record<string, unknown> }) | null
+  /**
+   * V0.5.10: `config.json` auditViewer.tabs — which navigation tabs the console
+   * shows. Absent means "all of them" (resolveConsoleTabs' empty-config rule),
+   * so an audit-only mirror never has to think about it.
+   *
+   * This is a visibility switch, NOT an access-control one: the hidden tab's
+   * /api route, its section markup and the audit sink all stay exactly as they
+   * are. See src/runtime/console-tabs.ts.
+   */
+  consoleTabs?: (() => Partial<Record<ConsoleTabId, boolean>>) | null
+  /**
+   * V0.5.13: the console's OWN tab preferences (console-prefs.json), written
+   * by the switches in the 设置 tab. Kept separate from `consoleTabs` so the two
+   * layers stay distinguishable: config.json pins a tab (and the UI shows it
+   * locked), this one is what the operator clicked.
+   */
+  consoleTabLocal?: (() => Partial<Record<ConsoleTabId, boolean>>) | null
+  /**
+   * V0.5.13: the 设置 tab's tab-visibility block — the resolved visible list,
+   * which layer decided each tab, the local store's integrity and its path
+   * hint. Rendering it live (rather than only baking it into the HTML) is what
+   * lets the switches redraw themselves after a successful write.
+   */
+  consoleTabReport?: (() => Record<string, unknown>) | null
+  /**
+   * V0.5.13: persist one tab's visibility. Structured result so the page can
+   * name the reason (unknown id / always-on tab / unreadable store / failed
+   * write) instead of a generic failure.
+   */
+  setConsoleTab?: ((id: string, hidden: boolean) => { ok: boolean; error?: string }) | null
+  /**
+   * V0.5.11: the multi-account view for the 设置 tab — the active profile id,
+   * the redacted profile list, the file integrity flag and whether the console
+   * may write. REDACTED only: no token, no plaintext ever reaches this payload.
+   */
+  accounts?: (() => Record<string, unknown>) | null
+  /** V0.5.11: point the connector at one account (null = none). */
+  switchAccount?: ((id: string | null) => { ok: boolean; error?: string }) | null
+  /** V0.5.11: create/update one account. Never echoes the password back. */
+  saveAccount?: ((input: Record<string, unknown>) => { ok: boolean; error?: string }) | null
+  /**
+   * V0.5.12: delete one account. Structured result (same shape as saveAccount)
+   * so the page can say WHY a delete failed — unknown id, read-only console or
+   * an unreadable profiles file — instead of a single "unknown error".
+   */
+  removeAccount?: ((id: string) => { ok: boolean; error?: string }) | null
 }
 
 /** Terminal events sent to the page per poll (tail; older events are dropped). */
@@ -95,6 +143,59 @@ const TERMINAL_TAIL_EVENTS = 400
 const TERMINAL_MAX_LINES = 2000
 /** Consecutive failed polls before the page declares the server dead. */
 const DEAD_AFTER_FAILURES = 6
+/** V0.5.10: upper bound on one /api/entries page (a client cannot ask for more). */
+const AUDIT_PAGE_MAX = 20000
+
+/**
+ * V0.5.10: the single label table for the console navigation. Used by the
+ * server when it renders the nav (only VISIBLE tabs appear in the HTML) and
+ * handed to the page so the 设置 tab can name the hidden ones. Keys are the
+ * same ids the sections, the hash router and auditViewer.tabs use.
+ */
+const CONSOLE_TAB_LABELS: Record<ConsoleTabId, string> = {
+  terminal: '实时终端',
+  assets: '资产',
+  topology: '拓扑',
+  jobs: '任务',
+  audit: '审计日志',
+  stats: '统计',
+  sessions: '会话',
+  settings: '设置',
+}
+
+/**
+ * Nav markup for the visible tabs, in CONSOLE_TAB_IDS order.
+ *
+ * A hidden tab produces NO button — the operator simply cannot navigate to it.
+ * Its section markup stays in the page (removing it would leave the script's
+ * `$('rows')` / `$('cards')` bindings pointing at nothing), and the hash router
+ * refuses to select it, so the state is unreachable rather than absent.
+ */
+function navMarkup(visibleTabs: readonly ConsoleTabId[]): string {
+  return visibleTabs.map((id) => '    <button data-tab="' + id + '">' + CONSOLE_TAB_LABELS[id] + '</button>').join('\n')
+}
+
+/**
+ * V0.5.13: the ONE place the two preference layers are merged for this module.
+ * The page render, the /api/settings payload and the POST /api/console/tabs
+ * response all go through here, so the nav that was rendered, the switches that
+ * report it and the router that guards it can never disagree about which tabs
+ * exist. Hiding a tab is a visibility change only — never a permission change.
+ */
+function resolveVisibleTabs(services: AuditViewerServices): ConsoleTabId[] {
+  return resolveConsoleTabs(
+    services.consoleTabs?.() ?? undefined,
+    services.consoleTabLocal?.() ?? undefined,
+  )
+}
+
+/** V0.5.13: which layer decided each tab, for the locked rows in 设置. */
+function resolveTabSources(services: AuditViewerServices): Record<ConsoleTabId, ConsoleTabSource> {
+  return consoleTabSources(
+    services.consoleTabs?.() ?? undefined,
+    services.consoleTabLocal?.() ?? undefined,
+  )
+}
 
 let viewerUrl: string | null = null
 /** Discovery-file dir + our own file, written on every heartbeat. */
@@ -122,6 +223,33 @@ let consoleRequestedPort = 0
 let consoleAdoptLogged = false
 /** V0.5.1: max hints while the console has never been opened. */
 const CONSOLE_NAG_LIMIT = 12
+/**
+ * V0.5.4: which role this process plays in the workspace.
+ *   `owner`    — owns the configured (stable) port and serves it.
+ *   `follower` — the port was taken, so this process adopted the same public
+ *                address for handover BUT bound a private loopback port for its
+ *                own sessions.
+ *   `none`     — console disabled or not started yet.
+ */
+type ConsoleRole = 'owner' | 'follower' | 'none'
+let consoleRole: ConsoleRole = 'none'
+/**
+ * V0.5.4: the follower's private loopback listener + port. Before this, a
+ * process that lost the port race served NOTHING — its sessions were invisible
+ * (and, worse, the shared page's 中断 button acted on the port owner's sessions
+ * instead of the caller's). Two WorkBuddy conversations therefore looked at one
+ * terminal with no way to tell whose it was.
+ */
+let consoleFollowerServer: import('node:http').Server | null = null
+let consoleFollowerPort = 0
+/** V0.5.4: heartbeat freshness window; an entry older than this is a dead process. */
+const CONSOLE_STALE_MS = 20_000
+/**
+ * V0.5.4: live session registry, kept module-level so the heartbeat can publish
+ * a one-line instance summary (state / target / session count) for the page's
+ * instance picker. Cleared on stopAuditViewer.
+ */
+let liveRegistry: SessionRegistry | null = null
 /**
  * V0.4.1: per-process random access token. The console binds to 127.0.0.1, but
  * any local process (or a browser tab) could otherwise read the audit trail and
@@ -158,6 +286,23 @@ function consoleTokenExpired(): boolean {
   return consoleToken !== null && consoleTokenExpiresAt !== null && Date.now() >= consoleTokenExpiresAt
 }
 
+/**
+ * V0.5.12: true when the request carries an Origin header that is neither
+ * `http://<Host>` nor `https://<Host>`.
+ *
+ * A browser ALWAYS sends Origin on a cross-origin fetch / form post, so this is
+ * the CSRF marker: a page on another origin must not be able to drive the
+ * console even when it somehow learned a valid token. Requests WITHOUT Origin —
+ * curl, the host's preview panel, the model's own programmatic calls — carry no
+ * such signal and are left to the token check (see the handler gate).
+ */
+function isCrossOrigin(req: import('node:http').IncomingMessage): boolean {
+  const origin = req.headers['origin']
+  if (typeof origin !== 'string' || origin.length === 0) return false
+  const host = typeof req.headers['host'] === 'string' ? (req.headers['host'] as string) : ''
+  return origin !== 'http://' + host && origin !== 'https://' + host
+}
+
 /** Mint a fresh token, set its expiry, and refresh the handover URL + discovery file. */
 function rotateConsoleToken(): string {
   consoleToken = randomBytes(16).toString('hex')
@@ -187,7 +332,16 @@ export function readAuditEntries(file: string): Record<string, unknown>[] {
   }
 }
 
-function page(timeZone: string, injectedToken: string): string {
+function page(
+  timeZone: string,
+  injectedToken: string,
+  selfPid: number,
+  selfPort: number,
+  openPid: number | null = null,
+  handover: string | null = null,
+  visibleTabs: readonly ConsoleTabId[] = CONSOLE_TAB_IDS,
+  tabSources: Partial<Record<ConsoleTabId, ConsoleTabSource>> = {},
+): string {
   return `<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
 <title>JumpServer MCP 控制台</title>
@@ -204,9 +358,17 @@ nav button{background:transparent;border:1px solid transparent;color:#999;paddin
 nav button:hover{color:#ddd}
 nav button.on{background:#2a2a2a;color:#fff;border-color:#3a3a3a}
 #stat{color:#777;font-size:12px;margin-left:auto;white-space:nowrap;flex:none;padding-left:10px}
+/* V0.5.4: per-instance (per-conversation) picker + embedded foreign console */
+.instpick{background:#222;border:1px solid #333;color:#ddd;padding:3px 6px;border-radius:6px;font:inherit;font-size:12px;flex:none;max-width:320px;margin-left:auto}
+.instpick+.instpick{margin-left:0}
+#stat{margin-left:0}
+.fwbar{background:#2a2118;border:1px solid #5f4a2f;color:#e8c98a;border-radius:8px;padding:8px 12px;margin-bottom:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px}
+.fwbar b{color:#fff;font-weight:500}
+.fwbar button{background:#3a2f1e;border:1px solid #6b552f;color:#e8c98a;padding:3px 10px;border-radius:6px;font:inherit;cursor:pointer}
+#fwframe{width:100%;height:calc(100vh - 250px);border:1px solid #2a2a2a;border-radius:8px;background:#0d0d0d}
 main{padding:12px 16px}
 section{display:none}section.on{display:block}
-input[type=text]{background:#222;border:1px solid #333;color:#ddd;padding:4px 10px;border-radius:6px;outline:none}
+input[type=text],input[type=password]{background:#222;border:1px solid #333;color:#ddd;padding:4px 10px;border-radius:6px;outline:none}
 button.act{background:#24313c;border:1px solid #35505f;color:#9fd3ee;padding:4px 12px;border-radius:6px;font:inherit;cursor:pointer;white-space:nowrap}
 button.act:hover{background:#2c3f4d}
 button.warn{background:#3a2424;border-color:#5f3535;color:#ee9f9f}
@@ -221,6 +383,12 @@ tr:hover td{background:#1d1d1d}
 .risk{white-space:nowrap}
 .risk-READ{color:#7fc98f}.risk-PRIVILEGED_READ{color:#c9c37f}.risk-UNKNOWN{color:#bbb}.risk-MODIFY{color:#e8a86a}.risk-DANGEROUS{color:#e87f7f}
 .bad{color:#e87f7f;font-weight:600}
+/* V0.5.9: a refusal is not a failure — it is the policy working. Kept visually
+   distinct from the .bad class so "stopped" never reads as "crashed". */
+.refused{color:#e8c07f;font-size:10px;border:1px solid #6b5a2f;border-radius:3px;padding:0 3px;margin-left:4px;white-space:nowrap}
+/* V0.5.8: judge marker — 自动 = AUTO_ALLOWED (ran without a human prompt). */
+.judge{color:#999;font-size:10px;border:1px solid #444;border-radius:3px;padding:0 3px;margin-left:4px;white-space:nowrap}
+.judge.auto{color:#7fd1a8;border-color:#2f6b4f}
 .cmd{color:#a8d8a8;word-break:break-all}
 #empty{padding:40px;text-align:center;color:#666}
 .termbox{background:#0d0d0d;border:1px solid #2a2a2a;border-radius:8px;padding:10px;height:calc(100vh - 210px);overflow-y:auto;white-space:pre-wrap;word-break:break-all;font-size:12.5px;line-height:1.45}
@@ -275,18 +443,27 @@ tr:hover td{background:#1d1d1d}
 <header>
   <div class="dot"></div><h1>JumpServer MCP 控制台</h1>
   <nav>
-    <button data-tab="terminal">实时终端</button>
-    <button data-tab="assets">资产</button>
-    <button data-tab="topology">拓扑</button>
-    <button data-tab="jobs">任务</button>
-    <button data-tab="audit">审计日志</button>
-    <button data-tab="stats">统计</button>
-    <button data-tab="sessions">会话</button>
-    <button data-tab="settings">设置</button>
+${navMarkup(visibleTabs)}
   </nav>
+  <select class="instpick" id="instsel" title="工作区内的控制台实例 —— 每个 WorkBuddy 对话对应一个 MCP 进程，各自有独立的会话/终端/审计"></select>
+  <span id="instnote" style="display:none;color:#e8a86a;font-size:12px;white-space:nowrap;flex:none"></span>
   <span id="stat">loading…</span>
 </header>
 <main>
+
+<!-- V0.5.4: another MCP instance (i.e. another WorkBuddy conversation) embedded
+     in full. Its own page injects its own token, so no secret is shared.
+     V0.5.8: this wrapper also carries the case "the instance that asked for
+     this page is not the process serving it" — the title/button say which pid
+     is which instead of calling the requesting conversation a stranger. -->
+<section id="foreign" style="display:none">
+  <div class="fwbar">
+    <b id="fwtitle">正在查看另一个实例</b>
+    <span id="fwmeta"></span>
+    <button id="fwback"><span id="fwbacklabel">切回本对话实例</span>（pid <span id="fwbackpid"></span>）</button>
+  </div>
+  <iframe id="fwframe" title="另一个实例的控制台" referrerpolicy="no-referrer"></iframe>
+</section>
 
 <section id="tab-terminal">
   <div class="sessbar" id="sesschips"></div>
@@ -347,6 +524,7 @@ tr:hover td{background:#1d1d1d}
     <input type="text" id="filter" placeholder="过滤：命令 / 资产 / 操作类型 / 风险 / callId" style="width:280px">
     <button class="act" id="exp-jsonl">导出 JSONL</button>
     <button class="act" id="exp-csv">导出 CSV</button>
+    <button class="act" id="audit-archive">归档审计</button>
     <span style="color:#777;font-size:12px">时间显示时区：${timeZone}（存储为 UTC）</span>
   </div>
   <div class="tw"><table><thead><tr><th style="width:165px">时间</th><th style="width:125px">操作</th><th style="width:185px">目标</th><th style="width:140px">风险 / 结果</th><th>命令</th></tr></thead>
@@ -380,6 +558,8 @@ tr:hover td{background:#1d1d1d}
   <div class="grp"><h3>当前连接</h3><div id="setconn">加载中…</div></div>
   <div class="grp"><h3>策略配置（只在 config.json 中设置）</h3><div id="setpolicy">加载中…</div></div>
   <div class="grp"><h3>已知主机密钥（known_hosts）</h3><div id="sethosts">加载中…</div></div>
+  <div class="grp"><h3>控制台显示的 Tab（取消勾选即隐藏）</h3><div id="settabs">加载中…</div></div>
+  <div class="grp"><h3>JumpServer 账号（多账号）</h3><div id="setaccts">加载中…</div></div>
 </section>
 
 </main>
@@ -387,16 +567,165 @@ tr:hover td{background:#1d1d1d}
 <div id="expired"><div class="t">控制台令牌已过期</div><div class="d">出于安全考虑，本地控制台的访问令牌有时效。请让 AI 重新调用一次 jumpserver_status（或任意工具），然后用新的链接打开控制台。</div><button class="act" id="expired-close">关闭本页</button></div>
 <script>
 var TZ = ${JSON.stringify(timeZone)};
-var tab = (location.hash || '#audit').slice(1);
-var auditAll = [], lastCount = -1;
+/* V0.5.10: which tabs this console shows (config: auditViewer.tabs). The nav
+   above is already rendered from the same list server-side, so VISIBLE and the
+   buttons can never disagree. TAB_LABELS lets the 设置 tab name the hidden
+   ones. Both are inert data — visibility is not an access-control boundary. */
+var VISIBLE = ${JSON.stringify(visibleTabs)};
+var TAB_LABELS = ${JSON.stringify(CONSOLE_TAB_LABELS)};
+/* V0.5.13: which layer decided each tab — 'config' (pinned in config.json, so
+   the switch is rendered locked and disabled), 'local' (this console's own
+   store), 'always' (settings), 'default'. The switches need it to avoid
+   offering a control that cannot win; it is inert data, not a permission. */
+var TAB_SOURCES = ${JSON.stringify(tabSources)};
+/* V0.5.6: 实时终端 is the landing tab. The console exists to be WATCHED while
+   the agent works — the live PTY mirror is what the operator opens it for; the
+   audit table is a lookup, not the reason to look up. A bookmark (no hash)
+   therefore lands on terminal, and an unknown hash falls back to it too. */
+var tab = (location.hash || '#terminal').slice(1);
+/* V0.5.10: the audit table is fetched incrementally and windowed. auditAll is
+   the in-memory window, auditLastIdx the ABSOLUTE index of the newest record
+   seen, auditTotal/auditWindowed mirror the server counters, auditNotice is a
+   one-line status (e.g. the last archive) kept in the status bar. Only
+   AUDIT_RENDER_LIMIT rows are ever built into the DOM — rendering a 5000-row
+   innerHTML on every poll is what made a long-lived console crawl. */
+var auditAll = [], lastCount = -1, auditLastIdx = -1, auditTotal = 0, auditWindowed = false, auditNotice = '';
+var AUDIT_RENDER_LIMIT = 300, AUDIT_PAGE_LIMIT = 1000, AUDIT_BACKFILL_LIMIT = 5000, AUDIT_MEM_LIMIT = 5000;
 var trackedSeq = {}, currentSess = null, sessStatus = {}, termLines = 0;
 var failCount = 0, deadShown = false, expiredShown = false;
 var topo = null, topoPick = null, jobPick = null;
+/* V0.5.4: instance (per-conversation) state. SELFPID is injected by THIS
+   instance's server; the handover URL carries ?inst=<pid> so opening the
+   console from a second conversation lands on that conversation's sessions
+   instead of whichever process owns the shared address.
+   V0.5.8: the process that ANSWERS the shared port is very often not the
+   conversation that asked for the console. OPENPID is the requester (from
+   ?inst=), HANDOVER is that instance's own address once it has one, and
+   「本实例」 means OPENPID — never "whoever answered". Failing to jump, the
+   wrapper says which pid serves the page instead of calling the requester a
+   stranger. */
+var SELFPID = ${JSON.stringify(selfPid)};
+var SELFPORT = ${JSON.stringify(selfPort)};
+var OPENPID = ${JSON.stringify(openPid)};
+var HANDOVER = ${JSON.stringify(handover)};
+var EMBED = (new URLSearchParams(location.search)).get('embed') === '1';
+var HOME = (OPENPID !== null && OPENPID > 0) ? OPENPID : SELFPID;
+var instances = [], selPid = HOME, instReady = false, movedAway = false, shownGone = false, polls = 0;
+function instById(pid){
+  for (var i=0;i<instances.length;i++) if (instances[i].pid === pid) return instances[i];
+  return null;
+}
+/* V0.5.8: 「本实例」= the conversation this tab was opened for; the process that
+   happens to serve the shared port is named for what it is. */
+function instRoleTag(pid){
+  if (pid === HOME) return '本实例';
+  if (pid === SELFPID) return '本页服务进程';
+  var it = instById(pid);
+  return (it !== null && it.role === 'owner') ? '主实例' : '其他实例';
+}
+function instLabel(it){
+  var bits = ['pid ' + it.pid, instRoleTag(it.pid)];
+  if (it.target) bits.push(it.target);
+  if (it.sessions) bits.push('会话 ' + it.sessions);
+  bits.push(it.state || '?');
+  return bits.join(' · ');
+}
+/* Where this browser tab really belongs: the requesting instance's own
+   listener. Recomputed from the live list when the server had no answer yet
+   (a brand-new process publishes its port a moment after it hands out the URL). */
+function handoverUrl(){
+  if (EMBED || movedAway) return null;
+  if (OPENPID === null || OPENPID <= 0 || OPENPID === SELFPID) return null;
+  var it = instById(OPENPID);
+  if (it === null || !it.port || it.port === SELFPORT) return null;
+  return 'http://127.0.0.1:' + it.port + '/?inst=' + it.pid;
+}
+/* Probe before leaving: a dead port must keep the wrapper (an iframe that
+   fails is recoverable, a browser error page is not). /ping is token-free and
+   token-free is safe — it answers 204 and carries no data. */
+function maybeHandover(){
+  var url = HANDOVER || handoverUrl();
+  if (url === null) return false;
+  movedAway = true;
+  fetch(url + (url.indexOf('?') >= 0 ? '&' : '?') + 'ping=1', {mode:'no-cors', cache:'no-store'})
+    .then(function(){ location.replace(url + location.hash); })
+    .catch(function(){ movedAway = false; applyInstance(); });
+  return true;
+}
+function renderInstances(){
+  var el = $('instsel'); if (!el) return;
+  if (EMBED) { el.style.display = 'none'; return; }
+  if (!instances.length) { el.innerHTML = '<option value="' + HOME + '">pid ' + HOME + ' · 本实例</option>'; return; }
+  el.innerHTML = instances.map(function(it){
+    return '<option value="' + it.pid + '"' + (it.pid === selPid ? ' selected' : '') + '>' + esc(instLabel(it)) + '</option>';
+  }).join('');
+}
+function selectInstance(pid){
+  selPid = pid;
+  applyInstance();
+}
+function applyInstance(){
+  var it = instById(selPid);
+  /* A vanished instance falls back to this one rather than showing a dead frame. */
+  if (it === null) { selPid = SELFPID; it = instById(selPid); }
+  var foreign = (selPid !== SELFPID);
+  var nav = document.querySelector('header nav');
+  if (nav) nav.style.display = foreign ? 'none' : '';
+  $('foreign').style.display = foreign ? 'block' : 'none';
+  $('instnote').style.display = 'none';
+  if (foreign && it !== null) {
+    var secs = document.querySelectorAll('main > section');
+    for (var i=0;i<secs.length;i++) secs[i].className = '';
+    var mine = (selPid === HOME);
+    $('fwtitle').textContent = mine
+      ? '正在显示本对话实例（pid ' + it.pid + '）的控制台'
+      : '正在查看另一个实例（pid ' + it.pid + '）的控制台';
+    $('fwmeta').textContent = mine
+      ? '本页由 pid ' + SELFPID + ' 的服务进程应答；终端 / 审计 / 会话标签属于它，所以这里整页嵌入了 pid ' + it.pid + ' 自己的控制台，按钮与中断只作用于它。'
+      : (it.target ? '目标 ' + it.target + ' · ' : '') +
+        '该实例属于另一个对话，它有自己的会话与审计；此处的「中断 / 断开」只作用于它。';
+    $('fwbacklabel').textContent = mine ? '切换到本页服务进程' : '切回本对话实例';
+    $('fwbackpid').textContent = String(mine ? SELFPID : HOME);
+    var f = $('fwframe');
+    var want = it.url + '?inst=' + it.pid + '&embed=1';
+    if (f.getAttribute('src') !== want) f.setAttribute('src', want);
+  } else {
+    var f2 = $('fwframe');
+    if (f2 && f2.getAttribute('src')) f2.removeAttribute('src');
+    if (HOME !== SELFPID) {
+      /* The requested instance is gone. Say it, instead of presenting another
+         conversation's console as if it were this conversation's. */
+      $('instnote').textContent = '本对话实例（pid ' + HOME + '）已退出 · 现显示 pid ' + SELFPID + '（本页服务进程）';
+      $('instnote').style.display = '';
+    }
+    showTab(tab);
+  }
+  renderInstances();
+}
+function pollInstances(){
+  return F('/api/instances').then(function(r){return r.json();}).then(function(j){
+    if (!j || !j.instances) return;
+    instances = j.instances;
+    polls += 1;
+    var first = !instReady;
+    instReady = true;
+    // Give a just-started process two ticks to publish its port before calling
+    // the requested instance dead — otherwise a fresh conversation sees a
+    // 「已退出」 notice about itself for one poll interval.
+    var gone = (HOME !== SELFPID) && (instById(HOME) === null) && polls >= 2;
+    if (maybeHandover()) return;
+    if (first || gone !== shownGone) { shownGone = gone; applyInstance(); return; }
+    renderInstances();
+  }).catch(function(){});
+}
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function stripAnsi(s){return String(s == null ? '' : s).replace(/\\x1b\\[[0-9;?]*[A-Za-z]/g,'').replace(/[\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f]/g,'');}
 function shortId(id){return id.length > 22 ? id.slice(0,8) + '…' + id.slice(-10) : id;}
-function labelId(id){return id === 'anonymous' ? '当前对话' : shortId(id);}
+/* V0.5.4: 'anonymous' is the PTY session id, not the chat conversation — the
+   old wording made operators read another conversation's terminal as their own.
+   (Do not spell that old label here: this comment ships inside the page.) */
+function labelId(id){return id === 'anonymous' ? '当前会话' : shortId(id);}
 /* V0.4.0: storage is UTC, display is the configured zone. */
 var dtf = null;
 try { dtf = new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}); } catch(e) { dtf = null; }
@@ -451,7 +780,18 @@ function POST(u,body){
 }
 
 /* ---- tabs ---- */
+/* V0.5.10: a tab outside VISIBLE is unreachable. Mirrors pickLandingTab()
+   (src/runtime/console-tabs.ts): honour the request only when it names a
+   visible tab, otherwise land on the first one. Guarding HERE — not just in
+   the click handlers — is what keeps a hand-edited #hash from selecting a
+   hidden section, and it keeps every poller's own tab!==xxx gate shut for
+   tabs that are switched off. */
+function landingTab(name){
+  if (VISIBLE.length === 0) return 'terminal';
+  return VISIBLE.indexOf(name) >= 0 ? name : VISIBLE[0];
+}
 function showTab(name){
+  name = landingTab(name);
   tab = name; location.hash = name;
   var secs = document.querySelectorAll('section');
   for (var i=0;i<secs.length;i++) secs[i].className = (secs[i].id === 'tab-'+name) ? 'on' : '';
@@ -469,7 +809,39 @@ var navBtns = document.querySelectorAll('nav button');
 for (var b=0;b<navBtns.length;b++){
   (function(btn){btn.addEventListener('click',function(){showTab(btn.getAttribute('data-tab'));});})(navBtns[b]);
 }
-showTab(['terminal','assets','topology','jobs','audit','stats','sessions','settings'].indexOf(tab)>=0?tab:'audit');
+showTab(tab);
+
+/* V0.5.4: instance picker wiring. The handover URL carries ?inst=<pid>, so the
+   conversation that asked for the console lands on its OWN instance; a plain
+   bookmark (no ?inst) keeps showing whichever process owns the address.
+   V0.5.8: 「切回本对话实例」 returns to OPENPID (the asking conversation), not to
+   whoever answered the shared port. */
+$('instsel').addEventListener('change', function(){ selectInstance(Number(this.value)); });
+$('fwback').addEventListener('click', function(){ selectInstance(selPid === HOME ? SELFPID : HOME); });
+pollInstances();
+every(5000, pollInstances);
+
+/* ---- V0.5.2: visibility gate -------------------------------------------
+   Each poller already self-gates on its OWN tab, so an inactive tab costs
+   nothing. What leaked was a HIDDEN page: a console left in a background
+   tab (or a minimised window) with, say, the audit tab selected kept
+   fetching every second and re-reading audit.jsonl with nobody looking —
+   for as long as the tab stayed open. One scheduler, one rule: a page
+   nobody can see does not poll. */
+function every(ms, fn){
+  setInterval(function(){ if (document.hidden) return; fn(); }, ms);
+}
+/* A tab switch already polls (showTab), but coming BACK to a backgrounded
+   page does not, so the user would stare at stale data for up to 3s. */
+var POLLERS = { terminal:pollTerminal, topology:pollTopology, jobs:pollJobs, audit:pollAudit, stats:pollStats, sessions:pollSessions, assets:pollAssets, settings:pollSettings };
+document.addEventListener('visibilitychange', function(){
+  if (document.hidden) return;
+  /* terminal keeps a self-rescheduling loop of its own; poking it here would
+     start a SECOND chain, so it refreshes on its own next tick (<=1s). */
+  if (tab === 'terminal') return;
+  var refresh = POLLERS[tab];
+  if (refresh) refresh();
+});
 
 /* ---- terminal ---- */
 function renderChips(list){
@@ -506,7 +878,8 @@ function appendTerm(sess, events){
   if (stick && $('autoscroll').checked) box.scrollTop = box.scrollHeight;
 }
 function pollTerminal(){
-  if (tab!=='terminal'){setTimeout(pollTerminal,1000);return;}
+  /* V0.5.2: hidden page = nobody reading the mirror, so skip the fetch too. */
+  if (document.hidden || tab!=='terminal'){setTimeout(pollTerminal,1000);return;}
   var min = Infinity;
   for (var k in trackedSeq) if (trackedSeq[k]<min) min=trackedSeq[k];
   F('/api/terminal?since='+(min===Infinity?0:min)).then(function(r){return r.json();}).then(function(j){
@@ -617,10 +990,11 @@ if (assRefresh) assRefresh.addEventListener('click', function(){ pollAssets(); }
 function srcLabel(s){
   if (s==='env') return 'WorkBuddy 环境变量';
   if (s==='config') return 'config.json';
+  if (s==='profile') return '已选账号';
   return '默认值';
 }
 function srcChip(s){
-  var color = s==='env' ? '#5c9' : (s==='config' ? '#7ab' : '#888');
+  var color = s==='env' ? '#5c9' : (s==='config' ? '#7ab' : (s==='profile' ? '#c9a86a' : '#888'));
   return '<span style="color:'+color+'">'+srcLabel(s)+'</span>';
 }
 function kvTable(rows){
@@ -666,11 +1040,277 @@ function renderSettings(j){
       return [k, '<span style="color:#8ab">'+esc(r.fingerprint)+'</span>', '<span style="color:#777">'+esc(r.algorithm||'')+' · '+esc(r.source)+'</span>'];
     })) + '<div style="color:#777;font-size:12px;margin-top:6px">'+esc(j.knownHosts.path)+'</div>';
   }
+  renderAccounts(j.accounts);
+  // V0.5.13: redraw the tab switches from the live payload, so a config edit or
+  // another instance's toggle shows up on the next poll instead of being frozen
+  // into the HTML the page was born with. If the resolved list actually CHANGED
+  // (another console sharing the same prefs file), rebuild the nav too — the
+  // expensive apply only runs on a real change, never on every 5s poll.
+  var visibleBefore = VISIBLE.join(',');
+  renderVisibleTabs(j.consoleTabs);
+  if (VISIBLE.join(',') !== visibleBefore) applyVisibleTabs();
 }
 function pollSettings(){
   if (tab!=='settings') return;
   F('/api/settings').then(function(r){return r.json();}).then(function(j){ renderSettings(j); }).catch(function(){});
 }
+/* V0.5.13: the tab switches. V0.5.10 shipped these as a read-only report, which
+   was the wrong call — the field request was explicitly "a switch in 设置", and
+   a report that says "config.json controls this" without saying how leaves the
+   operator exactly where they started. So: real checkboxes, persisted to the
+   console's own store via POST /api/console/tabs, EXCEPT where config.json
+   pins the tab — those rows are rendered locked and disabled, because a control
+   that cannot win is worse than no control.
+   Applying a change never edits VISIBLE locally from a guess: the server
+   returns the authoritative visible list + sources, and this re-renders the nav
+   and the sections from that. One source of truth, still. */
+function tabSourceOf(id){ return TAB_SOURCES[id] || 'default'; }
+function tabLockReason(id, src){
+  if (src === 'always') return '（「设置」不可隐藏：它是唯一的诊断与说明入口）';
+  if (src === 'config') return '（已被 config.json 的 auditViewer.tabs 固定，修改请改配置文件）';
+  return '';
+}
+function renderVisibleTabs(report){
+  var el = $('settabs'); if (!el) return;
+  if (report){
+    if (report.visible) VISIBLE = report.visible;
+    if (report.sources) TAB_SOURCES = report.sources;
+  }
+  var all = Object.keys(TAB_LABELS);
+  var html = '<div style="font-size:12px;line-height:1.8;margin-bottom:8px">显示 '
+    + '<b style="color:#ccc">'+VISIBLE.length+'</b> / '+all.length
+    + ' —— 取消勾选即从导航栏移除该 Tab。这只影响控制台的显示与前端轮询：'
+    + '审计照旧落盘，权限门禁与全部 /api/ 接口不受影响。</div>';
+  for (var i=0;i<all.length;i++){
+    var id = all[i];
+    var src = tabSourceOf(id);
+    var shown = VISIBLE.indexOf(id) >= 0;
+    var locked = (src === 'config' || src === 'always');
+    html += '<label style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:12px'
+      + (locked ? ';opacity:.6' : ';cursor:pointer') + '">'
+      + '<input type="checkbox" data-tab-toggle="'+esc(id)+'"'
+      + (shown ? ' checked' : '') + (locked ? ' disabled' : '') + '>'
+      + '<span style="color:#ccc">'+esc(TAB_LABELS[id]||id)+'</span>'
+      + '<span style="color:#777">'+esc(tabLockReason(id, src))+'</span>'
+      + '</label>';
+  }
+  var st = report && report.integrity;
+  if (st && st.broken){
+    html += '<div style="background:#3a2424;border:1px solid #5f3535;color:#ee9f9f;border-radius:6px;padding:8px 12px;margin-top:8px">'
+      + '偏好文件无法读取：'+esc(st.message||'未知原因')
+      + ' —— 为避免覆盖可能仍可恢复的数据，写入已被拒绝（当前按默认值显示）。请修复或删除该文件：'
+      + esc((report && report.storePathHint)||'~/.workbuddy/jumpserver-mcp/console-prefs.json')+'</div>';
+  } else {
+    html += '<div style="font-size:12px;color:#777;margin-top:8px">勾选结果保存在本机 '
+      + esc((report && report.storePathHint)||'~/.workbuddy/jumpserver-mcp/console-prefs.json')
+      + '，不写回 config.json。config.json 里显式写过的项优先级更高，会显示为不可改。</div>';
+  }
+  html += '<div id="tab-msg" style="font-size:12px;margin-top:6px;color:#888"></div>';
+  el.innerHTML = html;
+  wireVisibleTabs(el);
+}
+function tabMsg(text, ok){
+  var m = $('tab-msg'); if (!m) return;
+  m.textContent = text || '';
+  m.style.color = ok ? '#7fc98f' : '#e8a86f';
+}
+function tabErrText(code){
+  if (code==='PREFS_FILE_UNREADABLE') return '偏好文件损坏，已拒绝写入';
+  if (code==='PREFS_WRITE_FAILED') return '写入失败（目录不可写？）';
+  if (code==='TAB_ALWAYS_VISIBLE') return '该 Tab 不可隐藏';
+  if (code==='INVALID_ARGUMENT') return '未知的 Tab';
+  if (code==='NOT_AVAILABLE') return '该控制台未接入运行时';
+  return code || '未知错误';
+}
+/* Rebuild the nav from the server's authoritative list, re-bind its clicks
+   (innerHTML replaced the old buttons and their listeners), then re-land on the
+   current tab — which may itself have just been hidden. Section visibility is
+   NOT touched here: showTab() owns it via the "on" class, so there is still
+   exactly one mechanism deciding which section is on screen. */
+function applyVisibleTabs(){
+  var nav = document.querySelector('nav');
+  if (nav){
+    var html = '';
+    for (var i=0;i<VISIBLE.length;i++){
+      html += '<button data-tab="'+esc(VISIBLE[i])+'">'+esc(TAB_LABELS[VISIBLE[i]]||VISIBLE[i])+'</button>';
+    }
+    nav.innerHTML = html;
+    var btns = nav.querySelectorAll('button');
+    for (var b=0;b<btns.length;b++){
+      (function(btn){btn.addEventListener('click',function(){showTab(btn.getAttribute('data-tab'));});})(btns[b]);
+    }
+  }
+  showTab(tab);
+}
+function wireVisibleTabs(el){
+  var boxes = el.querySelectorAll('[data-tab-toggle]');
+  for (var i=0;i<boxes.length;i++){
+    boxes[i].addEventListener('change', function(){
+      var id = this.getAttribute('data-tab-toggle');
+      var want = !this.checked; /* checkbox checked = visible */
+      POST('/api/console/tabs',{id:id, hidden:want}).then(function(r){return r.json();}).then(function(j){
+        if (j && j.ok===false){ tabMsg('保存失败：'+tabErrText(j.error), false); pollSettings(); return; }
+        renderVisibleTabs(j);
+        applyVisibleTabs();
+        tabMsg('已保存：'+esc(TAB_LABELS[id]||id)+(want?' 已隐藏':' 已显示'), true);
+      }).catch(function(){ tabMsg('保存失败：请求未送达', false); });
+    });
+  }
+}
+renderVisibleTabs();
+
+/* V0.5.11: multi-account block. The list comes from /api/settings (redacted
+   ProfileView fields only — no token, no plaintext). Writes go to the three
+   /api/accounts/* POST routes, all gated by the console token AND the /api/*
+   same-origin gate like every other console endpoint. allowCredentialWrite=false
+   renders the list read-only; a
+   broken profiles file is reported loudly and the form is withheld, because the
+   store would refuse the write anyway. */
+function acctMsg(text, ok){
+  var m = $('acct-msg'); if (!m) return;
+  m.textContent = text || '';
+  m.style.color = ok ? '#7fc98f' : '#e8a86f';
+}
+function renderAccounts(acc){
+  var el = $('setaccts'); if (!el) return;
+  if (!acc){ el.innerHTML = '<span style="color:#666">控制台没有拿到账号信息（audit-only 模式）。</span>'; return; }
+  var list = acc.profiles || [];
+  var allowWrite = acc.allowWrite !== false;
+  var broken = !!(acc.integrity && acc.integrity.broken);
+  var html = '<div style="font-size:12px;color:#888;line-height:1.7;margin-bottom:8px">'
+    + '密码以 AES-256-GCM 加密保存在本机 '+esc(acc.storePathHint||'~/.workbuddy/jumpserver-mcp/profiles.json')
+    + '（密钥为同目录 vault.key），不上传、不回显；切换账号会断开当前所有堡垒机会话，下次调用工具时按新账号（主机 / 用户名 / 密码）重连。'
+    + '</div>';
+  if (broken){
+    html += '<div style="background:#3a2424;border:1px solid #5f3535;color:#ee9f9f;border-radius:6px;padding:8px 12px;margin-bottom:10px">'
+      + '账号文件无法读取：'+esc((acc.integrity&&acc.integrity.message)||'未知原因')
+      + ' —— 为避免覆盖可能仍可恢复的数据，写入已被拒绝；请修复或移除该文件后重试。</div>';
+  }
+  if (!allowWrite){
+    html += '<div style="color:#e8a86a;font-size:12px;margin-bottom:10px">本机控制台已关闭凭据写入（config.json 的 auditViewer.allowCredentialWrite = false），下方仅只读展示。</div>';
+  }
+  if (!list.length){
+    html += '<div style="color:#666">暂无账号。'+(allowWrite?'可在下方新增。':'')+'</div>';
+  } else {
+    html += '<div class="tw"><table><thead><tr><th style="width:180px">标签</th><th style="width:280px">用户名@主机:端口</th>'
+      + '<th style="width:110px">凭据</th><th style="width:90px">当前</th><th></th></tr></thead><tbody>';
+    list.forEach(function(p){
+      var cur = p.active ? '<span style="color:#7fc98f">当前</span>' : '';
+      var ops = '';
+      if (allowWrite && !broken){
+        if (!p.active) ops += '<button class="act" data-acct-activate="'+esc(p.id)+'">设为当前</button> ';
+        ops += '<button class="act" data-acct-edit="'+esc(p.id)+'">编辑</button> ';
+        ops += '<button class="act warn" data-acct-remove="'+esc(p.id)+'">删除</button>';
+      }
+      html += '<tr><td>'+esc(p.label)+'</td>'
+        + '<td style="font-family:ui-monospace,Consolas,monospace">'+esc(p.username)+'@'+esc(p.host)+':'+esc(p.port)+'</td>'
+        + '<td>'+esc(p.hasSecret?'已保存':'未保存')+'</td>'
+        + '<td>'+cur+'</td>'
+        + '<td>'+ops+'</td></tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+  if (allowWrite && !broken){
+    html += '<div style="margin-top:12px">'
+      + '<div style="color:#ccc;font-size:12px;margin-bottom:6px">新增 / 编辑账号</div>'
+      + '<input type="hidden" id="acct-id">'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+      + '<input type="text" id="acct-label" placeholder="标签（如：生产维护账号）" style="width:200px">'
+      + '<input type="text" id="acct-host" placeholder="堡垒机地址" style="width:170px">'
+      + '<input type="text" id="acct-port" placeholder="端口" value="2222" style="width:80px">'
+      + '<input type="text" id="acct-user" placeholder="用户名" style="width:140px">'
+      + '<input type="password" id="acct-pass" placeholder="密码（留空表示不改动已有凭据）" style="width:250px" autocomplete="new-password">'
+      + '<button class="act" id="acct-save">保存</button>'
+      + '<button class="act" id="acct-clear">清空表单</button>'
+      + '</div>'
+      + '<div id="acct-msg" style="font-size:12px;margin-top:6px;color:#888"></div>'
+      + '</div>';
+  }
+  el.innerHTML = html;
+  wireAccounts(el, acc);
+}
+function acctErrText(code){
+  if (code==='CREDENTIAL_WRITE_DISABLED') return '凭据写入已关闭';
+  if (code==='PROFILES_FILE_UNREADABLE') return '账号文件无法写入';
+  if (code==='PROFILE_NOT_FOUND') return '账号不存在';
+  if (code==='INVALID_ARGUMENT') return '请填写标签 / 地址 / 用户名，端口需为 1-65535';
+  return code || '未知错误';
+}
+/* V0.5.12: the delete route now reports WHY it failed. Keep the delete button's
+   copy specific instead of the shared generic text, and fall back to the common
+   mapping for anything unrecognised. */
+function acctDelErrText(code){
+  if (code==='PROFILE_NOT_FOUND') return '账号不存在';
+  if (code==='PROFILES_FILE_UNREADABLE') return '账号文件损坏，已拒绝写入';
+  if (code==='CREDENTIAL_WRITE_DISABLED') return '写入已关闭';
+  return acctErrText(code);
+}
+function wireAccounts(el, acc){
+  var acts = el.querySelectorAll('[data-acct-activate]');
+  for (var i=0;i<acts.length;i++){
+    acts[i].addEventListener('click', function(){
+      var id = this.getAttribute('data-acct-activate');
+      POST('/api/accounts/activate',{id:id}).then(function(r){return r.json();}).then(function(j){
+        if (j && j.ok===false){ acctMsg('切换失败：'+acctErrText(j.error), false); return; }
+        pollSettings();
+      }).catch(function(){});
+    });
+  }
+  var edits = el.querySelectorAll('[data-acct-edit]');
+  for (var e=0;e<edits.length;e++){
+    edits[e].addEventListener('click', function(){
+      var id = this.getAttribute('data-acct-edit');
+      var p = null;
+      for (var x=0;x<(acc.profiles||[]).length;x++){ if (acc.profiles[x].id===id) p = acc.profiles[x]; }
+      if (!p) return;
+      if ($('acct-id')) $('acct-id').value = p.id;
+      if ($('acct-label')) $('acct-label').value = p.label || '';
+      if ($('acct-host')) $('acct-host').value = p.host || '';
+      if ($('acct-port')) $('acct-port').value = String(p.port || 2222);
+      if ($('acct-user')) $('acct-user').value = p.username || '';
+      if ($('acct-pass')) $('acct-pass').value = '';
+      acctMsg('编辑「'+(p.label||'')+'」：密码留空表示不改动。', true);
+    });
+  }
+  var dels = el.querySelectorAll('[data-acct-remove]');
+  for (var d=0;d<dels.length;d++){
+    dels[d].addEventListener('click', function(){
+      var id = this.getAttribute('data-acct-remove');
+      POST('/api/accounts/remove',{id:id}).then(function(r){return r.json();}).then(function(j){
+        if (j && j.ok===false){ acctMsg('删除失败：'+acctDelErrText(j.error), false); return; }
+        pollSettings();
+      }).catch(function(){});
+    });
+  }
+  var save = $('acct-save');
+  if (save) save.addEventListener('click', function(){
+    var passEl = $('acct-pass');
+    var body = {
+      id: ($('acct-id') && $('acct-id').value) ? $('acct-id').value : undefined,
+      label: $('acct-label') ? $('acct-label').value : '',
+      host: $('acct-host') ? $('acct-host').value : '',
+      port: $('acct-port') ? Number($('acct-port').value) : 0,
+      username: $('acct-user') ? $('acct-user').value : '',
+      password: (passEl && passEl.value.length > 0) ? passEl.value : undefined
+    };
+    POST('/api/accounts/save',body).then(function(r){return r.json();}).then(function(j){
+      if (j && j.ok===false){ acctMsg('保存失败：'+acctErrText(j.error), false); return; }
+      acctMsg('已保存。切换账号会断开当前会话。', true);
+      pollSettings();
+    }).catch(function(){});
+  });
+  var clear = $('acct-clear');
+  if (clear) clear.addEventListener('click', function(){
+    if ($('acct-id')) $('acct-id').value = '';
+    if ($('acct-label')) $('acct-label').value = '';
+    if ($('acct-host')) $('acct-host').value = '';
+    if ($('acct-port')) $('acct-port').value = '2222';
+    if ($('acct-user')) $('acct-user').value = '';
+    if ($('acct-pass')) $('acct-pass').value = '';
+    acctMsg('', true);
+  });
+}
+
 var setRefresh = $('set-refresh');
 if (setRefresh) setRefresh.addEventListener('click', function(){ pollSettings(); });
 
@@ -722,7 +1362,7 @@ function pollTopology(){
   }).catch(function(){});
 }
 $('topo-refresh').addEventListener('click',pollTopology);
-setInterval(pollTopology,3000);
+every(3000, pollTopology);
 
 /* ---- jobs (V0.4.0) ---- */
 function renderJobs(list){
@@ -753,13 +1393,16 @@ function pollJobs(){
   F('/api/jobs').then(function(r){return r.json();}).then(function(list){renderJobs(list||[]);}).catch(function(){});
 }
 $('jobs-refresh').addEventListener('click',pollJobs);
-setInterval(pollJobs,1000);
+every(1000, pollJobs);
 
 /* ---- audit ---- */
 function renderAudit(){
   var q=$('filter').value.toLowerCase();
   var list=q?auditAll.filter(function(e){return JSON.stringify(e).toLowerCase().indexOf(q)>=0;}):auditAll;
-  var rows=list.slice().reverse().map(function(e){
+  /* V0.5.10: build at most the newest AUDIT_RENDER_LIMIT rows into the DOM
+     (newest first). The filter still runs over the whole in-memory window. */
+  var shown=list.slice(Math.max(0,list.length-AUDIT_RENDER_LIMIT)).reverse();
+  var rows=shown.map(function(e){
     var tgt=e.target||e.hostname||'-';
     var cmd=e.redactedCommand||e.command||'-';
     var risk=esc(e.risk||'?');
@@ -767,26 +1410,55 @@ function renderAudit(){
     // non-zero exit is a FAILED command and must not look healthy.
     var status=String(e.result||'?');
     var exitN=e.exitCode;
-    var bad=(status!=='SUCCESS'&&status!=='COMPLETED'&&status!=='ok'&&status!=='RUNNING'&&status!=='')
-      || (typeof exitN==='number'&&exitN!==0);
+    /* V0.5.9: BLOCKED (rules said no) and DENIED (no approval) are refusals —
+       they never produced an exit code, so they must not render as failures. */
+    var refused=(status==='BLOCKED'||status==='DENIED');
+    var bad=!refused&&((status!=='SUCCESS'&&status!=='COMPLETED'&&status!=='ok'&&status!=='RUNNING'&&status!=='')
+      ||(typeof exitN==='number'&&exitN!==0));
+    var refusedTag=refused?' <span class="refused" title="'+esc(String(e.refusalReason||''))+'">'+(status==='BLOCKED'?'已拦截':'未批准')+'</span>':'';
+    /* V0.5.8: a command the semantic judge cleared without asking is marked, so
+       "why was there no prompt" is answerable from the audit table itself. */
+    var judge=(typeof e.riskJudge==='string'&&e.riskJudge.length>0)?String(e.riskJudge):'';
+    var auto=judge.indexOf('AUTO_ALLOWED')===0;
+    var judgeTag=judge?' <span class="judge'+(auto?' auto':'')+'" title="'+esc(judge)+'">'+(auto?'JEV 自动':'JEV 参考')+'</span>':'';
     return '<tr><td class="time">'+esc(fmtTime(e.timestamp))+'</td>'
       +'<td class="op">'+esc(e.operation)+'</td>'
       +'<td class="tgt" title="'+esc(tgt)+'">'+esc(tgt)+'</td>'
-      +'<td class="risk risk-'+risk+'">'+risk+' / '+esc(status)+(bad?' <span class="bad">exit '+esc(String(exitN!=null?exitN:'?'))+'</span>':'')+'</td>'
+      +'<td class="risk risk-'+risk+'">'+risk+' / '+esc(status)+(bad?' <span class="bad">exit '+esc(String(exitN!=null?exitN:'?'))+'</span>':'')+refusedTag+judgeTag+'</td>'
       +'<td class="cmd">'+esc(cmd)+'</td></tr>';
   }).join('');
   $('rows').innerHTML=rows;
   $('empty').style.display=list.length?'none':'block';
-  $('stat').textContent='审计 '+auditAll.length+' 条'+(q?' / 匹配 '+list.length:'');
+  var stat='审计：匹配 '+list.length+' 条 / 显示最近 '+shown.length+' 条 / 共 '+auditTotal+' 条';
+  if (auditWindowed) stat+=' · 更早记录已淘汰或归档';
+  if (auditNotice) stat+=' · '+auditNotice;
+  $('stat').textContent=stat;
   lastCount=auditAll.length;
 }
 function pollAudit(){
   if (tab!=='audit') return;
-  F('/api/entries').then(function(r){return r.json();}).then(function(j){
-    if (j.length!==auditAll.length){auditAll=j;renderAudit();}else{auditAll=j;}
+  var first=auditLastIdx<0;
+  var limit=first?AUDIT_BACKFILL_LIMIT:AUDIT_PAGE_LIMIT;
+  var prevTotal=auditTotal, prevIdx=auditLastIdx;
+  /* V0.5.10: incremental fetch keyed on the ABSOLUTE index, not the array
+     length. The old code re-requested the whole ring every second and, once the
+     ring hit its cap, the length stopped changing so new records never showed. */
+  F('/api/entries?since='+auditLastIdx+'&limit='+limit).then(function(r){return r.json();}).then(function(j){
+    if (!j || typeof j.items==='undefined'){
+      /* Older server: a plain array. Rebuild and render (compat path). */
+      auditAll=j||[]; auditTotal=auditAll.length; auditWindowed=false;
+      auditLastIdx=auditAll.length-1; renderAudit(); return;
+    }
+    var got=j.items.length;
+    if (got>0) for (var i=0;i<got;i++) auditAll.push(j.items[i]);
+    if (typeof j.nextIndex==='number'&&j.nextIndex>auditLastIdx) auditLastIdx=j.nextIndex;
+    var total=(typeof j.total==='number')?j.total:prevTotal;
+    auditTotal=total; auditWindowed=(j.windowed===true);
+    if (auditAll.length>AUDIT_MEM_LIMIT) auditAll=auditAll.slice(-AUDIT_MEM_LIMIT);
+    if (got>0||total!==prevTotal||auditLastIdx!==prevIdx||first) renderAudit();
   }).catch(function(){});
 }
-setInterval(pollAudit,1000);
+every(1000, pollAudit);
 $('filter').addEventListener('input',renderAudit);
 function download(name,mime,text){
   var a=document.createElement('a');
@@ -797,11 +1469,24 @@ $('exp-jsonl').addEventListener('click',function(){
   download('jumpserver-audit.jsonl','application/json',auditAll.map(function(e){return JSON.stringify(e);}).join('\\n'));
 });
 $('exp-csv').addEventListener('click',function(){
-  var cols=['timestamp','operation','actor','target','hostname','risk','result','exitCode','durationMs','toolCallId','batchId','taskId','redactedCommand'];
+  var cols=['timestamp','operation','actor','target','hostname','risk','result','exitCode','durationMs','toolCallId','batchId','taskId','riskJudge','refusalReason','redactedCommand'];
   var q=function(v){v=v==null?'':String(v);return /[",\\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
   var lines=[cols.join(',')];
   auditAll.forEach(function(e){lines.push(cols.map(function(c){return q(e[c]);}).join(','));});
   download('jumpserver-audit.csv','text/csv','\\ufeff'+lines.join('\\n'));
+});
+/* V0.5.10: rotate the live audit file server-side. The archived file stays on
+   disk (never deleted); new records go to a fresh audit.jsonl. */
+$('audit-archive').addEventListener('click',function(){
+  var ok=window.confirm('归档审计：\\n1) 先把已排队的记录全部落盘；\\n2) 把当前 audit.jsonl 重命名为带 UTC 时间戳的归档文件（例如 audit.2026-01-01T00-00-00-000Z.jsonl）；\\n3) 之后的新记录写入一个全新的 audit.jsonl。\\n归档文件不会被删除。是否继续？');
+  if(!ok) return;
+  POST('/api/audit/archive').then(function(r){return r.json();}).then(function(j){
+    auditAll=[]; auditLastIdx=-1; auditTotal=0; auditWindowed=false;
+    if (j&&j.archived) auditNotice='已归档 '+j.records+' 条 → '+j.file;
+    else auditNotice='归档未执行（没有可归档的审计文件）';
+    renderAudit();
+    pollAudit();
+  }).catch(function(){ auditNotice='归档失败'; renderAudit(); });
 });
 
 /* ---- stats ---- */
@@ -834,7 +1519,7 @@ function pollStats(){
     bars($('by-day'),s.byDay.slice(-14));
   }).catch(function(){});
 }
-setInterval(pollStats,3000);
+every(3000, pollStats);
 
 /* ---- sessions ---- */
 function pollSessions(){
@@ -868,7 +1553,7 @@ function pollSessions(){
     }
   }).catch(function(){});
 }
-setInterval(pollSessions,2000);
+every(2000, pollSessions);
 $('close-all').addEventListener('click',function(){
   if (!confirm('断开全部 JumpServer 会话？')) return;
   POST('/api/sessions/close',{all:true}).then(function(){pollSessions();}).catch(function(){});
@@ -884,6 +1569,28 @@ $('interrupt-all').addEventListener('click',function(){
 function sendJson(res: import('node:http').ServerResponse, data: unknown): void {
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
   res.end(JSON.stringify(data))
+}
+
+/**
+ * V0.5.10: paging over a plain array, used only on the no-AuditStore fallback
+ * path (`readAuditEntries`). Here an array position IS the absolute index,
+ * since the whole file was just parsed.
+ */
+function paginateArray(
+  list: Record<string, unknown>[],
+  since: number,
+  limit: number,
+): { items: Record<string, unknown>[]; total: number; nextIndex: number; windowed: boolean; firstIndex: number } {
+  const total = list.length
+  const start = Math.max(0, since + 1)
+  const items = start >= total ? [] : list.slice(start, start + limit)
+  return {
+    items,
+    total,
+    nextIndex: items.length > 0 ? start + items.length - 1 : since,
+    windowed: false,
+    firstIndex: 0,
+  }
 }
 
 function readBody(req: import('node:http').IncomingMessage): Promise<Record<string, unknown>> {
@@ -967,7 +1674,7 @@ function topologyRoles(store: TopologyStore | null): Record<string, string[]> {
  * result" reading that made the model park the URL until the task was over.
  */
 export function consoleHintForModel(): string | null {
-  const url = auditViewerUrl()
+  const url = advertisedConsoleUrl()
   if (url === null || hintEnabled !== true) return null
   hintEmitted += 1
   return (
@@ -975,6 +1682,8 @@ export function consoleHintForModel(): string | null {
     '这是「启动阶段」的界面交接，不是任务结果汇报 —— 请在执行第一条远程命令之前就调用 present_files 打开它。' +
     '等到任务快结束才打开就晚了：那时进程可能已经退出，页面只会显示「工作台已失效」。\n' +
     '地址固定（V0.5.1 起不含令牌、也不随进程退出而失效），可以直接打开或收藏。\n' +
+    'V0.5.8：地址末尾的 ?inst= 是本对话实例编号 —— 页面会自动定位到你自己那个实例（它有自己的终端 / 审计 / 会话），' +
+    '同一个工作区的其他实例属于别的对话，顶部切换器可切换，中断 / 断开只作用于所选实例。\n' +
     '禁止改用系统浏览器打开（不要 rundll32 / start / explorer / 外部浏览器）。'
   )
 }
@@ -1002,6 +1711,11 @@ export function startAuditViewer(
   consoleOpened = false
   hintEmitted = 0
   consoleBound = false
+  // V0.5.4: instance bookkeeping — see ConsoleRole. The registry is kept so the
+  // heartbeat can publish this instance's live target/state for the picker.
+  consoleRole = 'none'
+  consoleFollowerPort = 0
+  liveRegistry = registry
   consoleDir = join(dirname(auditPath), 'consoles')
   consoleStartedAt = new Date().toISOString()
   const ttlMinutes = opts.tokenTtlMinutes
@@ -1012,26 +1726,38 @@ export function startAuditViewer(
   const assets = services.assets ?? null
   const baselines = services.baselines ?? null
   const timeZone = services.timeZone ?? 'Asia/Shanghai'
-  const server = http.createServer((req, res) => {
+  // V0.5.4: one request handler, shared by the public (stable-address) listener
+  // and — when we lose the port race — the follower's private loopback listener.
+  // Both serve the identical page; only the advertised address differs.
+  const handler = (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse): void => {
     void (async () => {
       const target = req.url ?? '/'
       const href = target.split('?')[0] ?? '/'
       const query = new URLSearchParams(target.split('?')[1] ?? '')
+      // V0.5.8: token-free liveness probe, used by a console page to decide
+      // whether it may hand the browser over to another instance's listener (a
+      // dead port must keep the wrapper) and by the tests. 204, no body, no
+      // data — it says nothing an audit-enabled reader could learn from.
+      if (href === '/ping') {
+        res.writeHead(204, { 'cache-control': 'no-store' })
+        res.end()
+        return
+      }
       // V0.4.1: /api/* must present the token (query or header).
       // V0.4.2: an expired token is rejected with a distinct marker so the page
       // can show "console expired" instead of a generic failure.
       // V0.5.1: in stable-address mode `GET /` is exempt — the page is static
       // and carries no audit data, and it receives the token as an injected
-      // constant rather than a query parameter. Cross-origin callers are still
-      // refused outright, so a web page in the local browser cannot read the
-      // audit trail or reach /api/interrupt.
+      // constant rather than a query parameter. A cross-origin PAGE LOAD is
+      // still refused (see isCrossOrigin), so a web page in the local browser
+      // cannot read the audit trail or reach /api/interrupt.
+      // V0.5.12: /api/* is same-origin only — see the check below. A token on
+      // its own is no longer enough: a cross-origin caller is refused outright,
+      // while requests that carry no Origin at all (curl, the host preview
+      // panel, the model's programmatic calls) remain token-gated as before.
       const presented = query.get('token') ?? (typeof req.headers[TOKEN_HEADER] === 'string' ? (req.headers[TOKEN_HEADER] as string) : null)
       const isPageLoad = (req.method === 'GET' || req.method === 'HEAD') && (href === '/' || href === '/index.html')
-      const origin = req.headers['origin']
-      const reqHost = typeof req.headers['host'] === 'string' ? (req.headers['host'] as string) : ''
-      const crossOrigin =
-        typeof origin === 'string' && origin.length > 0 && origin !== 'http://' + reqHost && origin !== 'https://' + reqHost
-      const pageExempt = stableAddress && isPageLoad && !crossOrigin
+      const pageExempt = stableAddress && isPageLoad && !isCrossOrigin(req)
       if (!pageExempt && !tokenMatches(presented)) {
         const expired = consoleTokenExpired()
         res.statusCode = 403
@@ -1040,9 +1766,59 @@ export function startAuditViewer(
         res.end(expired ? 'console token expired: reload the page to get a fresh one' : 'forbidden: missing or invalid console token')
         return
       }
+      // V0.5.12: the CSRF gate. The token check above already dropped anonymous
+      // callers; this stops a cross-origin page that DOES present a valid token
+      // from driving the write routes (accounts activate / save / remove,
+      // audit archive, interrupt, sessions close, jobs stop). No side effect is
+      // reached — the request is refused before any route body runs.
+      if (href.startsWith('/api/') && isCrossOrigin(req)) {
+        res.statusCode = 403
+        res.setHeader('content-type', 'text/plain; charset=utf-8')
+        res.end('forbidden: cross-origin request')
+        return
+      }
+      // V0.5.4: every live console in this workspace (one per MCP process, i.e.
+      // per conversation). The page's instance picker is built from this, so a
+      // conversation can always get to ITS OWN sessions instead of silently
+      // watching whichever process happened to win the stable port.
+      if (href === '/api/instances') {
+        sendJson(res, listConsoleInstances())
+        return
+      }
       const entries = (): Record<string, unknown>[] => (audit !== null ? audit.list() : readAuditEntries(auditPath))
       if (href === '/api/entries') {
+        // V0.5.10: opt-in pagination. Passing no query at all keeps the
+        // historical "return the whole array" contract other callers rely on.
+        if (query.has('since') || query.has('limit')) {
+          // -1 (or absent/non-finite) means "from the beginning" — never clamp
+          // negatives to 0, or absolute index 0 would be skipped.
+          const sinceRaw = query.has('since') ? Number(query.get('since')) : -1
+          const since = Number.isFinite(sinceRaw) ? Math.floor(sinceRaw) : -1
+          const limitRaw = Number(query.get('limit') ?? '')
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.min(AUDIT_PAGE_MAX, Math.floor(limitRaw))
+            : DEFAULT_AUDIT_RING_SIZE
+          sendJson(res, audit !== null ? audit.page(since, limit) : paginateArray(entries(), since, limit))
+          return
+        }
         sendJson(res, entries())
+        return
+      }
+      // V0.5.10: rotate the live audit file. This branch sits AFTER the token
+      // check above, so it is gated exactly like every other /api/* route. Only
+      // the archived file NAME is returned — never a full disk path.
+      if (href === '/api/audit/archive' && req.method === 'POST') {
+        if (audit === null) {
+          sendJson(res, { archived: false, file: null, records: 0, bytes: 0 })
+          return
+        }
+        const result = await audit.archive()
+        sendJson(res, {
+          archived: result.archivedPath !== null,
+          file: result.archivedPath !== null ? basename(result.archivedPath) : null,
+          records: result.records,
+          bytes: result.bytes,
+        })
         return
       }
       if (href === '/api/stats') {
@@ -1195,7 +1971,83 @@ export function startAuditViewer(
         const knownHosts = services.knownHosts !== undefined && services.knownHosts !== null
           ? services.knownHosts()
           : { entries: {} }
-        sendJson(res, { connection: conn, policy, knownHosts })
+        // V0.5.11: the redacted multi-account view. accounts() is built to carry
+        // ProfileView fields only — never a password or a vault token.
+        const accounts = services.accounts !== undefined && services.accounts !== null
+          ? services.accounts()
+          : null
+        // V0.5.13: the tab-visibility block — resolved visible list, which layer
+        // decided each tab, and the local store's integrity. Same shape the
+        // write route returns, so the page has ONE renderer for both.
+        const consoleTabs = services.consoleTabReport !== undefined && services.consoleTabReport !== null
+          ? services.consoleTabReport()
+          : null
+        sendJson(res, { connection: conn, policy, knownHosts, accounts, consoleTabs })
+        return
+      }
+      // V0.5.13: persist one tab's visibility. Like every other write route it
+      // sits AFTER the token check and the same-origin gate. It is deliberately
+      // NOT behind auditViewer.allowCredentialWrite: hiding a tab changes what
+      // the operator sees and nothing else — no credential is written, no
+      // permission is granted, and the audit sink keeps writing.
+      if (href === '/api/console/tabs' && req.method === 'POST') {
+        const body = await readBody(req)
+        if (services.setConsoleTab === undefined || services.setConsoleTab === null) {
+          sendJson(res, { ok: false, error: 'NOT_AVAILABLE' })
+          return
+        }
+        const id = String(body['id'] ?? '')
+        const hidden = body['hidden'] === true
+        const written = services.setConsoleTab(id, hidden)
+        if (written.ok !== true) {
+          sendJson(res, written)
+          return
+        }
+        // The AUTHORITATIVE new state travels back with the ack: the page
+        // rebuilds its nav from this list instead of patching VISIBLE itself,
+        // which is what keeps the rendered nav and the router in agreement.
+        const report = services.consoleTabReport !== undefined && services.consoleTabReport !== null
+          ? services.consoleTabReport()
+          : {}
+        sendJson(res, { ok: true, ...report })
+        return
+      }
+      // V0.5.11: multi-account write routes. They sit AFTER the token check and
+      // the V0.5.12 same-origin gate above, exactly like /api/audit/archive, so
+      // they are gated by both the console token and the request's origin.
+      if (href === '/api/accounts/activate' && req.method === 'POST') {
+        const body = await readBody(req)
+        const rawId = body['id']
+        const id = rawId === null ? null : typeof rawId === 'string' ? rawId : null
+        if (services.switchAccount === undefined || services.switchAccount === null) {
+          sendJson(res, { ok: false, error: 'NOT_AVAILABLE' })
+          return
+        }
+        sendJson(res, services.switchAccount(id))
+        return
+      }
+      if (href === '/api/accounts/save' && req.method === 'POST') {
+        const body = await readBody(req)
+        if (services.saveAccount === undefined || services.saveAccount === null) {
+          sendJson(res, { ok: false, error: 'NOT_AVAILABLE' })
+          return
+        }
+        // The response is the structured result only — the request body (which
+        // may carry a password) is never echoed back.
+        sendJson(res, services.saveAccount(body))
+        return
+      }
+      if (href === '/api/accounts/remove' && req.method === 'POST') {
+        const body = await readBody(req)
+        if (services.removeAccount === undefined || services.removeAccount === null) {
+          sendJson(res, { ok: false, error: 'NOT_AVAILABLE' })
+          return
+        }
+        const id = String(body['id'] ?? '')
+        // V0.5.12: pass the service's structured result straight through so the
+        // page can name the real reason (PROFILE_NOT_FOUND / read-only / broken
+        // store). Never a credential — the result carries a code, not data.
+        sendJson(res, id.length > 0 ? services.removeAccount(id) : { ok: false, error: 'INVALID_ARGUMENT' })
         return
       }
       if (href === '/api/topology') {
@@ -1222,7 +2074,19 @@ export function startAuditViewer(
         return
       }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      res.end(page(timeZone, consoleToken ?? ''))
+      // V0.5.8: who asked for this page (?inst=) and where that instance really
+      // lives. Embedded pages (?embed=1) never re-locate: they ARE the target.
+      const embedded = query.get('embed') === '1'
+      const rawInst = query.get('inst')
+      const parsedInst = rawInst === null ? null : Number(rawInst)
+      const openPid =
+        embedded || parsedInst === null || !Number.isFinite(parsedInst) || parsedInst <= 0 ? null : Math.trunc(parsedInst)
+      const handover =
+        openPid === null ? null : resolveConsoleHandover(openPid, process.pid, publishedPort(), listConsoleInstances().instances)
+      // V0.5.10: the tab switches are read per page load, so editing
+      // auditViewer.tabs takes effect on the next refresh — no console restart.
+      const visibleTabs = resolveVisibleTabs(services)
+      res.end(page(timeZone, consoleToken ?? '', process.pid, publishedPort(), openPid, handover, visibleTabs, resolveTabSources(services)))
       // V0.5.1: the page has been fetched — stop nagging the model about it.
       consoleOpened = true
     })().catch(() => {
@@ -1233,7 +2097,8 @@ export function startAuditViewer(
         /* response already gone */
       }
     })
-  })
+  }
+  const server = http.createServer(handler)
   consoleRequestedPort = opts.port
   // V0.5.1: a random fallback port is what made handover URLs go stale, so it
   // only applies in the legacy (token-in-URL) mode.
@@ -1263,12 +2128,19 @@ export function startAuditViewer(
             ' is already served by another MCP process; adopting that address (will take over when it exits)',
         )
       }
+      // V0.5.4: adopting the address must NOT leave this process without a
+      // console. Bind a private loopback port so this instance's sessions,
+      // terminal mirror and audit stay reachable; the page embeds it when the
+      // operator selects this instance. Without this, two conversations showed
+      // one terminal and the 中断 button hit the wrong process.
+      startFollowerListener(handler)
       return
     }
     console.error('[jumpserver-mcp] ops console: ' + (error instanceof Error ? error.message : String(error)))
   })
   server.on('listening', () => {
     consoleBound = true
+    consoleRole = 'owner'
     consoleAdoptLogged = false
     const address = server.address()
     const port = typeof address === 'object' && address !== null ? address.port : opts.port
@@ -1315,6 +2187,11 @@ export function stopAuditViewer(): void {
     try { consoleServer.close() } catch { /* already closed */ }
     consoleServer = null
   }
+  // V0.5.4: the private follower listener (and its role/port) comes down too.
+  if (consoleFollowerServer !== null) {
+    try { consoleFollowerServer.close() } catch { /* already closed */ }
+    consoleFollowerServer = null
+  }
   // V0.5.0: the exit handler registered by startHeartbeat() has to come off
   // with the console. startHeartbeat() registers with process.once(), and each
   // registration is a NEW wrapper, so repeated start/stop cycles in one process
@@ -1332,6 +2209,10 @@ export function stopAuditViewer(): void {
   consoleRequestedPort = 0
   consoleOpened = false
   hintEmitted = 0
+  // V0.5.4 state.
+  consoleRole = 'none'
+  consoleFollowerPort = 0
+  liveRegistry = null
 }
 
 /**
@@ -1347,7 +2228,8 @@ function consoleUrl(port: number): string {
 
 /**
  * Heartbeat a per-process discovery file:
- *   data/consoles/<pid>.json = { pid, port, startedAt, heartbeatAt, tokenExpiresAt }
+ *   data/consoles/<pid>.json =
+ *     { pid, port, role, startedAt, heartbeatAt, tokenExpiresAt, summary }
  * Stale files (heartbeat older than 20s => the conversation/process is gone)
  * are pruned, so external tools can enumerate live consoles by listing the dir.
  *
@@ -1355,20 +2237,185 @@ function consoleUrl(port: number): string {
  * process (or a sync agent watching the workspace) could otherwise read the
  * token off disk and reach the console, defeating the token entirely. The
  * token lives only in this process's memory and is handed to the user through
- * the MCP response (consoleHintForModel).
+ * the MCP response (consoleHintForModel). V0.5.4 keeps that promise and adds
+ * only non-secret fields (role + a one-line session summary) so the page can
+ * label each instance.
  */
 function writeConsoleFile(): void {
-  if (consoleFile === null || consolePort <= 0) return
+  const port = publishedPort()
+  if (consoleFile === null || port <= 0) return
   try {
     writeFileSync(consoleFile, JSON.stringify({
       pid: process.pid,
-      port: consolePort,
+      port,
+      role: consoleRole,
       startedAt: consoleStartedAt,
       heartbeatAt: new Date().toISOString(),
       tokenExpiresAt: consoleTokenExpiresAt !== null ? new Date(consoleTokenExpiresAt).toISOString() : null,
+      summary: selfSummary(),
     }) + '\n', 'utf8')
   } catch {
     /* discovery file is best-effort */
+  }
+}
+
+/** V0.5.4: the port this instance publishes — the owned one, else the follower's. */
+function publishedPort(): number {
+  if (consoleRole === 'owner') return consolePort
+  return consoleFollowerPort
+}
+
+/** V0.5.4: compact live summary so the instance picker can label each console. */
+function selfSummary(): { state: string; target: string | null; sessions: number } {
+  const registry = liveRegistry
+  if (registry === null) return { state: 'none', target: null, sessions: 0 }
+  let state = 'none'
+  let target: string | null = null
+  let sessions = 0
+  try {
+    for (const [, bundle] of registry.snapshot()) {
+      sessions += 1
+      const status = bundle.manager.status()
+      if (target === null && typeof status.target === 'string' && status.target.length > 0) target = status.target
+      if (state === 'none' && typeof status.state === 'string' && status.state.length > 0) state = status.state
+    }
+  } catch {
+    /* a closing session must never break the heartbeat */
+  }
+  return { state, target, sessions }
+}
+
+/** One live console as the page sees it. */
+interface ConsoleInstanceView {
+  pid: number
+  port: number
+  role: string
+  startedAt: string
+  ageMs: number
+  self: boolean
+  state: string
+  target: string | null
+  sessions: number
+  url: string
+}
+
+/**
+ * V0.5.4: enumerate this workspace's live consoles from the discovery files.
+ * Deliberately file-based — no cross-process calls and no shared secret: the
+ * page reaches another instance by EMBEDDING that instance's own page, which
+ * injects its own token, so the per-process token model is untouched.
+ */
+function listConsoleInstances(): {
+  selfPid: number
+  selfPort: number
+  selfRole: string
+  instances: ConsoleInstanceView[]
+} {
+  const instances: ConsoleInstanceView[] = []
+  if (consoleDir !== null) {
+    try {
+      for (const name of readdirSync(consoleDir)) {
+        if (!name.endsWith('.json')) continue
+        try {
+          const raw = JSON.parse(readFileSync(join(consoleDir, name), 'utf8')) as Record<string, unknown>
+          const pid = Number(raw['pid'])
+          const port = Number(raw['port'])
+          if (!Number.isFinite(pid) || !Number.isFinite(port) || port <= 0) continue
+          const ageMs = Date.now() - Date.parse(String(raw['heartbeatAt'] ?? ''))
+          if (!Number.isFinite(ageMs) || ageMs > CONSOLE_STALE_MS) continue
+          const summary = (raw['summary'] ?? {}) as Record<string, unknown>
+          const rawTarget = summary['target']
+          instances.push({
+            pid,
+            port,
+            role: String(raw['role'] ?? 'owner'),
+            startedAt: String(raw['startedAt'] ?? ''),
+            ageMs,
+            self: pid === process.pid,
+            state: String(summary['state'] ?? 'unknown'),
+            target: rawTarget === null || rawTarget === undefined ? null : String(rawTarget),
+            sessions: Number(summary['sessions'] ?? 0) || 0,
+            url: consoleUrl(port),
+          })
+        } catch {
+          /* unreadable discovery entry — skip; the next tick retries */
+        }
+      }
+    } catch {
+      /* consoles dir may not exist yet */
+    }
+  }
+  instances.sort((a, b) => (a.self === b.self ? a.pid - b.pid : a.self ? -1 : 1))
+  return { selfPid: process.pid, selfPort: publishedPort(), selfRole: consoleRole, instances }
+}
+
+/**
+ * V0.5.8: where a freshly opened console page should really live.
+ *
+ * The handover URL is the SHARED stable address (`http://127.0.0.1:8765/`) plus
+ * `?inst=<pid>`. Whoever owns that port answers the request — and that is very
+ * often NOT the conversation that asked for the console: with two conversations
+ * open, the older MCP process holds 8765 and serves the page while the newer
+ * one (the process that just handed this URL to its model) is a follower on a
+ * private loopback port. The page then treated ITSELF as "the console" and
+ * labelled the requesting conversation 「另一个对话」 — an operator watched
+ * their own terminal under a stranger's banner, and 「切回本实例」 led to
+ * somebody else's session. Content was right, identity was inverted.
+ *
+ * So when `?inst=` names a live instance that owns a DIFFERENT listener, the
+ * page hands the browser over to that instance: the page it then loads is that
+ * instance — own tabs, own audit, own sessions, no wrapper.
+ *
+ * Returns null when the page must stay where it is: no parameter, the parameter
+ * names this process, the instance is unknown/stale, or it publishes no port of
+ * its own (an owner still binding).
+ */
+export function resolveConsoleHandover(
+  openPid: number | null,
+  selfPid: number,
+  selfPort: number,
+  instances: ConsoleInstanceView[],
+): string | null {
+  if (openPid === null || !Number.isFinite(openPid) || openPid <= 0) return null
+  if (openPid === selfPid) return null
+  const target = instances.find((item) => item.pid === openPid)
+  if (target === undefined) return null
+  if (!Number.isFinite(target.port) || target.port <= 0) return null
+  if (target.port === selfPort) return null
+  const sep = target.url.includes('?') ? '&' : '?'
+  return target.url + sep + 'inst=' + String(target.pid)
+}
+
+/**
+ * V0.5.4: bind this process's own loopback console when the configured (stable)
+ * address belongs to another MCP process. Port 0 = any free port; the number is
+ * published in the heartbeat file and is only ever reached through the page's
+ * instance picker, never advertised as the workspace address.
+ */
+function startFollowerListener(
+  handler: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void,
+): void {
+  if (consoleFollowerServer !== null) return
+  const follower = http.createServer(handler)
+  follower.on('listening', () => {
+    const address = follower.address()
+    consoleFollowerPort = typeof address === 'object' && address !== null ? address.port : 0
+    // A later takeover flips the role to 'owner'; never downgrade it back.
+    if (consoleRole !== 'owner') consoleRole = 'follower'
+    consoleStartedAt = new Date().toISOString()
+    writeConsoleFile()
+  })
+  follower.on('error', (error) => {
+    console.error(
+      '[jumpserver-mcp] ops console: follower listener failed: ' + (error instanceof Error ? error.message : String(error)),
+    )
+  })
+  follower.unref?.()
+  consoleFollowerServer = follower
+  try {
+    follower.listen(0, '127.0.0.1')
+  } catch (error) {
+    console.error('[jumpserver-mcp] ops console: ' + (error instanceof Error ? error.message : String(error)))
   }
 }
 
@@ -1387,7 +2434,9 @@ function startHeartbeat(): void {
     return
   }
   const timer = setInterval(() => {
-    if (consolePort > 0) writeConsoleFile()
+    // V0.5.4: heartbeat even when we are only a follower — writeConsoleFile()
+    // publishes whichever port this instance owns and no-ops when none is bound.
+    writeConsoleFile()
     pruneStale()
     attemptConsoleTakeover()
   }, 5_000)
@@ -1460,6 +2509,24 @@ export function auditViewerUrl(): string | null {
 }
 
 /**
+ * V0.5.4: the address handed to the model. Same stable address as always (a
+ * plain bookmark keeps working) plus `?inst=<pid>`, so the page resolves to the
+ * instance that ASKED for the console instead of whichever process owns the
+ * port. `auditViewerUrl()` stays parameter-free for callers that need the
+ * canonical, bookmark-stable address.
+ */
+export function advertisedConsoleUrl(): string | null {
+  if (viewerUrl === null) return null
+  // The picker only exists in stable-address mode — that is the address several
+  // processes share. In legacy (?token=…) mode every process owns its own
+  // ephemeral port, so there is nothing to switch between and the handover URL
+  // must stay byte-identical to auditViewerUrl(): a duplicate `?` would also
+  // corrupt the query string.
+  if (!stableAddress) return viewerUrl
+  return viewerUrl + (viewerUrl.includes('?') ? '&' : '?') + 'inst=' + String(process.pid)
+}
+
+/**
  * V0.4.2: issue a fresh token for a running console and return the new URL.
  * The previous token stops working immediately, so the caller must hand the new
  * URL to the user. Returns null when no console is running.
@@ -1469,7 +2536,7 @@ export function rotateConsoleAccessToken(): string | null {
   // another's address still owns a token and must be able to rotate it.
   if (consoleToken === null) return null
   rotateConsoleToken()
-  return viewerUrl
+  return advertisedConsoleUrl()
 }
 
 /** V0.4.2: token lifetime + expiry, for status output. */

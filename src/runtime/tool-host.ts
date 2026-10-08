@@ -11,6 +11,8 @@ import type { JumpServerConfig } from '../config/types.js'
 import type { SessionManager } from '../jumpserver/session-manager.js'
 import type { SessionBundle, SessionRegistry } from '../jumpserver/session-registry.js'
 import { JUMPSERVER_NOT_ARMED, NOT_ARMED_MESSAGE, type SessionGrant } from '../security/grant.js'
+// V0.5.2: the connection must be complete before anything touches the bastion.
+import { requireConfigured } from './config-guard.js'
 import type { GateServices } from '../security/permission-gate.js'
 import { consoleHintForModel, consoleHintPending } from './audit-viewer.js'
 import { bundleFor as bundleForId, renderResult, sessionIdOf, type ResultValue } from './tools-common.js'
@@ -57,7 +59,28 @@ export interface ToolHost {
   servicesFor: (bundle: { manager: SessionManager }) => GateServices
   /** Returns a not-armed value when grants are required and locked, else null. */
   requireGrant: (exec: ToolRunContext) => ResultValue | null
+  /**
+   * V0.5.2: the full readiness gate every connect-needing tool must pass —
+   * connection complete, THEN arm/grant. Returns the refusal, or null to
+   * proceed. Tools that must stay answerable while unconfigured
+   * (jumpserver_status / jumpserver_console_rotate_token) keep using
+   * `requireGrant` alone.
+   */
+  requireReady: (exec: ToolRunContext) => ResultValue | null
   sessionIdOf: (exec: ToolRunContext) => string
+}
+
+/**
+ * V0.5.2: connection-completeness + arm gate, as ONE expression.
+ *
+ * Order matters: report the missing connection BEFORE the arm window, because
+ * "arm yourself" is useless advice to someone who has not filled the form yet.
+ */
+export function requireReady(runtime: Runtime, grants: SessionGrant, exec: ToolRunContext): ResultValue | null {
+  const incomplete = requireConfigured(runtime)
+  if (incomplete !== null) return incomplete
+  if (runtime.getConfig().requireArm !== true) return null
+  return grants.isGranted(sessionIdOf(exec)) ? null : { ok: false, code: JUMPSERVER_NOT_ARMED, message: NOT_ARMED_MESSAGE }
 }
 
 export function createToolHost(runtime: Runtime): ToolHost {
@@ -76,6 +99,7 @@ export function createToolHost(runtime: Runtime): ToolHost {
       if (runtime.getConfig().requireArm !== true) return null
       return grants.isGranted(sessionIdOf(exec)) ? null : { ok: false, code: JUMPSERVER_NOT_ARMED, message: NOT_ARMED_MESSAGE }
     },
+    requireReady: (exec) => requireReady(runtime, grants, exec),
     sessionIdOf,
   }
 }

@@ -107,6 +107,95 @@ export interface JumpServerConfig {
   autoReconnect: boolean
   /** Persist command audit records (default true) */
   enableAudit: boolean
+  /**
+   * V0.5.7: optional semantic second opinion for UNKNOWN commands (Jev /
+   * TypeSafe AI). ADVISORY ONLY — it never changes a gate decision. See
+   * src/security/risk-judge.ts for the full safety contract.
+   */
+  riskJudge?: RiskJudgeConfig
+}
+
+/**
+ * V0.5.7 risk judge settings.
+ *
+ * The judge is consulted ONLY for commands the deterministic classifier
+ * returns UNKNOWN for, and its verdict is rendered into the approval copy.
+ * It cannot allow, deny or downgrade anything: with `enabled:false` (the
+ * default) the connector behaves exactly as before.
+ */
+export interface RiskJudgeConfig {
+  /** Master switch (default false — no outbound request is ever made). */
+  enabled: boolean
+  /** System One endpoint (default https://api.typesafe.ai/v1/systemone). */
+  endpoint: string
+  /** Credential-ref (env var name) holding the API key (default TYPESAFE_API_KEY). */
+  apiKeyEnv: string
+  /**
+   * Optional file holding the API key (default ''). Consulted only when the
+   * env var above is empty, mirroring ~/.workbuddy/typesafe/ts.py. Storing the
+   * PATH here keeps the secret itself out of config.json.
+   */
+  apiKeyFile: string
+  /** Model alias (default jev-latest). */
+  model: string
+  /**
+   * Per-call timeout in ms (default 1500). The gate is on the critical path:
+   * a slow judge must degrade to null, never delay an approval prompt.
+   */
+  timeoutMs: number
+  /** Verdict cache TTL per redacted command, seconds (default 3600). */
+  cacheTtlSeconds: number
+  /**
+   * Mask IPs / FQDNs / home-directory account names before the command leaves
+   * the process (default true). System paths (/etc, /var/log) are preserved —
+   * they carry the semantics the judgement needs, credentials never are.
+   */
+  redactNetwork: boolean
+  /**
+   * V0.5.8: the ONE place a judge verdict may change a gate outcome.
+   *
+   * The advisory judge (above) only decorates an approval prompt. Turning this
+   * on lets a confident "this command only reads" verdict skip the human
+   * round-trip on a command the rule classifier could not rule on — the main
+   * source of friction during multi-host collection, where every unclassified
+   * probe costs a confirm cycle per host.
+   *
+   * It is deliberately narrow and fail-closed: it applies only where the
+   * deterministic gate already said "ask a human" (never where it said
+   * "blocked"), only to `UNKNOWN` classifications, only when every threshold
+   * below is met, and never to a composed command. `MODIFY`, `DANGEROUS`,
+   * `READ` and `PRIVILEGED_READ` are still decided by the classifier alone and
+   * are never sent anywhere.
+   */
+  autoAllow: RiskJudgeAutoAllowConfig
+}
+
+/**
+ * V0.5.8 auto-allow thresholds. Every value is a veto: the verdict must pass
+ * ALL of them. Defaults are the conservative end of the measured distribution
+ * (see README) — raise nothing without reading the actual verdicts first.
+ */
+export interface RiskJudgeAutoAllowConfig {
+  /** Master switch (default false). Off = advisory-only, exactly as V0.5.7. */
+  enabled: boolean
+  /** Minimum P(command only reads) — the noul answer (default 0.9). */
+  minReadOnly: number
+  /** Minimum of the confidences the model reported for its answers (default 0.7). */
+  minConfidence: number
+  /**
+   * Highest accepted expected rubric position on the 0..4 scale the API returns
+   * (0 = 随时可执行 … 4 = 禁止自动执行). Default 1.0 keeps auto-allow inside the
+   * two safest rubric bands.
+   */
+  maxRiskScore: number
+  /**
+   * Minimum probability mass the rubric distribution puts on its two safest
+   * bands (P(0)+P(1)), default 0.85. A verdict whose distribution is missing or
+   * spread out is refused — the expected value alone can hide a fat tail.
+   */
+  minSafeProbability: number
+  /** Maximum P(the command needs root/sudo), default 0.3. */
+  maxNeedsPrivilege: number
 }
 
 /** V0.2.6: one asset group definition (keyword list). */
@@ -183,6 +272,55 @@ export interface RunbookDef {
   steps: RunbookStep[]
 }
 
+/**
+ * V0.5.9: the stable identifiers of the embedded console's navigation tabs.
+ *
+ * These ids are shared verbatim by the nav buttons (`data-tab`), the tab
+ * sections (`id="tab-<name>"`) and the hash router, so they must not be
+ * renamed without touching the viewer's markup.
+ */
+export type ConsoleTabId = 'terminal' | 'assets' | 'topology' | 'jobs' | 'audit' | 'stats' | 'sessions' | 'settings'
+
+/**
+ * Every console tab id, in navigation order.
+ *
+ * The order IS the rendered order: `resolveConsoleTabs()` walks this array, so
+ * the viewer never has to sort and a filtered tab list keeps its place.
+ */
+export const CONSOLE_TAB_IDS: readonly ConsoleTabId[] = [
+  'terminal',
+  'assets',
+  'topology',
+  'jobs',
+  'audit',
+  'stats',
+  'sessions',
+  'settings',
+] as const
+
+/** Default visibility of every console tab: all on. */
+export const DEFAULT_CONSOLE_TABS: Record<ConsoleTabId, boolean> = {
+  terminal: true,
+  assets: true,
+  topology: true,
+  jobs: true,
+  audit: true,
+  stats: true,
+  sessions: true,
+  settings: true,
+}
+
+/**
+ * Tabs that can never be hidden.
+ *
+ * `settings` is the console's only explanation and diagnostics entry point —
+ * and the page that documents this very switch. Hiding it would strand an
+ * operator with a console that has lost tabs and no way to find out why, so
+ * the rule is enforced inside `resolveConsoleTabs()` rather than delegated to
+ * each caller.
+ */
+export const ALWAYS_ON_CONSOLE_TABS: readonly ConsoleTabId[] = ['settings'] as const
+
 /** Default terminal scrollback (rows). */
 export const DEFAULT_TERMINAL_SCROLLBACK = 5000
 
@@ -222,3 +360,33 @@ export const MAX_SESSIONS_CEILING = 16
 export const MAX_ASSET_CAPTURE_BYTES = 256 * 1024
 
 export const DEFAULT_PASSWORD_ENV = 'JUMPSERVER_PASSWORD'
+
+/** V0.5.7: default credential-ref for the optional risk judge (Jev / TypeSafe AI). */
+export const DEFAULT_RISK_JUDGE_API_KEY_ENV = 'TYPESAFE_API_KEY'
+
+/** V0.5.7: default System One endpoint. */
+export const DEFAULT_RISK_JUDGE_ENDPOINT = 'https://api.typesafe.ai/v1/systemone'
+
+/** V0.5.7: fallback key file — the same one ~/.workbuddy/typesafe/ts.py reads. */
+export const DEFAULT_RISK_JUDGE_API_KEY_FILE = '~/.workbuddy/typesafe/api_key'
+
+/** V0.5.7: default risk-judge settings (disabled — nothing leaves the process). */
+export const DEFAULT_RISK_JUDGE: RiskJudgeConfig = {
+  enabled: false,
+  endpoint: DEFAULT_RISK_JUDGE_ENDPOINT,
+  apiKeyEnv: DEFAULT_RISK_JUDGE_API_KEY_ENV,
+  apiKeyFile: DEFAULT_RISK_JUDGE_API_KEY_FILE,
+  model: 'jev-latest',
+  timeoutMs: 1500,
+  cacheTtlSeconds: 3600,
+  redactNetwork: true,
+  // V0.5.8: opt-in, and conservative even then. See RiskJudgeAutoAllowConfig.
+  autoAllow: {
+    enabled: false,
+    minReadOnly: 0.9,
+    minConfidence: 0.7,
+    maxRiskScore: 1,
+    minSafeProbability: 0.85,
+    maxNeedsPrivilege: 0.3,
+  },
+}

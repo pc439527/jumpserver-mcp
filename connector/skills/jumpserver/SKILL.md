@@ -46,23 +46,42 @@ DISCONNECTED  --connect-->  JUMPSERVER_MENU  --enter(target)-->  ASSET_SHELL
 | 工具 | 参数 | 用途 |
 |---|---|---|
 | `jumpserver_assets` | `filter?` `group?` `refresh?` `includeRawText?` | 列出账号有权访问的资产，**不进入**任何一台 |
-| `jumpserver_enter` | `target` | 通过菜单进入指定资产，内部跑探针校验后才报告成功 |
+| `jumpserver_enter` | `target` `accountIndex?` | 通过菜单进入指定资产；`accountIndex` 用于 KoKo 多用户选择屏（详见下方）。内部跑探针校验后才报告成功 |
 | `jumpserver_leave` | 无 | 退出当前资产，回到菜单 |
+
+> **多用户选择屏（V0.5.3）**：当某台资产在堡垒机上绑定了多个用户账号（例如 admin/ops/root），KoKo 不会直接进入资产 shell，而是先打印一份编号列表 + `ID>` 提示符等调用方挑一个。连接器看到这种屏幕会按下面处理：
+>
+> - 调用方传了 `accountIndex: N`（**就是 KoKo 屏上显示的编号**，通常是 1 或 2，不是数组下标）：连接器自动写入 `N` 然后等 shell。
+> - 调用方没传：连接器抛 `ACCOUNT_SELECTION_REQUIRED` 错误，`detail` 字段里附 `accounts=0:admin \| 1:ops \| 2:deploy` 这样的解析结果；模型据此问用户后再用对的 `accountIndex` 重试。
+> - **重试就在同一个会话上做，不要重连（V0.5.6）**：抛 `ACCOUNT_SELECTION_REQUIRED` 之后会话**仍然活着并停在那块 `ID>` 屏上**（状态 `ENTERING_ASSET`）。紧接着把 `accountIndex` 传给 `jumpserver_enter` / `jumpserver_run` / `jumpserver_batch` / `jumpserver_job_start` 再调一次即可 —— 连接器把编号写进**已经打开的那块屏**：同一条 SSH 链路、不重发资产行、**不需要先 `connect`**。
+>   - 那块屏已经不在了（KoKo 选择超时、链路断掉）时才抛 `ACCOUNT_SELECTION_EXPIRED`，这时才重连后重新 `enter`。
+>   - `accountIndex` 不在列表里同样是 `ACCOUNT_SELECTION_REQUIRED`（`detail` 带 `requested accountIndex=N`），屏还在，直接用合法编号重试。
+>   - ⚠️ 若看到 `CONNECTION_LOST` + `no live JumpServer session`：那是 ≤ V0.5.5 的旧行为（抛错时把会话打成 `UNKNOWN`，导致"带账号重试"被拒），已修复。别再把它理解成"会话掉了"而去重连。
+> - 连接器**永不自动选** —— fail-closed，避免误登。
+>
+> 多目标的批量工具（`jumpserver_batch` 每个 task、`jumpserver_inspect/topology/compare/baseline_*/profile_run` 全局）用 `accountByTarget: { "<ip>": <index> }` 这个 map 来分别指定；`jumpserver_job_start` 单点直接传 `accountIndex`。
+
+> **资产网络不通 = 立刻停（V0.5.5）**：堡垒机连不上目标资产时 KoKo 会打印 `开始连接到 root(root)@<ip> error: 网络不通（连接超时）` 然后退回自己的菜单提示符。这时连接器抛 `ASSET_UNREACHABLE`，`detail` 里是**完整那句 KoKo 横幅**（不是匹配到的关键词）和 `retryAfterMs`。
+>
+> - **不要重试、不要继续排查**：这不是配置/账号/`accountIndex` 问题，重试只会再等 KoKo 自己的 ~15 秒拨号超时。工具结果里会带 `next: STOP` 一行，照做：直接告诉用户「该服务器暂时无法联通」，然后换目标或等用户确认网络恢复。
+> - 会话本身是好的：状态回到 `JUMPSERVER_MENU`，换一台资产**不需要重连**。
+> - 同一台资产在 2 分钟内会被**直接拒绝（不写 PTY）**；已确认网络已修复时，`jumpserver_close` 会清掉这个冷却。
+> - 非网络的失败（例如 `资产不存在`）仍是 `ASSET_ENTER_TIMEOUT`，可以正常重试/换参数。
 
 ### 执行
 | 工具 | 参数 | 用途 |
 |---|---|---|
 | `jumpserver_exec` | `command` `timeout?` `confirm?` | 在当前已进入的资产上跑**一条**简单命令 |
-| `jumpserver_run` | `target` `command` `timeout?` `confirm?` | 指定目标跑一条命令，自动处理连接与切换 |
-| `jumpserver_batch` | `tasks` `confirm?` | 多目标批量执行；每台进入一次、跑完该台所有命令再切走 |
+| `jumpserver_run` | `target` `command` `timeout?` `confirm?` `accountIndex?` | 指定目标跑一条命令，自动处理连接与切换；`accountIndex` 同上 |
+| `jumpserver_batch` | `tasks` `confirm?`（每个 task 含 `target` `commands` `accountIndex?` `timeout?`） | 多目标批量执行；每台进入一次、跑完该台所有命令再切走 |
 
 ### 结构化采集（优先用这些，而不是堆 `exec`）
 | 工具 | 参数 | 用途 |
 |---|---|---|
-| `jumpserver_inspect` | `targets` `profile?` `group?` `format?` `concurrency?` | 用固定只读探针采集结构化主机画像 |
-| `jumpserver_topology` | `targets?` `group?` `profiles?` `depth?` `format?` `concurrency?` | 主机间关系图（谁连谁、哪个端口、证据来自哪） |
-| `jumpserver_profile_run` | `runbook` `targets?` `group?` `format?` `concurrency?` | 跑 config 里定义的命名 Runbook，带断言 |
-| `jumpserver_compare` | `targets` `command?` `profile?` `stripPrefixes?` `format?` `concurrency?` | 多台主机跑同一命令，只报**差异** |
+| `jumpserver_inspect` | `targets` `profile?` `group?` `format?` `concurrency?` `accountByTarget?` | 用固定只读探针采集结构化主机画像 |
+| `jumpserver_topology` | `targets?` `group?` `profiles?` `depth?` `format?` `concurrency?` `accountByTarget?` | 主机间关系图（谁连谁、哪个端口、证据来自哪） |
+| `jumpserver_profile_run` | `runbook` `targets?` `group?` `format?` `concurrency?` `accountByTarget?` | 跑 config 里定义的命名 Runbook，带断言 |
+| `jumpserver_compare` | `targets` `command?` `profile?` `stripPrefixes?` `format?` `concurrency?` `accountByTarget?` | 多台主机跑同一命令，只报**差异** |
 
 `inspect` 的 profile：`basic` / `network` / `process` / `service` / `web` / `java` / `database` / `container` / `full`。
 命令由连接器决定，**不要自己拼 shell**——这是固定探针，不是自由文本入口。

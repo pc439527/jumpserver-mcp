@@ -1,16 +1,27 @@
 /**
  * Ops tools (V0.4.0) — the "AI infrastructure investigation" layer:
  *
- *   jumpserver_inspect    fixed read-only probes -> structured host inventory
- *   jumpserver_topology   inventories -> evidence-annotated relationship graph
- *   jumpserver_interrupt  Ctrl+C the remote shell (console/abort parity)
- *   jumpserver_job_start  streaming job (tail -f / journalctl -f / tcpdump)
- *   jumpserver_job_read   incremental output of a running job
- *   jumpserver_job_stop   Ctrl+C + release the PTY
- *   jumpserver_jobs       list jobs of this conversation
+ *   jumpserver_inspect       fixed read-only probes -> structured host inventory
+ *   jumpserver_topology      inventories -> evidence-annotated relationship graph
+ *   jumpserver_profile_run   named runbook across targets (with PASS/FAIL)
+ *   jumpserver_compare       same command/profile across hosts -> the DIFF
+ *   jumpserver_baseline_*    capture / re-inspect for drift
+ *   jumpserver_interrupt     Ctrl+C the remote shell (console/abort parity)
+ *   jumpserver_job_*         streaming jobs (tail -f / journalctl -f / tcpdump)
  *
  * Kept out of server.ts so the tool registry stays readable; the shared
- * plumbing (grant check, console hint, session bundle) comes from tool-host.
+ * plumbing (config + grant gates, console hint, session bundle) comes from
+ * tool-host.
+ *
+ * V0.5.2:
+ *  - every tool declares `annotations`, and `jumpserver_baseline_capture`
+ *    correctly reports that it WRITES a file (it advertised readOnlyHint:true
+ *    while calling baselineStore.save()).
+ *  - the multi-target tools report per-target progress when the client asked
+ *    for it (see runtime/progress.ts).
+ *  - descriptions were trimmed: the long-form usage guidance moved to
+ *    connector/skills/jumpserver/SKILL.md, which is loaded lazily rather than
+ *    injected into every conversation.
  */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
@@ -25,8 +36,11 @@ import { requireTargetAllowed } from '../security/target-scope.js'
 import { gateCommandForNavigation } from '../security/permission-gate.js'
 import { JumpServerError } from '../jumpserver/errors.js'
 import { redactCommandSecrets } from '../security/command-redaction.js'
-import { guardText, guardValue, type ResultValue } from './tools-common.js'
+import { guardText, guardValue, renderResult, type ResultValue } from './tools-common.js'
+import { renderFailureLines } from '../jumpserver/errors.js'
 import { createToolHost, toolText, toolTextRaw, type ToolHost } from './tool-host.js'
+// V0.5.2: per-target progress for the long multi-host operations.
+import { progressReporter } from './progress.js'
 // V0.4.5: the MCP interrupt tool and the console share ONE stop entry point.
 import { interruptSession } from './interrupt.js'
 import { randomHex } from '../jumpserver/timing.js'
@@ -40,23 +54,30 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     'jumpserver_inspect',
     {
       description:
-        'Collect a STRUCTURED host inventory from one or more servers through JumpServer, using FIXED read-only probes (the connector decides the commands — do not invent shell). Returns parsed facts (OS, kernel, uptime, load, memory, disks, IPs, listening ports, established connections, processes, services, nginx upstreams, java, docker, detected roles) instead of raw shell text. Use this (not a pile of jumpserver_exec calls) whenever you need to understand what a server is or how servers relate. Profiles: basic / network / process / service / web / java / database / container / full.',
+        'Collect a STRUCTURED host inventory from one or more servers using FIXED read-only probes (the connector decides the commands — do not invent shell). Returns parsed facts (OS, kernel, uptime, load, memory, disks, IPs, listening ports, connections, processes, services, nginx upstreams, java, docker, roles) instead of raw shell text. Use this rather than a pile of jumpserver_exec calls. Profiles: basic / network / process / service / web / java / database / container / full.',
       inputSchema: {
-        targets: z.array(z.string()).min(1).max(20).describe('Target IPs or asset names to inspect (max 20).'),
+        targets: z.array(z.string()).min(1).max(20).describe('Target IPs or asset names (max 20).'),
         profile: z.union([z.enum(INSPECT_PROFILES), z.array(z.enum(INSPECT_PROFILES))]).optional().describe('Probe profile(s), default "basic". "full" runs every profile.'),
-        group: z.string().optional().describe('Instead of targets: a configured asset group (e.g. "OA") — every asset of that group is inspected.'),
+        group: z.string().optional().describe('Instead of targets: a configured asset group whose assets are all inspected.'),
         format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured inventory).'),
-        concurrency: z.number().int().min(1).max(8).optional().describe('How many targets to survey at once (default: batchConcurrency setting). Raise for a large estate; each target still gets its own bastion session turn.'),
+        concurrency: z.number().int().min(1).max(8).optional().describe('Targets surveyed at once (default: batchConcurrency setting).'),
+        // V0.5.3: accountByTarget maps each target string to a 0-based
+        // accountIndex. Required only when any inspected target has more
+        // than one authorised bastion user (the `ID>` prompt). Pass an
+        // empty object (or omit) when every target is single-user.
+        accountByTarget: z.record(z.string(), z.number().int().min(0)).optional().describe('{ [target]: displayedAccountId } for multi-user assets (KoKo `ID>` prompt).'),
       },
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_inspect', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
+      const progress = progressReporter(extra)
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
-        const blocked = host.requireGrant(exec)
+        const blocked = host.requireReady(exec)
         if (blocked !== null) return render(blocked)
         const bundle = host.bundleFor(exec)
         const targets = await resolveTargets(host, bundle, exec, args.targets, args.group)
+        progress(0, targets.length, 'inspect: ' + targets.length + ' target(s)')
         const result = await inspectTargets(bundle.manager, host.getConfig, {
           targets,
           profile: args.profile as InspectProfile | InspectProfile[] | undefined,
@@ -64,6 +85,8 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           toolCallId: String(exec.callId),
           batchId: 'ins_' + randomHex(6),
           concurrency: args.concurrency ?? host.getConfig().batchConcurrency ?? 1,
+          onTarget: (done, total, target) => progress(done, total, 'inspect ' + target),
+          accountByTarget: args.accountByTarget,
         })
         const head = 'ok inspect profile=' + result.profiles.join(',') +
           ' targets=' + result.targets + ' reachable=' + result.reachable +
@@ -81,26 +104,29 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     'jumpserver_topology',
     {
       description:
-        'Build the relationship graph between servers: which host proxies/connects to which, on which port, with what evidence (nginx upstream, ESTABLISHED socket, /etc/hosts). Internally runs the read-only inspect probes (profiles network/process/web by default) and returns nodes (roles, ports, OS, load, memory) plus edges (type, port, confidence, evidence). Use it for "what is the relationship between 99/100/101/102/103" style questions instead of guessing from names. depth>=2 also links app nodes that share one upstream (same cluster).',
+        'Build the relationship graph between servers: which host proxies or connects to which, on which port, with what evidence (nginx upstream, ESTABLISHED socket, /etc/hosts). Internally runs the read-only inspect probes and returns nodes (roles, ports, OS, load, memory) plus edges (type, port, confidence, evidence). Use it for "what is the relationship between these hosts" instead of guessing from names. depth>=2 also links app nodes sharing one upstream.',
       inputSchema: {
         targets: z.array(z.string()).optional().describe('Target IPs or asset names (max 20). Omit when using group.'),
-        group: z.string().optional().describe('Configured asset group (e.g. "OA") — every asset of that group is surveyed.'),
-        profiles: z.array(z.enum(INSPECT_PROFILES)).optional().describe('Probe profiles for the survey (default: network, process, web).'),
+        group: z.string().optional().describe('Configured asset group — every asset of that group is surveyed.'),
+        profiles: z.array(z.enum(INSPECT_PROFILES)).optional().describe('Probe profiles (default: network, process, web).'),
         depth: z.number().int().min(1).max(3).optional().describe('1 = direct evidence only (default); 2+ also links nodes sharing one upstream.'),
         format: z.enum(['text', 'json']).optional().describe('text (default, tree) or json (nodes + edges).'),
-        concurrency: z.number().int().min(1).max(8).optional().describe('How many targets to survey at once (default: batchConcurrency setting).'),
+        concurrency: z.number().int().min(1).max(8).optional().describe('Targets surveyed at once (default: batchConcurrency setting).'),
+        accountByTarget: z.record(z.string(), z.number().int().min(0)).optional().describe('{ [target]: displayedAccountId } for multi-user assets (KoKo `ID>` prompt).'),
       },
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_topology', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
+      const progress = progressReporter(extra)
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
-        const blocked = host.requireGrant(exec)
+        const blocked = host.requireReady(exec)
         if (blocked !== null) return render(blocked)
         const bundle = host.bundleFor(exec)
         const targets = await resolveTargets(host, bundle, exec, args.targets, args.group)
         const profiles = args.profiles !== undefined && args.profiles.length > 0 ? args.profiles : ['network', 'process', 'web']
         const started = Date.now()
+        progress(0, targets.length, 'topology: ' + targets.length + ' target(s)')
         const result = await inspectTargets(bundle.manager, host.getConfig, {
           targets,
           profile: profiles,
@@ -108,6 +134,8 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           toolCallId: String(exec.callId),
           batchId: 'topo_' + randomHex(6),
           concurrency: args.concurrency ?? host.getConfig().batchConcurrency ?? 1,
+          onTarget: (done, total, target) => progress(done, total, 'topology ' + target),
+          accountByTarget: args.accountByTarget,
         })
         const topology = buildTopology(result.inventories, { depth: args.depth ?? 1 })
         runtime.topology.set({
@@ -137,30 +165,35 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     'jumpserver_profile_run',
     {
       description:
-        'Run a NAMED runbook (a reviewed, reusable survey recipe defined in config under "runbooks") against one or more servers. Each step is either an inspect profile or an explicit READ-only command; non-READ steps are SKIPPED and reported, never executed. Use this instead of hand-assembling the same set of checks for several hosts: it guarantees the exact same steps run on every target, and the results come back grouped per target and per step. Call it with a runbook name (see the config) plus targets[] or a configured group.',
+        'Run a NAMED runbook (a reviewed, reusable recipe from config "runbooks") across one or more servers: the SAME steps run on every host, and the results come back grouped per target and per step. Each step is an inspect profile or an explicit READ command; a non-READ step is SKIPPED and reported, never executed. Steps carrying `expect` assertions yield a PASS/FAIL verdict per step, per target and overall.',
       inputSchema: {
         runbook: z.string().describe('Runbook name as defined in config.json under "runbooks", e.g. "oa-health".'),
         targets: z.array(z.string()).optional().describe('Target IPs or asset names (max 20). Omit when using group.'),
-        group: z.string().optional().describe('Configured asset group (e.g. "OA") — the runbook runs on every asset of that group.'),
+        group: z.string().optional().describe('Configured asset group — the runbook runs on every asset of that group.'),
         format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured result).'),
-        concurrency: z.number().int().min(1).max(8).optional().describe('How many targets to run at once (default: batchConcurrency setting).'),
+        concurrency: z.number().int().min(1).max(8).optional().describe('Targets run at once (default: batchConcurrency setting).'),
+        accountByTarget: z.record(z.string(), z.number().int().min(0)).optional().describe('{ [target]: displayedAccountId } for multi-user assets (KoKo `ID>` prompt).'),
       },
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_profile_run', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
+      const progress = progressReporter(extra)
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
-        const blocked = host.requireGrant(exec)
+        const blocked = host.requireReady(exec)
         if (blocked !== null) return render(blocked)
         const bundle = host.bundleFor(exec)
         const def = resolveRunbook(host.getConfig().runbooks, args.runbook)
         const targets = await resolveTargets(host, bundle, exec, args.targets, args.group)
+        progress(0, targets.length, 'runbook ' + args.runbook + ': ' + targets.length + ' target(s)')
         const result = await runRunbook(bundle.manager, host.getConfig, args.runbook, def, {
           targets,
           signal: exec.signal,
           toolCallId: String(exec.callId),
           batchId: 'rbk_' + randomHex(6),
           concurrency: args.concurrency ?? host.getConfig().batchConcurrency ?? 1,
+          onTarget: (done, total, target) => progress(done, total, 'runbook ' + target),
+          accountByTarget: args.accountByTarget,
         })
         if (args.format === 'json') return JSON.stringify({ ok: true, ...result }, null, 2)
         return renderRunbook(result)
@@ -173,23 +206,26 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     'jumpserver_compare',
     {
       description:
-        'Run the SAME read-only command (or inspect profile) across several servers and report what DIFFERS — which host has a different config, a missing listener, a full disk. Returns groups of identical hosts plus, for each outlier, the lines it is missing / has extra versus the majority. Use this for "are these 6 nodes configured the same?" / "which one is different?" questions instead of eyeballing 6 raw dumps. Only READ commands are accepted; a mutating command refuses the whole call.',
+        'Run the SAME read-only command or inspect profile across several servers and report what DIFFERS — which host has a different config, a missing listener, a full disk. Returns groups of identical hosts plus, for each outlier, the lines it is missing or has extra versus the majority. Use it for "are these nodes configured the same?" instead of eyeballing raw dumps. Only READ is accepted; a mutating command refuses the whole call.',
       inputSchema: {
         targets: z.array(z.string()).min(2).max(20).describe('Target IPs or asset names to compare (2..20).'),
         command: z.string().optional().describe('One read-only command to run on every target (mutually exclusive with profile).'),
         profile: z.enum(INSPECT_PROFILES).optional().describe('Inspect profile to run on every target (mutually exclusive with command).'),
         stripPrefixes: z.array(z.string()).optional().describe('Line prefixes to strip before diffing (e.g. volatile timestamps).'),
         format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured diff).'),
-        concurrency: z.number().int().min(1).max(8).optional().describe('How many targets at once (default: batchConcurrency setting).'),
+        concurrency: z.number().int().min(1).max(8).optional().describe('Targets at once (default: batchConcurrency setting).'),
+        accountByTarget: z.record(z.string(), z.number().int().min(0)).optional().describe('{ [target]: displayedAccountId } for multi-user assets (KoKo `ID>` prompt).'),
       },
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_compare', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
+      const progress = progressReporter(extra)
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
-        const blocked = host.requireGrant(exec)
+        const blocked = host.requireReady(exec)
         if (blocked !== null) return render(blocked)
         const bundle = host.bundleFor(exec)
+        progress(0, args.targets.length, 'compare: ' + args.targets.length + ' target(s)')
         const result = await compareTargets(bundle.manager, host.getConfig, {
           targets: args.targets,
           command: args.command,
@@ -199,6 +235,8 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           toolCallId: String(exec.callId),
           batchId: 'cmp_' + randomHex(6),
           concurrency: args.concurrency ?? host.getConfig().batchConcurrency ?? 1,
+          onTarget: (done, total, target) => progress(done, total, 'compare ' + target),
+          accountByTarget: args.accountByTarget,
         })
         if (args.format === 'json') return JSON.stringify({ ok: true, ...result }, null, 2)
         return renderCompare(result)
@@ -211,20 +249,25 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     'jumpserver_baseline_capture',
     {
       description:
-        'Capture a NAMED baseline snapshot of one or more servers: the read-only inspect probes are run and a compact state (OS, kernel, cores, memory, disks, listening ports, services, roles) is saved to data/baselines/<name>.json. Later, jumpserver_baseline_compare re-inspects the same targets and reports DRIFT (new/removed ports, disk growth, service changes, load/memory shifts). Use it before a change window, then compare after, to prove what actually changed.',
+        'Capture a NAMED baseline snapshot of one or more servers: the read-only inspect probes run and a compact state (OS, kernel, cores, memory, disks, listening ports, services, roles) is SAVED to data/baselines/<name>.json. Pair it with jumpserver_baseline_compare before and after a change window to prove what actually changed. Writes a file, so this is NOT a read-only operation.',
       inputSchema: {
         name: z.string().describe('Baseline name (letters/digits/._-, max 64), e.g. "oa-prechange-20260910".'),
         targets: z.array(z.string()).min(1).max(20).describe('Target IPs or asset names to snapshot (max 20).'),
         group: z.string().optional().describe('Instead of targets: a configured asset group whose assets are snapshotted.'),
         profile: z.enum(INSPECT_PROFILES).optional().describe('Probe profile used for the snapshot (default "full").'),
         overwrite: z.boolean().optional().describe('Allow replacing an existing baseline of the same name (default false).'),
+        accountByTarget: z.record(z.string(), z.number().int().min(0)).optional().describe('{ [target]: displayedAccountId } for multi-user assets (KoKo `ID>` prompt).'),
       },
-      annotations: { readOnlyHint: true },
+      // V0.5.2: this tool writes data/baselines/<name>.json. It used to claim
+      // readOnlyHint:true — the same class of bug V0.4.3 fixed for
+      // jumpserver_status, where a side effect hid behind a read-only label.
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
     async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_baseline_capture', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
+      const progress = progressReporter(extra)
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
-        const blocked = host.requireGrant(exec)
+        const blocked = host.requireReady(exec)
         if (blocked !== null) return render(blocked)
         const bundle = host.bundleFor(exec)
         const targets = await resolveTargets(host, bundle, exec, args.targets, args.group)
@@ -232,6 +275,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           throw new JumpServerError('INVALID_ARGUMENT', 'baseline "' + args.name + '" already exists; pass overwrite:true to replace it')
         }
         const profile = args.profile ?? 'full'
+        progress(0, targets.length, 'baseline ' + args.name + ': ' + targets.length + ' target(s)')
         const result = await inspectTargets(bundle.manager, host.getConfig, {
           targets,
           profile,
@@ -239,6 +283,8 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           toolCallId: String(exec.callId),
           batchId: 'bl_' + randomHex(6),
           concurrency: host.getConfig().batchConcurrency ?? 1,
+          onTarget: (done, total, target) => progress(done, total, 'baseline ' + target),
+          accountByTarget: args.accountByTarget,
         })
         const baseline: Baseline = {
           name: args.name,
@@ -264,22 +310,25 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     'jumpserver_baseline_compare',
     {
       description:
-        'Compare a saved baseline (jumpserver_baseline_capture) against the CURRENT state of the same servers and report DRIFT: which hosts changed and exactly what changed (added/removed listening ports, disk usage, services, roles, kernel, cores, memory %, load). Use it after a change window, or periodically, to prove what moved. Hosts that cannot be reached now are reported as unreachable, never as "unchanged".',
+        'Compare a saved baseline (jumpserver_baseline_capture) against the CURRENT state of the same servers and report DRIFT: which hosts changed and exactly what changed (added/removed listening ports, disk usage, services, roles, kernel, cores, memory %, load). Use it after a change window, or periodically, to prove what moved. Hosts that cannot be reached now are reported as unreachable, never as unchanged.',
       inputSchema: {
         name: z.string().describe('Baseline name to compare against.'),
         profile: z.enum(INSPECT_PROFILES).optional().describe('Probe profile for the fresh capture (default: the profile stored in the baseline).'),
         format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured drift).'),
+        accountByTarget: z.record(z.string(), z.number().int().min(0)).optional().describe('{ [target]: displayedAccountId } for multi-user assets (KoKo `ID>` prompt).'),
       },
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_baseline_compare', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
+      const progress = progressReporter(extra)
       return toolTextRaw(await guardText(exec, async (): Promise<string> => {
-        const blocked = host.requireGrant(exec)
+        const blocked = host.requireReady(exec)
         if (blocked !== null) return render(blocked)
         const bundle = host.bundleFor(exec)
         const baseline = runtime.baselines.load(args.name)
         const profile = args.profile ?? baseline.profile
+        progress(0, baseline.targets.length, 'baseline ' + args.name + ': ' + baseline.targets.length + ' target(s)')
         const result = await inspectTargets(bundle.manager, host.getConfig, {
           targets: baseline.targets,
           profile,
@@ -287,6 +336,8 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           toolCallId: String(exec.callId),
           batchId: 'bld_' + randomHex(6),
           concurrency: host.getConfig().batchConcurrency ?? 1,
+          onTarget: (done, total, target) => progress(done, total, 'baseline ' + target),
+          accountByTarget: args.accountByTarget,
         })
         const current = result.inventories.map(toBaselineHost)
         const drift = diffBaseline(baseline, current, new Date().toISOString())
@@ -303,11 +354,12 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       description:
         'Send Ctrl+C to the remote shell NOW to interrupt whatever is running (a stuck command, a tail that will not end, a long find). Out-of-band: it does NOT wait for the current operation to finish. Afterwards the connector re-probes the shell and reports whether it is usable again (ASSET_SHELL) or collapsed to UNKNOWN. Use it instead of jumpserver_close when you only want to stop the remote job and keep the session.',
       inputSchema: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },
     async (_args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_interrupt', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
       return toolText(await guardValue(exec, async (): Promise<ResultValue> => {
-        const blocked = host.requireGrant(exec)
+        const blocked = host.requireReady(exec)
         if (blocked !== null) return blocked
         const bundle = host.bundleFor(exec)
         // V0.4.5: ONE owner per PTY. If a streaming job owns this shell, the
@@ -338,18 +390,21 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     'jumpserver_job_start',
     {
       description:
-        'Start a STREAMING job on a server — for commands that never return on their own: tail -f /…/stdout.log, journalctl -f -u nginx, tcpdump, top -b, ping. Returns a jobId; then poll jumpserver_job_read(jobId) for the new output and call jumpserver_job_stop(jobId) when done. While a job is running the shell is reserved for it (other commands get SESSION_BUSY). The job auto-stops at maxDuration.',
+        'Start a STREAMING job on a server — for commands that never return on their own: tail -f /…/stdout.log, journalctl -f -u nginx, tcpdump, top -b, ping. Returns a jobId; then poll jumpserver_job_read(jobId) for the new output and call jumpserver_job_stop(jobId) when done. While a job runs the shell is reserved for it (other commands get SESSION_BUSY), and it auto-stops at maxDuration.',
       inputSchema: {
         target: z.string().describe('Target asset IP or name.'),
-        command: z.string().describe('Streaming command, e.g. "tail -f /usr/weaver/Resin4/log/stdout.log"'),
+        command: z.string().describe('Streaming command, e.g. "tail -f /usr/weaver/Resin4/log/stdout.log".'),
         maxDuration: z.number().int().min(1).max(900).optional().describe('Auto-stop after N seconds (default 300, max 900).'),
         confirm: z.boolean().optional().describe('Set true after the user approved this command (non-READ classifications require it).'),
+        // V0.5.3: accountIndex for the multi-username `ID>` selection screen.
+        accountIndex: z.number().int().min(0).optional().describe('The account ID shown by KoKo at the `ID>` prompt (usually 1 or 2; matches the number on the screen).'),
       },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },
     async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_job_start', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: args.confirm === true }
       return toolText(await guardValue(exec, async (): Promise<ResultValue> => {
-        const blocked = host.requireGrant(exec)
+        const blocked = host.requireReady(exec)
         if (blocked !== null) return blocked
         requireTargetAllowed(host.getConfig(), args.target)
         const bundle = host.bundleFor(exec)
@@ -365,6 +420,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
           maxDurationMs: args.maxDuration !== undefined ? args.maxDuration * 1000 : undefined,
           signal: exec.signal,
           toolCallId: String(exec.callId),
+          accountIndex: typeof args.accountIndex === 'number' ? args.accountIndex : undefined,
           classification: {
             risk: gated.classification.risk,
             reason: gated.classification.reason,
@@ -374,6 +430,9 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
             normalizedCommand: gated.classification.normalizedCommand,
           },
           approvalRequired: gated.approvalRequired,
+          // V0.5.8: a judge decision is recorded even for a job — the audit must
+          // show not just what ran but who let it run unattended.
+          riskJudge: gated.judgeNote,
           // V0.4.4: forward the deferred gate and let the SessionManager
           // derive the real approval outcome. Pre-stamping `approved` here
           // (the V0.4.3 bug) wrote "approved" to the audit while the user
@@ -398,7 +457,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
     'jumpserver_job_read',
     {
       description:
-        'Read the output of a streaming job (jumpserver_job_start) as a CURSOR READ: by default it returns only what arrived after the previous read and reports nextSeq, which you pass back as sinceSeq to resume exactly where you left off (safe to retry, never re-consumes old lines). full:true returns the whole buffered output instead. Use it to watch logs while you work: "keep reading the OA log" = call this repeatedly.',
+        'Read the output of a streaming job (jumpserver_job_start) as a CURSOR READ: by default it returns only what arrived after the previous read, plus nextSeq to pass back as sinceSeq so you resume exactly where you left off (safe to retry, never re-consumes old lines). full:true returns the whole buffered output instead.',
       inputSchema: {
         jobId: z.string().describe('Job id returned by jumpserver_job_start, e.g. jsjob_8fd11a'),
         sinceSeq: z.number().int().min(0).optional().describe('Absolute cursor to resume from — pass the nextSeq of the previous read. Omit to continue from the last read.'),
@@ -440,6 +499,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       inputSchema: {
         jobId: z.string().describe('Job id returned by jumpserver_job_start.'),
       },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },
     async (args, extra) => {
       const exec: ToolRunContext = { name: 'jumpserver_job_stop', callId: extra.requestId, signal: extra.signal , sessionId: extra.sessionId, confirm: false }
@@ -489,11 +549,14 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
   )
 }
 
+/**
+ * Refusal projection for the text-streaming ops tools. V0.5.12: it used to
+ * print code+message only, dropping `detail` and the `connection: INCOMPLETE
+ * — missing …` line, so a refusal told the model *that* it failed but never
+ * *why*. Delegates to renderResult, the single source of truth.
+ */
 function render(value: ResultValue): string {
-  const lines: string[] = []
-  if (value.code !== undefined) lines.push('code: ' + String(value.code))
-  if (value.message !== undefined) lines.push(String(value.message))
-  return lines.join('\n')
+  return renderResult(value)
 }
 
 /** Compact model-facing projection of a runbook run. */
@@ -520,7 +583,7 @@ export function renderRunbook(result: RunbookResult): string {
         (target.verdict !== null ? '  [' + target.verdict.toUpperCase() + ']' : '') + ' ==',
     )
     if (target.error !== null) {
-      lines.push('  !! 失败: ' + target.error.code + ': ' + target.error.message)
+      for (const line of renderFailureLines(target.error, '  !! ')) lines.push(line)
       continue
     }
     for (const step of target.steps) {
@@ -533,7 +596,7 @@ export function renderRunbook(result: RunbookResult): string {
         for (const failure of step.check.failures) lines.push('    x ' + failure)
       }
       if (step.error !== null) {
-        lines.push('    !! ' + step.error.code + ': ' + step.error.message)
+        for (const line of renderFailureLines(step.error, '    !! ')) lines.push(line)
         continue
       }
       // V0.4.3: a profile step is ONE row; its per-probe output is nested so
@@ -544,7 +607,7 @@ export function renderRunbook(result: RunbookResult): string {
             ' exit=' + (cmd.exitCode ?? '?')
           lines.push(probeHead)
           if (cmd.error !== null) {
-            lines.push('      !! ' + cmd.error.code + ': ' + cmd.error.message)
+            for (const line of renderFailureLines(cmd.error, '      !! ')) lines.push(line)
             continue
           }
           const probeBody = cmd.output.trim()
@@ -646,7 +709,8 @@ export function renderCompare(result: CompareResult): string {
     lines.push('')
     lines.push('--- 失败目标 ---')
     for (const failure of failures) {
-      lines.push('  ' + failure.target + ': ' + (failure.error !== null ? failure.error.code + ': ' + failure.error.message : '?'))
+      lines.push('  ' + failure.target + ':')
+      for (const line of renderFailureLines(failure.error, '    ')) lines.push(line)
     }
   }
   return lines.join('\n')
