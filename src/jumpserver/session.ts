@@ -3,9 +3,10 @@ import { AbortRequestedError, JumpServerError } from './errors.js'
 import { MarkerWatcher } from './output-buffer.js'
 import { cleanAnsi } from './output-buffer.js'
 import { nextState, SessionState } from './state-machine.js'
-import { looksLikeAccountSelection, looksLikeMenuPrompt, ScreenDetector, type ScreenState } from './detector.js'
+import { looksLikeAccountSelection, looksLikeMenuPrompt, looksLikeShellPrompt, ScreenDetector, type ScreenState } from './detector.js'
 import { buildDoneScript, buildProbeScript, cleanCommandOutput, parseDoneLine, PROBE_PREFIX } from './command-runner.js'
 import { parseProbeOutput } from './probe.js'
+import { verifyTargetIdentity } from './target-verify.js'
 import { MAX_ASSET_CAPTURE_BYTES, MAX_OUTPUT_BYTES } from '../config/types.js'
 import { footerComplete, hasPayloadEvidence, looksPaged, parseFooter } from './asset-list.js'
 import { randomHex, sleep } from './timing.js'
@@ -149,6 +150,40 @@ const ACCOUNT_PROMPT_STAYS_LIVE =
   ' — the session stays live at the KoKo ID> prompt: call again with accountIndex to answer it (no reconnect needed)'
 
 /**
+ * V0.6.0: KoKo banners that mean "this account may not use this asset".
+ *
+ * Split out of the generic failure pattern on purpose. The three entry
+ * failures need three different answers from the model:
+ *   - the asset does not exist        → fix the name/IP
+ *   - the asset exists, this account  → an administrator has to grant access;
+ *     is not authorized for it          retrying (with another accountIndex,
+ *                                       even) cannot help
+ *   - the asset exists but is not      → wait / report, do not retry
+ *     reachable from the bastion
+ * Reporting all three as "enter timeout" made the model keep retrying against
+ * an authorization wall.
+ */
+const ENTER_NOT_AUTHORIZED_PATTERN =
+  /无权限|无此权限|权限不足|未授权|没有权限|不允许访问|拒绝访问|permission denied|not authorized|unauthorized|access denied|forbidden/i
+
+/**
+ * V0.6.0: KoKo banners that mean "there is no such asset".
+ *
+ * Deliberately does NOT match the network-level phrases — those belong to
+ * {@link ENTER_UNREACHABLE_PATTERN}.
+ */
+const ENTER_NOT_FOUND_PATTERN =
+  /未找到|不存在|没有该资产|无此资产|资产不存在|找不到|not found|no such (?:host|asset|machine)|unknown asset/i
+
+/**
+ * V0.6.0: KoKo connection banners that mention the asset it tried to reach.
+ * Used for the target self-verification: the banner carries the asset's own
+ * IP as the bastion saw it, which is a second, independent witness next to
+ * the probe's `hostname -I`.
+ */
+const KOKO_TARGET_BANNER = /@([0-9]{1,3}(?:\.[0-9]{1,3}){3})/
+
+/**
  * V0.5.5: the KoKo line that explains why an entry failed.
  *
  * Scans the tail for the last line carrying a failure MARKER rather than just
@@ -236,6 +271,17 @@ export class JumpServerSession {
   currentHostname: string | null = null
   currentUser: string | null = null
   currentPwd: string | null = null
+  /**
+   * V0.6.0: the asset's own IPv4 addresses, as reported by the last probe.
+   * Used by the target self-verification and by the batch target binding.
+   */
+  currentIps: string[] = []
+  /**
+   * V0.6.0: true when the target self-verification positively confirmed that
+   * the shell owns the requested asset. 'unverified' (no address evidence) is
+   * NOT the same as 'verified' and must never be reported as such.
+   */
+  currentVerified = false
   connectedAt: number | null = null
   lastActivityAt: number | null = null
   reconnectCount = 0
@@ -513,6 +559,24 @@ export class JumpServerSession {
         // match first. Reporting the token gave the model `detail: error` and
         // no way to tell a dead asset from a wrong accountIndex.
         const banner = failureBanner(this.detector.tailPreview(2000), ENTER_FAILURE_PATTERN) || failureText
+        // V0.6.0: split the "enter failed" bucket into the three states that
+        // need three DIFFERENT answers from the model. The order matters:
+        // authorization and existence are checked BEFORE the network pattern,
+        // because a banner can mention both ("无权限" + "连接失败").
+        if (ENTER_NOT_AUTHORIZED_PATTERN.test(banner)) {
+          throw new JumpServerError(
+            'ASSET_NOT_AUTHORIZED',
+            'asset ' + target + ' exists but this bastion account is not authorized to use it — an administrator has to grant access. Retrying (even with another accountIndex) cannot help.',
+            'koko=' + banner,
+          )
+        }
+        if (ENTER_NOT_FOUND_PATTERN.test(banner)) {
+          throw new JumpServerError(
+            'ASSET_NOT_FOUND',
+            'asset ' + target + ' does not exist in this account\'s authorized asset list — check the name/IP.',
+            'koko=' + banner,
+          )
+        }
         if (ENTER_UNREACHABLE_PATTERN.test(banner)) {
           this.unreachable.set(target, { until: Date.now() + UNREACHABLE_COOLDOWN_MS, reason: banner })
           throw new JumpServerError(
@@ -526,6 +590,25 @@ export class JumpServerSession {
       if (!shellSeen) {
         const tail = this.detector.tailPreview(2048)
         const sel = looksLikeAccountSelection(tail)
+        // V0.6.0: the wait can also expire with an authorization / existence
+        // banner on screen (the failure marker may sit outside the 400-char
+        // window the loop scans). Classify it here too, so the model gets the
+        // actionable code instead of a generic timeout.
+        const banner = failureBanner(tail, ENTER_FAILURE_PATTERN)
+        if (banner.length > 0 && ENTER_NOT_AUTHORIZED_PATTERN.test(banner)) {
+          throw new JumpServerError(
+            'ASSET_NOT_AUTHORIZED',
+            'asset ' + target + ' exists but this bastion account is not authorized to use it — an administrator has to grant access. Retrying (even with another accountIndex) cannot help.',
+            'koko=' + banner,
+          )
+        }
+        if (banner.length > 0 && ENTER_NOT_FOUND_PATTERN.test(banner)) {
+          throw new JumpServerError(
+            'ASSET_NOT_FOUND',
+            'asset ' + target + ' does not exist in this account\'s authorized asset list — check the name/IP.',
+            'koko=' + banner,
+          )
+        }
         throw new JumpServerError(
           'ASSET_ENTER_TIMEOUT',
           'asset shell for ' + target + ' was not detected within the enter timeout',
@@ -548,9 +631,30 @@ export class JumpServerSession {
         this.setState(SessionState.UNKNOWN)
         throw new JumpServerError('ASSET_VERIFY_FAILED', 'target verification (probe) failed on ' + target)
       }
+      // V0.6.0: the target self-verification. Until now "a shell prompt
+      // appeared" was accepted as proof that the shell IS the requested asset.
+      // It is not — a batch that asked for 192.168.30.2 while the session was
+      // still on 192.168.30.3 ran its commands on the WRONG machine and
+      // reported success. The probe's own address list is the witness.
+      const verification = verifyTargetIdentity({ target, hostname: info.hostname, ips: info.ips })
+      if (verification.status === 'mismatch') {
+        // Fail closed: the shell is provably a different asset. Do NOT run a
+        // single command against it, and do not pretend the enter succeeded.
+        this.currentHostname = info.hostname
+        this.currentUser = info.user
+        this.currentPwd = info.pwd
+        this.setState(SessionState.UNKNOWN)
+        throw new JumpServerError(
+          'TARGET_VERIFICATION_FAILED',
+          'the session is not on the requested asset ' + target + ' — ' + verification.reason + '. No command was executed against it.',
+          'requested=' + target + ' observedIps=' + (verification.observedIps.join(',') || 'none') + ' hostname=' + (info.hostname ?? 'unknown'),
+        )
+      }
       this.currentHostname = info.hostname
       this.currentUser = info.user
       this.currentPwd = info.pwd
+      this.currentIps = info.ips
+      this.currentVerified = verification.status === 'verified'
       this.callbacks.onTarget?.(target, info.hostname, info.user, info.pwd)
       this.unreachable.delete(target)
       this.pendingAccountChoice = null
@@ -718,13 +822,43 @@ export class JumpServerSession {
 
   async leave(signal?: AbortSignal): Promise<void> {
     this.assertState(SessionState.ASSET_SHELL, 'NOT_IN_ASSET', 'leave requires an entered asset shell')
-    // Exactly one exit attempt: never auto-send multiple exits.
-    this.wire!.write('exit\n')
-    this.callbacks.onInput?.('exit')
-    const back = await this.waitForScreen(SessionState.JUMPSERVER_MENU, this.cfg.leaveMs, signal)
-    if (!back) {
+    // V0.6.0: bounded backoff instead of a single shot.
+    //
+    // The pre-V0.6.0 code sent `exit` exactly once and turned a missed menu
+    // confirmation into MENU_RETURN_FAILED + UNKNOWN — a deterministic
+    // cross-target failure (measured: the FIRST switch to a new target always
+    // failed, the identical retry always worked).
+    //
+    // Two facts drive the retry policy:
+    //   1. `exit` is only safe to send while the screen still looks like the
+    //      ASSET's shell. At the KoKo menu the same word disconnects the whole
+    //      bastion session, so a blind retry would cost the gateway.
+    //   2. KoKo repaints the menu as a bare navigation prompt (`[Host]> `) —
+    //      the box-drawn menu is gone by then. `looksLikeMenu` needs a frame
+    //      AND a numbered list, so the menu detector can miss a prompt-only
+    //      screen and report a failure for a leave that actually succeeded.
+    //      `looksLikeMenuPrompt` (last non-blank line) is the reliable check.
+    const backoffs = [300, 800, 2000]
+    for (let attempt = 0; attempt <= backoffs.length; attempt += 1) {
+      this.wire!.write('exit\n')
+      this.callbacks.onInput?.('exit')
+      // The first attempt keeps the full leave budget (unchanged semantics);
+      // the retries use a short slice — a lost exit reappears quickly, and a
+      // stuck screen must not hold the queue for another full leave timeout.
+      const waitMs = attempt === 0 ? this.cfg.leaveMs : Math.min(this.cfg.leaveMs, 3000)
+      if (await this.waitForMenuReturn(waitMs, signal)) break
+      // Still in the asset's own shell ⇒ the exit was lost; a resend is safe.
+      if (!this.stillInAssetShell()) break
+      if (attempt === backoffs.length) break
+      await sleep(backoffs[attempt]!)
+    }
+    if (!this.atKoKoPrompt() && this.detector.detect() !== 'JUMPSERVER_MENU') {
       this.setState(SessionState.UNKNOWN)
-      throw new JumpServerError('MENU_RETURN_FAILED', 'exit was sent but the JumpServer menu was not confirmed')
+      throw new JumpServerError(
+        'MENU_RETURN_FAILED',
+        'exit was sent but the JumpServer menu was not confirmed',
+        'attempts=' + (backoffs.length + 1) + ' screen=' + (this.detector.detect() ?? 'unknown'),
+      )
     }
     this.currentTarget = null
     this.currentHostname = null
@@ -732,6 +866,25 @@ export class JumpServerSession {
     this.currentPwd = null
     this.setState(SessionState.JUMPSERVER_MENU)
     this.touch()
+  }
+
+  /**
+   * V0.6.0: is the session sitting at a KoKo navigation prompt
+   * (`[Host]> ` / `Opt> `)? This is the CONFIRMATION that a leave succeeded:
+   * after `exit` KoKo repaints a bare prompt, not the framed menu, so the
+   * menu detector alone reports false failures.
+   */
+  atKoKoPrompt(): boolean {
+    return looksLikeMenuPrompt(this.detector.tailPreview(400))
+  }
+
+  /**
+   * V0.6.0: does the screen still look like the ASSET's own shell? Only then
+   * may another `exit` be sent — at the KoKo menu the same word would
+   * disconnect the bastion session itself.
+   */
+  private stillInAssetShell(): boolean {
+    return looksLikeShellPrompt(this.detector.tailPreview(600))
   }
 
   /**
@@ -933,6 +1086,27 @@ export class JumpServerSession {
     if (state === SessionState.JUMPSERVER_MENU) return 'JUMPSERVER_MENU'
     if (state === SessionState.ASSET_SHELL) return 'ASSET_SHELL'
     return undefined
+  }
+
+  /**
+   * V0.6.0: wait until the session is back at the KoKo menu.
+   *
+   * Accepts BOTH shapes of "we are at the menu": the framed menu the detector
+   * recognises, and the bare navigation prompt (`[Host]> `) that KoKo leaves
+   * behind after `exit`. The prompt-only shape is the common one and the
+   * menu detector misses it (it wants a frame AND a numbered list), which is
+   * exactly what made a successful leave look like a failure.
+   */
+  private async waitForMenuReturn(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      if (this.detector.detect() === 'JUMPSERVER_MENU') return true
+      if (this.atKoKoPrompt()) return true
+      if (this.wireClosed || this.wire === null) return false
+      if (signal?.aborted === true) throw new AbortRequestedError()
+      if (Date.now() >= deadline) return false
+      await sleep(80)
+    }
   }
 
   /** Run one script and watch for its marker; bounded capture, cancellable. */

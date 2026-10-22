@@ -59,6 +59,24 @@ export const JUMP_ERROR_CODES = [
   // the transport died underneath it). The answer must go through a fresh
   // enter() — retrying the same accountIndex on this session cannot work.
   'ACCOUNT_SELECTION_EXPIRED',
+  // V0.6.0: the bastion account is not allowed to use this asset at all
+  // (`无权限` / `permission denied` / `not authorized`). Split out of
+  // ASSET_ENTER_TIMEOUT because the three states need three DIFFERENT
+  // answers from the model:
+  //   - ASSET_NOT_FOUND      → the asset name/IP does not exist (fix the name)
+  //   - ASSET_NOT_AUTHORIZED → the asset exists but this account may not use
+  //                            it (an ADMIN has to grant access — retrying
+  //                            with another accountIndex cannot help)
+  //   - ASSET_UNREACHABLE    → the asset exists but the network is down
+  // Reporting all three as "enter timeout" made the model retry with
+  // different arguments against an authorization wall.
+  'ASSET_NOT_AUTHORIZED',
+  // V0.6.0: the session is provably NOT on the asset the caller asked for.
+  // The connector asked the shell who it was (hostname / `hostname -I`) and the
+  // answer contradicted the request — e.g. a batch asked for 192.168.30.2 while
+  // the shell answered `k8s-192-168-30-3`. No command may run in that state:
+  // this is the "假成功" (silent wrong-machine) defect.
+  'TARGET_VERIFICATION_FAILED',
 ] as const
 
 export type JumpServerErrorCode = (typeof JUMP_ERROR_CODES)[number]

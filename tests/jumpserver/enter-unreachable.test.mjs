@@ -217,19 +217,42 @@ test('the cooldown is per-target: a reachable asset is not collateral damage', a
   assert.equal(session.state, SessionState.ASSET_SHELL)
 })
 
-test('a non-network enter failure stays retryable (ASSET_ENTER_TIMEOUT)', async () => {
+test('a non-network enter failure is classified, not lumped into a timeout', async () => {
   const { session, holder } = await connectAtMenu()
   const enterP = session.enter(UNREACHABLE)
   setTimeout(() => holder.wire._emit('开始连接到 root(root)@192.168.138.56 error: 资产不存在\r\n[Host]> '), 30)
   const error = await enterP.then(() => null, (e) => e)
   assert.ok(error !== null)
-  assert.equal(error.code, 'ASSET_ENTER_TIMEOUT', 'a fixable failure must not be reported as unreachable')
+  // V0.6.0 (A-6): the banner says the asset does not exist, so the code must
+  // say so too. The old blanket ASSET_ENTER_TIMEOUT hid the difference
+  // between "fix the name" and "the network is down".
+  assert.equal(error.code, 'ASSET_NOT_FOUND', 'an explicit 资产不存在 banner must not be reported as unreachable')
+  assert.notEqual(error.code, 'ASSET_UNREACHABLE')
   assert.ok(error.detail.includes('资产不存在'), error.detail)
   // ...and it must not poison the target for the next attempt.
   const retry = session.enter(UNREACHABLE)
   setTimeout(() => holder.wire._emit(ASSET_SHELL_PROMPT), 30)
   await retry
   assert.equal(session.state, SessionState.ASSET_SHELL)
+})
+
+test('an authorization failure is reported as ASSET_NOT_AUTHORIZED (retrying cannot help)', async () => {
+  const { session, holder } = await connectAtMenu()
+  const enterP = session.enter(UNREACHABLE)
+  setTimeout(() => holder.wire._emit('开始连接到 root(root)@192.168.138.56 error: 无权限使用该资产\r\n[Host]> '), 30)
+  const error = await enterP.then(() => null, (e) => e)
+  assert.ok(error !== null)
+  assert.equal(error.code, 'ASSET_NOT_AUTHORIZED')
+  assert.ok(error.detail.includes('无权限'), error.detail)
+})
+
+test('a plain (unclassifiable) enter failure stays ASSET_ENTER_TIMEOUT', async () => {
+  const { session, holder } = await connectAtMenu()
+  const enterP = session.enter(UNREACHABLE)
+  setTimeout(() => holder.wire._emit('开始连接到 root(root)@192.168.138.56 error: 会话异常\r\n[Host]> '), 30)
+  const error = await enterP.then(() => null, (e) => e)
+  assert.ok(error !== null)
+  assert.equal(error.code, 'ASSET_ENTER_TIMEOUT')
 })
 
 test('looksLikeMenuPrompt accepts the two navigation prompts only', () => {

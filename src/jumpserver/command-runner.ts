@@ -13,13 +13,20 @@ export function buildDoneScript(command: string, marker: string): string {
   )
 }
 
-/** Build the target-probe script: labeled H=/U=/P= lines between unique markers. */
+/**
+ * Build the target-probe script: labeled H=/U=/P=/A= lines between unique markers.
+ *
+ * V0.6.0: `A=` carries the asset's own IPv4 addresses (`hostname -I`). It is
+ * additive — the connector still works on hosts where the command does not
+ * exist (the value is then empty and the IP check is simply skipped).
+ */
 export function buildProbeScript(marker: string): string {
   return (
     `printf '${PROBE_PREFIX}${marker}\n'\n` +
     `printf 'H=%s\\n' "$(hostname 2>/dev/null || echo ?)"\n` +
     `printf 'U=%s\\n' "$(whoami 2>/dev/null || echo ?)"\n` +
     `printf 'P=%s\\n' "$(pwd 2>/dev/null || echo ?)"\n` +
+    `printf 'A=%s\\n' "$(hostname -I 2>/dev/null | tr ' ' ',' | sed 's/,$//')"\n` +
     `printf '${PROBE_END_PREFIX}${marker}\n'`
   )
 }

@@ -55,8 +55,13 @@ const ACCOUNT_SELECTION_HEADER = /\[(?:Users|账号|用户|accounts?)\]|\b(?:账
 
 /**
  * True when the tail looks like a real shell prompt (asset shell).
+ *
+ * V0.6.0: exported. `leave()` needs it to decide whether it is SAFE to send
+ * a second `exit`: at the KoKo MENU the word `exit` disconnects the whole
+ * bastion session, so a retry may only be sent while the screen still looks
+ * like the asset's own shell.
  */
-function looksLikeShellPrompt(tail: string): boolean {
+export function looksLikeShellPrompt(tail: string): boolean {
   // Only inspect the last ~600 chars; a prompt is the final line.
   const window = tail.slice(-600)
   const lines = window.split('\n').filter((l) => l.trim().length > 0)

@@ -7,7 +7,7 @@
   "description_en": "Connect to a JumpServer bastion host and run permission-gated, audited operations on internal assets.",
   "source": "jumpserver",
   "type": "mcp",
-  "version": "0.5.13",
+  "version": "0.6.0",
   "auth_mode": "token",
   "minWorkbuddyVersion": "5.0.0",
   "examples_zh": [

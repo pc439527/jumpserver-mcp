@@ -5,6 +5,13 @@ export interface ProbeInfo {
   hostname: string | null
   user: string | null
   pwd: string | null
+  /**
+   * V0.6.0: the asset's own IPv4 addresses (`hostname -I`), used for the
+   * target self-verification (does the shell really sit on the asset that
+   * was requested?). Empty when the host has no `hostname -I` — the check is
+   * then skipped rather than failed.
+   */
+  ips: string[]
 }
 
 export { buildProbeScript } from './command-runner.js'
@@ -15,6 +22,7 @@ export { buildProbeScript } from './command-runner.js'
  *   H=hostname
  *   U=user
  *   P=pwd
+ *   A=10.0.0.1,10.0.0.2
  *   __DSH_JS_PROBE_END_<m>
  * Robust to command echo, continuation prompts and banner noise: values are
  * found by their labels, not by line position.
@@ -40,5 +48,9 @@ export function parseProbeOutput(raw: string, marker: string): ProbeInfo | null 
   const user = grab('U')
   const pwd = grab('P')
   if (hostname === null || user === null || pwd === null) return null
-  return { hostname, user, pwd }
+  const rawIps = grab('A')
+  const ips = rawIps === null
+    ? []
+    : rawIps.split(',').map((ip) => ip.trim()).filter((ip) => ip.length > 0)
+  return { hostname, user, pwd, ips }
 }

@@ -527,9 +527,17 @@ export class SessionManager {
       if (!this.options.getConfig().host || !this.options.getConfig().username) {
         throw new JumpServerError('NOT_CONFIGURED', 'JumpServer is not configured')
       }
-      const session = await this.ensureConnectedLocked(request.signal)
+      let session = await this.ensureConnectedLocked(request.signal)
       this.assertNoActiveJob()
-      const st = await this.navigateToTarget(session, request.target, request.accountIndex, request.signal)
+      const nav = await this.navigateWithRetry(session, request.target, request.accountIndex, request.signal)
+      session = nav.session
+      const st = nav.status
+      // V0.6.0 (A-3): the same target-binding guard the batch path uses.
+      // A command must never run on an asset the caller did not ask for.
+      const binding = this.assertTargetBinding(session, request.target)
+      if (binding !== null) {
+        throw new JumpServerError(binding.code, binding.message, binding.detail)
+      }
       if (request.beforeExec !== undefined) {
         try {
           await request.beforeExec()
@@ -578,12 +586,19 @@ export class SessionManager {
     }, request.signal)
   }
 
-  /** Shared navigation: menu -> enter(target) -> verified status. */
-  private async navigateToTarget(session: JumpServerSession, target: string, accountIndex?: number, signal?: AbortSignal): Promise<SessionStatus> {
+  /**
+   * Shared navigation: menu -> enter(target) -> verified status.
+   *
+   * V0.6.0 (A-7): the returned object carries the session the target was
+   * actually entered on. A leave self-heal replaces the transport, so the
+   * session the caller holds before navigation may be stale afterwards —
+   * using it would run the command on a dead PTY.
+   */
+  private async navigateToTarget(session: JumpServerSession, target: string, accountIndex?: number, signal?: AbortSignal): Promise<{ session: JumpServerSession; status: SessionStatus }> {
     let st = session.status()
-    if (st.state === SessionState.ASSET_SHELL && st.target === target) return st
+    if (st.state === SessionState.ASSET_SHELL && st.target === target) return { session, status: st }
     if (st.state === SessionState.ASSET_SHELL) {
-      await session.leave(signal)
+      session = await this.leaveAndRecover(session, signal)
       st = session.status()
       if (st.state !== SessionState.JUMPSERVER_MENU) {
         throw new JumpServerError('UNKNOWN_STATE', 'not reliably at the JumpServer menu after leaving an asset')
@@ -604,7 +619,113 @@ export class SessionManager {
       }
     }
     await session.enter(target, accountIndex, signal)
-    return session.status()
+    return { session, status: session.status() }
+  }
+
+  /**
+   * V0.6.0 (A-3): verify that the live session is really sitting on
+   * `target`. Returns null when the binding holds, otherwise the failure
+   * detail the caller must report.
+   */
+  private assertTargetBinding(session: JumpServerSession, target: string): { code: 'TARGET_VERIFICATION_FAILED'; message: string; detail?: string } | null {
+    const current = session.currentTarget
+    if (current === null) {
+      return {
+        code: 'TARGET_VERIFICATION_FAILED',
+        message: 'the session is not on any asset (requested ' + target + ') — no command was executed',
+      }
+    }
+    if (current !== target) {
+      return {
+        code: 'TARGET_VERIFICATION_FAILED',
+        message: 'the session is on ' + current + ', not on the requested target ' + target + ' — no command was executed',
+        detail: 'requested=' + target + ' actual=' + current,
+      }
+    }
+    return null
+  }
+
+  /**
+   * V0.6.0 (A-5): navigate to a target, retrying ONCE when the entry failed
+   * for a transient reason (the asset was unreachable / the entry timed out).
+   *
+   * A definitive rejection (no permission, asset does not exist, target
+   * mismatch) is NEVER retried — the answer would not change, and retrying
+   * would only delay the error the model needs to see.
+   */
+  private async navigateWithRetry(session: JumpServerSession, target: string, accountIndex?: number, signal?: AbortSignal): Promise<{ session: JumpServerSession; status: SessionStatus }> {
+    try {
+      return await this.navigateToTarget(session, target, accountIndex, signal)
+    } catch (error) {
+      const code = error instanceof JumpServerError ? error.code : null
+      const transient = code === 'ASSET_UNREACHABLE' || code === 'ASSET_ENTER_TIMEOUT'
+      if (!transient) throw error
+      this.options.onLog?.('enter ' + target + ' failed (' + code + '); retrying once')
+      await sleep(1500)
+      // The failed attempt may have left the session mid-flight; re-navigate
+      // from the current state (navigateToTarget leaves an asset when needed).
+      return await this.navigateToTarget(session, target, accountIndex, signal)
+    }
+  }
+
+  /**
+   * V0.6.0 (A-7): leave with self-healing.
+   *
+   * `session.leave()` can fail with MENU_RETURN_FAILED — the `exit` was sent
+   * but KoKo did not paint a menu. Instead of losing the whole turn, rebuild
+   * the transport (close -> connect) and re-check that the new session really
+   * sits at the menu. Only when THAT fails does the original error surface.
+   *
+   * Contract: the caller must hold the queue mutex (this method never calls
+   * the public `close()`/`connect()`, both of which would re-enter it).
+   */
+  private async leaveAndRecover(session: JumpServerSession, signal?: AbortSignal): Promise<JumpServerSession> {
+    try {
+      await session.leave(signal)
+      return session
+    } catch (error) {
+      const code = error instanceof JumpServerError ? error.code : null
+      if (code !== 'MENU_RETURN_FAILED') throw error
+      this.options.onLog?.('leave failed (MENU_RETURN_FAILED); rebuilding the JumpServer session')
+      // The failed leave may have left the PTY in an unknown screen. Drop it
+      // and build a fresh one; connectLocked() closes a stale session itself.
+      const stale = this.session
+      this.session = null
+      if (stale !== null) {
+        try {
+          await stale.close()
+        } catch {
+          /* already closed */
+        }
+      }
+      this.releasePtyOwnership()
+      this.assetCache = null
+      try {
+        await this.connectLocked(signal)
+      } catch (reconnectError) {
+        // The self-heal failed — the original navigation error is the useful
+        // one for the caller, so it wins; the reconnect problem is appended.
+        const why = reconnectError instanceof Error ? reconnectError.message : String(reconnectError)
+        throw new JumpServerError(
+          'MENU_RETURN_FAILED',
+          'exit was sent but the JumpServer menu was not confirmed, and reconnecting failed too: ' + why,
+          error instanceof JumpServerError ? error.detail : undefined,
+        )
+      }
+      // TS narrows `this.session` to null after the assignment above; the
+      // reconnect may have replaced it, so read it back explicitly.
+      const next = this.session as JumpServerSession | null
+      if (next === null || !next.isLive()) {
+        throw new JumpServerError('CONNECTION_LOST', 'leave self-heal: the reconnected session is not live')
+      }
+      if (next.status().state !== SessionState.JUMPSERVER_MENU) {
+        throw new JumpServerError(
+          'UNKNOWN_STATE',
+          'leave self-heal: reconnected, but the session is in state ' + next.status().state + ' instead of the JumpServer menu',
+        )
+      }
+      return next
+    }
   }
 
   /**
@@ -643,8 +764,10 @@ export class SessionManager {
       const cfg = this.options.getConfig()
       if (cfg.enabled === false) throw new JumpServerError('DISABLED', 'JumpServer is disabled in settings')
       if (!cfg.host || !cfg.username) throw new JumpServerError('NOT_CONFIGURED', 'JumpServer is not configured')
-      const session = await this.ensureConnectedLocked(request.signal)
-      const st = await this.navigateToTarget(session, request.target, request.accountIndex, request.signal)
+      let session = await this.ensureConnectedLocked(request.signal)
+      const nav = await this.navigateWithRetry(session, request.target, request.accountIndex, request.signal)
+      session = nav.session
+      const st = nav.status
 
       // V0.4.4: gate runs AFTER navigateToTarget and BEFORE the PTY write.
       // COMMAND_APPROVAL_REQUIRED is the only expected rejection — anything
@@ -803,14 +926,41 @@ export class SessionManager {
       }
       let st: SessionStatus
       try {
-        st = await this.navigateToTarget(session, request.target, request.accountIndex, request.signal)
+        const nav = await this.navigateWithRetry(session, request.target, request.accountIndex, request.signal)
+        session = nav.session
+        st = nav.status
       } catch (error) {
         return { target: request.target, hostname: session.currentHostname, error: this.errorDetail(error), commands: [] }
+      }
+      // V0.6.0 (A-3): the session must be bound to the requested target before
+      // ANY command runs. Without this check a stale shell (left over from an
+      // earlier task) silently answers a batch that asked for another asset —
+      // the "false success" reported from the CRM rollout (batch asked for
+      // 192.168.30.2, the command landed on k8s-192-168-30-3).
+      const binding = this.assertTargetBinding(session, request.target)
+      if (binding !== null) {
+        return { target: request.target, hostname: session.currentHostname, error: binding, commands: [] }
       }
       const results: BatchCommandResult[] = []
       for (const item of request.commands) {
         if (request.signal?.aborted === true) {
           throw new AbortRequestedError()
+        }
+        // V0.6.0 (A-3): re-check the binding per command — a command may have
+        // knocked the session out of the asset (asset reboot, idle logout).
+        const stillBound = this.assertTargetBinding(session, request.target)
+        if (stillBound !== null) {
+          results.push({
+            command: item.command,
+            executionState: 'ERROR',
+            commandStatus: 'UNKNOWN',
+            exitCode: null,
+            output: '',
+            truncated: false,
+            durationMs: 0,
+            error: stillBound,
+          })
+          break
         }
         try {
           if (item.beforeExec !== undefined) await item.beforeExec()
@@ -913,7 +1063,9 @@ export class SessionManager {
     async leave(signal?: AbortSignal): Promise<ManagerStatus> {
     return this.queue(async () => {
       const session = this.requireLiveSession()
-      await session.leave(signal)
+      // V0.6.0 (A-7): a failed leave is healed by rebuilding the session
+      // instead of surfacing MENU_RETURN_FAILED to the caller.
+      await this.leaveAndRecover(session, signal)
       await this.audit({ operation: 'leave', target: null, hostname: null, command: null, risk: 'READ', result: 'ok', exitCode: null, durationMs: null })
       return this.status()
     }, signal)

@@ -14,6 +14,8 @@ JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server. Ported
 
 **v0.5.13 makes the tab switches real.** V0.5.10 answered "can I switch these tabs off" with `auditViewer.tabs` in `config.json` and a read-only report in the 设置 tab — which is a *file the operator owns and the connector form rewrites*, not a control, and the report named the rule without saying how to use it. Reported as "I can't find where to turn this off". The 设置 tab now renders one checkbox per tab, persisted to the console's own `~/.workbuddy/jumpserver-mcp/console-prefs.json`, and a write returns the **authoritative** new list (nav, router and switches all redraw from it, so the nav that was rendered can never disagree with the router that guards it). Precedence is one rule: an explicit value in `config.json` wins, so those rows render **locked and disabled** rather than offering a click that cannot win; `settings` can never be hidden by either layer, and the store refuses such a write instead of accepting-and-ignoring it. Still a visibility switch and nothing more — no credential is written and no permission is granted, so it is not behind `allowCredentialWrite`. A corrupt preference file degrades to defaults (it is read while rendering a page) and refuses further writes (so recoverable data is not replaced).
 
+**v0.6.0 is the navigation / execution-integrity release.** Four field reports — CRM 深圳, 泛微 OA 肇庆, ESB 测试, 服务器采集 — all said the same thing in different words: the connector *answered*, but not on the machine it was asked about, and the first call after a target switch usually failed. Both had a root cause in the navigation layer, and both are fixed here. (1) **The "假成功" defect is gone.** Entering an asset was believed on the strength of "a shell prompt appeared", so a batch that asked for `192.168.30.2` could answer on `k8s-192-168-30-3` and still report success. The probe now collects the asset's own addresses (`hostname -I`) and hostname, the answer is compared with the request (`verified` / `unverified` / `mismatch`), and a **mismatch aborts the entry with `TARGET_VERIFICATION_FAILED` before a single command byte is written**; every batch command additionally re-checks that the session is still bound to the requested target. (2) **Leaving an asset is reliable.** `leave()` sent `exit` once and then waited for a boxed menu, while KoKo actually paints a bare `[Host]> ` prompt — so a *successful* leave was reported as `MENU_RETURN_FAILED` and the next target's entry failed with the session in `UNKNOWN`. `exit` is now retried (bounded) while the screen still looks like the asset's own shell (sending `exit` at the KoKo menu would kill the whole bastion session), and the bare prompt counts as a confirmed menu return; if the menu still never appears, the manager rebuilds the transport (close → connect → re-check) instead of losing the turn. (3) **Entry failures are classified, not lumped together.** `资产不存在` → `ASSET_NOT_FOUND`, `无权限` → `ASSET_NOT_AUTHORIZED`, a network banner → `ASSET_UNREACHABLE` (the only STOP), anything else → `ASSET_ENTER_TIMEOUT`; only the first two are new, and the authorization case used to be a generic timeout that the model answered by retrying against a wall. (4) **A batch result says what happened.** The result carries `executedCount` / `rejectedCount` / `failedTargets`, so "nothing ran" is distinguishable from "everything failed" — the single most important fact in a batch. A transient entry failure (unreachable / timeout) is retried once; a definitive rejection is not.
+
 ## Tools (23)
 
 | Tool | Purpose |
@@ -25,7 +27,7 @@ JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server. Ported
 | `jumpserver_assets` | List authorized assets (`p` only — read-only, footer-verified, cached) |
 | `jumpserver_exec` | Execute one simple command on the currently-entered asset |
 | `jumpserver_run` | Auto-navigate + verify + execute (one target, one command) |
-| `jumpserver_batch` | Multi-target multi-command batch (target affinity) |
+| `jumpserver_batch` | Multi-target multi-command batch (target affinity). The result carries `executedCount` / `rejectedCount` / `failedTargets`, so "nothing ran" is distinguishable from "everything failed" |
 | `jumpserver_leave` | Leave the current asset, return to the KoKo menu |
 | `jumpserver_close` | Close the session, release resources |
 | `jumpserver_snapshot` | Terminal mirror: read the recent PTY event stream |
@@ -194,8 +196,33 @@ What the connector does with that knowledge:
 - **The session survives.** KoKo is back at its own prompt, so the state is `JUMPSERVER_MENU`, not `UNKNOWN` — the next `jumpserver_enter`/`jumpserver_run` for a *different* asset needs no reconnect. The check is tail-anchored and refuses to accept an `ID>` prompt, where an asset name would be read as an account choice.
 - **The target is refused for 2 minutes** (`retryAfterMs`), before any byte reaches the PTY: KoKo would otherwise spend its own ~15 s dial timeout to fail identically. The cooldown is per-target, and an explicit `jumpserver_close` clears it (the usual reason to close is that the network was just fixed).
 - **Failures are scoped to one attempt.** The detector tail is reset when a dial starts, so a banner left over from a previous attempt is never re-matched against a healthy new one.
-- **Only network failures stop.** A non-network banner (e.g. `资产不存在`) still returns `ASSET_ENTER_TIMEOUT` and stays retryable — a wrong guess must not be turned into a dead end.
+- **Only network failures stop.** A non-network banner stays retryable — a wrong guess must not be turned into a dead end. But since V0.6.0 it is no longer a single bucket: the banner is classified, so the model gets the actionable code (see below).
 - **Multi-target tools keep the reason.** `errorDetail()` now forwards `detail` (V0.5.5: it used to drop it between the session and the tool result), so `jumpserver_batch` / `inspect` / `topology` / `compare` / `profile_run` / `baseline_*` print the banner **and** the STOP line per target instead of a bare `code: message`.
+
+### Three entry failures, three answers (V0.6.0)
+
+An entry that fails is not one thing, and the three cases need three different reactions. The connector reads the KoKo banner and answers accordingly:
+
+| KoKo banner | `code` | What the model should do |
+|---|---|---|
+| `网络不通（连接超时）` and other network phrases | `ASSET_UNREACHABLE` | STOP, report to the user; the target is refused for 2 minutes |
+| `无权限` / `permission denied` / `not authorized` | `ASSET_NOT_AUTHORIZED` | An administrator has to grant access — retrying (even with another `accountIndex`) cannot help |
+| `资产不存在` / `not found` / `no such host` | `ASSET_NOT_FOUND` | The name/IP is wrong — fix it. The target is **not** poisoned and stays retryable |
+| anything else | `ASSET_ENTER_TIMEOUT` | The generic bucket; the banner is in `detail` |
+
+Only the first one is a STOP condition. The authorization and existence cases used to be reported as a plain timeout, which made the model retry against a wall.
+
+### The shell is asked who it is (V0.6.0)
+
+Entering an asset used to be believed on the strength of "a shell prompt appeared" — which is how a batch that asked for `192.168.30.2` ended up answering on `k8s-192-168-30-3` and still reported success. The connector now asks the shell itself: the probe collects the asset's own IPv4 addresses (`hostname -I`) and hostname, and the answer is compared with the request.
+
+| Situation | Verdict |
+|---|---|
+| the requested IP is among the shell's own addresses | `verified` |
+| no address evidence (`hostname -I` unavailable) | `unverified` — the check is skipped, not failed |
+| the shell's addresses / hostname belong to a **different** machine | `mismatch` → `TARGET_VERIFICATION_FAILED`, **no command runs** |
+
+On top of that, every batch command re-checks that the session is still bound to the requested target before it is written. A command never reaches a machine the caller did not ask for.
 
 For multi-host surveys this means the unreachable host is reported once with its banner and the rest of the fleet is surveyed normally; repeated entries for the same host are refused instantly instead of re-dialling.
 

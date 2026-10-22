@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JumpServer MCP 连接器 · 完整迭代计划 · 20261022</title>
+<style>
+:root{
+  --bg:#101318;--panel:#171b22;--panel2:#1e232c;--panel3:#252b36;--line:#2b3240;--line2:#3a4353;
+  --fg:#e8ecf3;--fg2:#aeb7c6;--fg3:#78829a;
+  --red:#f0736f;--red-bg:#3a1d1d;--red-l:#e24b4a;
+  --amber:#ef9f27;--amber-bg:#382a11;--amber-l:#ef9f27;
+  --green:#3fc18c;--green-bg:#17301f;--green-l:#2aa76a;
+  --blue:#5aa2e8;--blue-bg:#132439;--blue-l:#378add;
+  --purple:#9b8cf0;--r:10px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding:40px 24px 90px}
+h1{font-size:25px;font-weight:650;margin:0 0 6px;letter-spacing:.2px}
+h2{font-size:18px;font-weight:620;margin:44px 0 14px;padding-bottom:9px;border-bottom:1px solid var(--line)}
+h3{font-size:14.5px;font-weight:620;margin:24px 0 9px;color:var(--fg)}
+p{margin:9px 0}
+code,.mono{font-family:"Cascadia Mono",Consolas,"Courier New",monospace;font-size:12.5px;background:#222835;color:#9fd0ff;padding:1px 5px;border-radius:3px}
+pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:13px 15px;overflow-x:auto;font-size:12.5px;line-height:1.6}
+pre code{background:none;color:#cfe0f5;padding:0}
+.sub{color:var(--fg3);font-size:13px;margin:0 0 20px}
+.meta{display:flex;flex-wrap:wrap;gap:6px 18px;color:var(--fg3);font-size:12.5px;margin:0 0 22px}
+.meta b{color:var(--fg2);font-weight:500}
+table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}
+th,td{text-align:left;padding:9px 11px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--fg2);font-weight:600;font-size:12.5px;background:var(--panel2);white-space:nowrap}
+tr:hover td{background:var(--panel2)}
+td.c{text-align:center;white-space:nowrap}
+.tag{display:inline-block;font-size:11.5px;padding:1px 7px;border-radius:4px;border:1px solid;white-space:nowrap;line-height:1.6}
+.t-red{color:var(--red);border-color:var(--red-l);background:var(--red-bg)}
+.t-amber{color:var(--amber);border-color:var(--amber-l);background:var(--amber-bg)}
+.t-green{color:var(--green);border-color:var(--green-l);background:var(--green-bg)}
+.t-blue{color:var(--blue);border-color:var(--blue-l);background:var(--blue-bg)}
+.t-gray{color:var(--fg3);border-color:var(--line2)}
+.t-purple{color:var(--purple);border-color:#3c3570;background:#211d3d}
+.box{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--blue);border-radius:8px;padding:13px 16px;margin:12px 0}
+.box.red{border-left-color:var(--red)}.box.amber{border-left-color:var(--amber)}.box.green{border-left-color:var(--green)}.box.blue{border-left-color:var(--blue)}.box.purple{border-left-color:var(--purple)}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:6px 14px;font-size:13px;margin:6px 0}
+.kv b{color:var(--fg2);font-weight:500}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:12px;margin:18px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px}
+.card .l{font-size:12px;color:var(--fg3);margin-bottom:5px}
+.card .v{font-size:23px;font-weight:650;font-variant-numeric:tabular-nums}
+.card .n{font-size:11.5px;color:var(--fg3);margin-top:3px}
+ol,ul{margin:8px 0;padding-left:22px}li{margin:5px 0}
+.small{font-size:12.5px;color:var(--fg2)}
+.foot{margin-top:52px;padding-top:16px;border-top:1px solid var(--line);color:var(--fg3);font-size:12.5px}
+.flow{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:16px 18px;margin:14px 0;font-family:"Cascadia Mono",Consolas,monospace;font-size:12.5px;line-height:1.9;white-space:pre;overflow-x:auto;color:#cfe0f5}
+@media print{body{background:#fff;color:#111}th{background:#f4f4f6}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>JumpServer MCP 连接器 · 完整迭代计划</h1>
+<p class="sub">基于 4 份独立审阅报告的合并去重 + v0.5.13 源码走查 · 批次化排期、门禁验收与风险登记</p>
+<div class="meta">
+  <span>基线版本 <b>v0.5.13</b></span>
+  <span>Git HEAD <b>0fe581f</b></span>
+  <span>观测口径 <b>7222 条审计 / 154 资产 / 44 天</b></span>
+  <span>合并后独立问题 <b>23 个</b></span>
+  <span>迭代批次 <b>4 + 1 并行线</b></span>
+  <span>产出日期 <b>2026-10-22</b></span>
+</div>
+
+<div class="cards">
+  <div class="card"><div class="l">P0 问题</div><div class="v" style="color:var(--red)">5</div><div class="n">导航 / 假成功 / 批量 / 分类</div></div>
+  <div class="card"><div class="l">P1 问题</div><div class="v" style="color:var(--amber)">8</div><div class="n">错误码 / 输出 / 审计</div></div>
+  <div class="card"><div class="l">P2 问题</div><div class="v" style="color:var(--blue)">10</div><div class="n">能力补齐 / 工程治理</div></div>
+  <div class="card"><div class="l">首调失败率</div><div class="v">100%</div><div class="n">目标 ≤ 5%</div></div>
+  <div class="card"><div class="l">命令级失败率</div><div class="v">8.5%</div><div class="n">目标 ≤ 3%</div></div>
+</div>
+
+<h2>一、结论先行</h2>
+<p>四份报告各自独立取证，<b>结论高度收敛</b>：连接器的内核（状态机 / 审计闭环 / 错误投影 / 资产不可达 STOP）已经成熟且经得起验证，剩余摩擦集中在<b>四个接缝</b>——跨目标导航、审批分类精度、输出体量、批量入参通道。</p>
+
+<div class="kv">
+  <b>判断 1</b><span><b>最高频缺陷是确定性代码缺陷，不是环境抖动。</b>4 份报告独立记录同一现象（CRM「首次切换必失败」、泛微「命中率 100%」、ESB「最高频痛点」、采集「B1」）。根因在 <code>src/jumpserver/session.ts:719</code> <code>leave()</code>——「发一次 exit + 等一次菜单回显」，失败即置 <code>UNKNOWN</code> 并把重试责任甩给调用方。</span>
+  <b>判断 2</b><span><b>「假成功」比「失败」更危险，必须排在失败之前。</b>CRM 症状 3：batch 返回 <code>target=192.168.30.2</code> 但 <code>hostname=k8s-192-168-30-3</code>，命令实际落在旧机器上却以成功状态返回——采集到错误主机的数据会一路带进报告结论。</span>
+  <b>判断 3</b><span><b>有一半收益不在连接器内，在客户端。</b>采集报告 A1：<code>targets</code> 数组被序列化坏，<code>batch/compare/inspect/topology</code> 四个工具全线报 <code>must be array</code>。连接器侧必须做降级入参兜底，但不能只靠连接器。</span>
+  <b>判断 4</b><span><b>分类器放宽是安全边界变更，必须独立立项、独立验收。</b>泛微报告明确建议：不宜与稳定性修复混在一起发布。fail-closed 是对的，错的是规则粒度。</span>
+</div>
+
+<div class="box green">
+<b>总目标</b>：把「日常可用性」问题清空——跨目标首调失败率 100% → ~0；只读命令审批拦截 → 0；输出入上下文量降一个量级。
+</div>
+
+<h2>二、四份报告问题合并与去重</h2>
+<p class="small">同一问题在不同报告里的编号对照，便于回溯到原始证据。</p>
+<table>
+<thead><tr><th style="width:60px">统一 ID</th><th>问题</th><th style="width:74px">ESB</th><th style="width:74px">CRM</th><th style="width:74px">泛微</th><th style="width:74px">采集</th><th style="width:96px">层级</th><th style="width:150px">判定</th></tr></thead>
+<tbody>
+<tr><td><b>N-01</b></td><td>跨目标切换首调必失败 <code>MENU_RETURN_FAILED</code></td><td class="c">B1/B2</td><td class="c">症状1/A3</td><td class="c">族1-①</td><td class="c">B1</td><td>连接器</td><td><span class="tag t-red">最高频·确定性缺陷</span></td></tr>
+<tr><td><b>N-02</b></td><td>「假成功」：命令落在旧机器仍报成功</td><td class="c">—</td><td class="c">症状3/A1</td><td class="c">族1/P0②</td><td class="c">—</td><td>连接器</td><td><span class="tag t-red">最危险</span></td></tr>
+<tr><td><b>N-03</b></td><td>batch 多 target 语义与实现冲突</td><td class="c">B4</td><td class="c">症状2/A2</td><td class="c">族1</td><td class="c">—</td><td>连接器</td><td><span class="tag t-red">文档与实现不一致</span></td></tr>
+<tr><td><b>N-04</b></td><td>数组入参被序列化坏，批量工具全线失败</td><td class="c">—</td><td class="c">—</td><td class="c">—</td><td class="c">A1</td><td>客户端+连接器</td><td><span class="tag t-red">通道级</span></td></tr>
+<tr><td><b>N-05</b></td><td>命令分类器字面量匹配误伤</td><td class="c">C1/C2</td><td class="c">B类</td><td class="c">族3</td><td class="c">C4/C5</td><td>连接器</td><td><span class="tag t-red">最大隐形损耗</span></td></tr>
+<tr><td><b>N-06</b></td><td><code>ASSET_ENTER_TIMEOUT</code> 语义过载</td><td class="c">A3</td><td class="c">语义混淆</td><td class="c">—</td><td class="c">—</td><td>连接器</td><td><span class="tag t-amber">诊断被带偏</span></td></tr>
+<tr><td><b>N-07</b></td><td><code>leave</code> 不可靠 / 无自愈</td><td class="c">—</td><td class="c">—</td><td class="c">族1</td><td class="c">B2</td><td>连接器</td><td><span class="tag t-amber">中</span></td></tr>
+<tr><td><b>N-08</b></td><td>并行调用串会话（KoKo 菜单是全局单例）</td><td class="c">—</td><td class="c">—</td><td class="c">族1/P0③</td><td class="c">—</td><td>连接器</td><td><span class="tag t-amber">数据正确性</span></td></tr>
+<tr><td><b>N-09</b></td><td>输出无硬阈值，超长单行爆上下文</td><td class="c">D1/D2</td><td class="c">C类</td><td class="c">族2</td><td class="c">—</td><td>连接器</td><td><span class="tag t-amber">token 成本</span></td></tr>
+<tr><td><b>N-10</b></td><td>无换行输出被完成标记吃掉</td><td class="c">—</td><td class="c">—</td><td class="c">族2⑤</td><td class="c">—</td><td>连接器</td><td><span class="tag t-amber">静默错误</span></td></tr>
+<tr><td><b>N-11</b></td><td>审批误判无可观测闭环</td><td class="c">C3</td><td class="c">B5</td><td class="c">—</td><td class="c">D2</td><td>连接器</td><td><span class="tag t-amber">中</span></td></tr>
+<tr><td><b>N-12</b></td><td>SENSITIVE_APPROVAL 整批丢弃且禁止重试</td><td class="c">C4</td><td class="c">B3/B4</td><td class="c">—</td><td class="c">—</td><td>连接器</td><td><span class="tag t-amber">整轮损失</span></td></tr>
+<tr><td><b>N-13</b></td><td>审计缺 <code>errorCode</code> / 无轮转 / 无聚合指标面</td><td class="c">D4</td><td class="c">—</td><td class="c">族2</td><td class="c">D1-D3</td><td>连接器</td><td><span class="tag t-amber">可观测</span></td></tr>
+<tr><td><b>N-14</b></td><td>版本副本漂移（三份）+ 无构建指纹</td><td class="c">B5</td><td class="c">—</td><td class="c">族4⑨⑩</td><td class="c">A3/A4</td><td>工程</td><td><span class="tag t-amber">排查链路不透明</span></td></tr>
+<tr><td><b>N-15</b></td><td>控制台 URL 钉 pid，重启即死</td><td class="c">B5</td><td class="c">E1-E3</td><td class="c">—</td><td class="c">D4</td><td>连接器</td><td><span class="tag t-blue">中</span></td></tr>
+<tr><td><b>N-16</b></td><td>Windows 资产在 KoKo 通道外</td><td class="c">—</td><td class="c">—</td><td class="c">族4</td><td class="c">C1</td><td>外部+连接器</td><td><span class="tag t-blue">核验盲区</span></td></tr>
+<tr><td><b>N-17</b></td><td>资产清单 IP ↔ 资产名系统性错位</td><td class="c">A1</td><td class="c">—</td><td class="c">—</td><td class="c">—</td><td>外部数据</td><td><span class="tag t-blue">中</span></td></tr>
+<tr><td><b>N-18</b></td><td>无文件传输通道（临时 HTTP 敞口）</td><td class="c">—</td><td class="c">D类</td><td class="c">—</td><td class="c">—</td><td>连接器</td><td><span class="tag t-blue">安全敞口</span></td></tr>
+<tr><td><b>N-19</b></td><td>危险命令无执行时长护栏</td><td class="c">—</td><td class="c">—</td><td class="c">—</td><td class="c">—</td><td>连接器</td><td><span class="tag t-blue">中</span></td></tr>
+<tr><td><b>N-20</b></td><td>工具表固定税 23821 B / 5955 token 每对话</td><td class="c">D3</td><td class="c">—</td><td class="c">—</td><td class="c">—</td><td>连接器</td><td><span class="tag t-blue">规模化</span></td></tr>
+<tr><td><b>N-21</b></td><td>单目标探针 50.5s，全量 ~1.8h</td><td class="c">—</td><td class="c">—</td><td class="c">—</td><td class="c">C2</td><td>连接器</td><td><span class="tag t-blue">吞吐</span></td></tr>
+<tr><td><b>N-22</b></td><td>发布节奏无 feature flag，13 次补丁全量回归</td><td class="c">F</td><td class="c">—</td><td class="c">—</td><td class="c">—</td><td>工程</td><td><span class="tag t-blue">流程</span></td></tr>
+<tr><td><b>N-23</b></td><td><code>interrupt</code> 无作业记 unverified，污染失败率</td><td class="c">—</td><td class="c">—</td><td class="c">族4</td><td class="c">D2</td><td>连接器</td><td><span class="tag t-gray">统计口径</span></td></tr>
+</tbody>
+</table>
+
+<div class="box amber">
+<b>去重结论</b>：4 份报告共提出约 40 条改进项，去重后 <b>23 个独立问题</b>，其中 P0 级 5 个、P1 级 8 个、P2 级 10 个。
+</div>
+
+<h2>三、迭代批次规划</h2>
+<p>采用 <b>4 个批次 + 1 条并行线</b>。每批次独立可发布、可回滚、有明确验收门禁。安全边界变更（N-05 分类器）单独成批、独立验收。</p>
+
+<div class="flow">批次 A  v0.6.0  导航收敛与执行定位   →  N-01 N-02 N-03 N-06 N-07
+批次 B  v0.6.1  通道与入参健壮性      →  N-04
+批次 C  v0.7.0  审批分类精度（独立验收）→  N-05 N-11 N-12
+批次 D  v0.7.1  输出预算与可观测性      →  N-09 N-10 N-13 N-23
+并行线  —       工程治理（随时可做）     →  N-14 N-15 N-17 N-22
+观察后  v0.8.0  能力补齐与规模化        →  N-16 N-18 N-19 N-20 N-21</div>
+
+<h3>批次 A · v0.6.0 —— 导航收敛与执行定位（最高优先级）</h3>
+<div class="box green"><b>✅ 已实施（2026-10-22）</b> —— 全部 7 项落地，版本 0.5.13 → 0.6.0；<b>598 tests 全绿</b>（原 575 + 新增 23）。</div>
+<div class="box red"><b>目标</b>：跨目标首调失败率 100% → ~0，杜绝假成功。</div>
+<table>
+<thead><tr><th style="width:52px">ID</th><th>任务</th><th style="width:210px">落点</th><th style="width:66px">复杂度</th></tr></thead>
+<tbody>
+<tr><td><b>A-1</b></td><td><code>leave()</code> 改退避重试：300/800/2000ms 重发 exit，最多 3 次；仍失败则 reconnect + re-enter，而非把会话打成 <code>UNKNOWN</code> 甩锅上层</td><td><code>src/jumpserver/session.ts:719</code></td><td class="c">中</td></tr>
+<tr><td><b>A-2</b></td><td>目标自校验硬约束：enter 成功后自动 <code>hostname</code> + <code>ip -4 addr</code> 解析并与请求 IP 比对，不一致抛 <code>TARGET_VERIFICATION_FAILED</code> 并终止该 target 后续命令</td><td><code>session.ts</code> / <code>session-manager.ts</code></td><td class="c">中</td></tr>
+<tr><td><b>A-3</b></td><td>batch 强制携带 target 绑定：每个 task 执行前校验会话归属，不匹配直接拒绝，绝不落到旧机</td><td><code>session-manager.ts</code> <code>navigateToTarget</code></td><td class="c">中</td></tr>
+<tr><td><b>A-4</b></td><td>batch 返回体区分「0 执行」与「全部失败」：新增 <code>executedCount</code> / <code>rejectedCount</code> / <code>failedTargets</code></td><td><code>src/runtime/tools-common.ts</code></td><td class="c">低</td></tr>
+<tr><td><b>A-5</b></td><td>batch 多 target 真实语义：内部对每个 target 强制 <code>leave → enter → verify</code>，enter 失败退避重试 1 次；不可达 target 单独失败而非整批失败</td><td><code>session-manager.ts</code> <code>runTargetBatch</code></td><td class="c">中</td></tr>
+<tr><td><b>A-6</b></td><td><code>ASSET_ENTER_TIMEOUT</code> 三态拆分：<code>ASSET_NOT_AUTHORIZED</code> / <code>ASSET_NOT_FOUND</code> / <code>ASSET_UNREACHABLE</code>，各带可执行的下一步文案</td><td><code>src/jumpserver/errors.ts</code> + <code>session.ts:524</code></td><td class="c">低</td></tr>
+<tr><td><b>A-7</b></td><td><code>leave</code> 自愈：<code>MENU_RETURN_FAILED</code> 时自动降级 close→connect 并复检菜单</td><td><code>session-manager.ts</code> <code>leave()</code></td><td class="c">中</td></tr>
+</tbody>
+</table>
+<div class="box">
+<b>门禁验收</b>
+<ol>
+<li>连续切换 20 个不同 target，首调成功率 ≥ 95%（当前基线 0%）— ⏳ <b>待真实环境验证</b>（需 20 台真实资产的堡垒机回归）</li>
+<li>「假成功」回归用例：故意让 batch 指定 B 机而会话停在 A 机，断言返回 <code>TARGET_VERIFICATION_FAILED</code> 且 A 机无命令执行痕迹 — ✅ <code>tests/jumpserver/batch-target-binding.test.mjs</code></li>
+<li>3 目标混合 batch（单账号 + 多账号 + 不可达）：断言 <code>commands &gt; 0</code> 且不可达目标单独失败 — ⚠️ <b>未覆盖</b>（缺多账号 <code>ID&gt;</code> 屏的 batch 夹具）</li>
+<li><code>tsc --noEmit</code> 通过 + <code>npm run test:only</code> 全绿 — ✅ <b>598 tests 全绿</b>；smoke / validate-connector / measure-context（23821 B 未变）/ <code>--doctor</code> 均通过</li>
+</ol>
+</div>
+<div class="box blue">
+<b>实施中修正的两处计划偏差</b>
+<ul>
+<li><b>A-1 根因比计划更深</b>：不只是「重试不够」。KoKo <code>exit</code> 后只留<b>裸提示符 <code>[Host]&gt;</code></b>（无框线无编号行），而 <code>looksLikeMenu()</code> 要求框线+编号组合 ⇒ <b>成功的 leave 被判失败</b>。修法：新增 <code>waitForMenuReturn()</code> 接受两种菜单形态，<code>looksLikeMenuPrompt</code> 作为可靠确认；<code>looksLikeShellPrompt</code> 导出用于「仍在资产 shell 内」判定（<b>在 KoKo 菜单发 <code>exit</code> 会断开整个堡垒机会话</b>，故重试有前置条件）。</li>
+<li><b>A-2 判定比计划保守</b>：不做「hostname 与请求名直接比对」，因为资产<b>显示名 ≠ hostname</b> 会造成大量误报。改为：请求目标是 IP 字面量 → 自身地址列表必须含它；hostname 内嵌 IP 与请求不符 → 明确 mismatch；其余一律 <code>unverified</code>（<b>跳过而非失败</b>）。用 <code>hostname -I</code>（<code>A=</code> 行）而非 <code>ip -4 addr</code>，无需 <code>stripPrefixes</code> 白名单。</li>
+<li>A-7 连带改造：<code>navigateToTarget()</code> 返回 <code>{ session, status }</code>（自愈会替换 session 对象，调用方持有的旧引用会指向死 PTY），3 个调用点（<code>run</code> / <code>startJob</code> / <code>runTargetBatchGated</code>）同步改。</li>
+</ul>
+</div>
+<div class="box amber">
+<b>风险</b>：A-1/A-5 每次切换增加 2–3s/target（用 A-2 免重试路径对冲）；A-2 多网卡可能误报（先 20 台真实资产回归确定 <code>stripPrefixes</code>）；<b>不可达目标绝不能进重试循环</b>，否则又是一轮 2m53s。
+</div>
+
+<h3>批次 B · v0.6.1 —— 通道与入参健壮性（批量能力复活）</h3>
+<div class="box red"><b>目标</b>：修 N-04，让 <code>batch / compare / inspect / topology</code> 真正可用。</div>
+<table>
+<thead><tr><th style="width:52px">ID</th><th>任务</th><th style="width:210px">落点</th><th style="width:66px">复杂度</th></tr></thead>
+<tbody>
+<tr><td><b>B-1</b></td><td>数组入参降级：schema 改 <code>anyOf: [array, string]</code>，string 用逗号/空格分隔，工具内部归一</td><td><code>src/runtime/tools-ops.ts</code> + <code>server.ts</code></td><td class="c">低</td></tr>
+<tr><td><b>B-2</b></td><td>归一函数单测：逗号分隔、空串、重复项、非法 IP 全覆盖</td><td><code>tests/</code></td><td class="c">低</td></tr>
+<tr><td><b>B-3</b></td><td>客户端侧修复提工单：定位 WorkBuddy MCP 调用层把 <code>array</code> 降级为非数组的路径</td><td>平台侧（本仓库外）</td><td class="c">—</td></tr>
+<tr><td><b>B-4</b></td><td>工具可用性自检：<code>jumpserver_status</code> 输出「工具已注册 / 未注册」+ 当前 owner pid + 控制台 URL 有效性</td><td><code>src/runtime/doctor.ts</code></td><td class="c">低</td></tr>
+<tr><td><b>B-5</b></td><td>兜底提示：检测到入参是字符串而 schema 期望数组时，错误文案直接给出「请用逗号分隔字符串」的可用写法</td><td><code>src/runtime/tools-common.ts</code></td><td class="c">低</td></tr>
+</tbody>
+</table>
+<div class="box"><b>门禁验收</b>：① 用 <code>"1.1.1.1,2.2.2.2"</code> 调 <code>inspect</code>，结果与数组入参等价；② 连发 20 次双 target <code>inspect</code>，成功率 ≥ 95%；③ 断开 MCP 后跑 <code>jumpserver_status</code> 显式报「未注册」。</div>
+<div class="box amber"><b>风险</b>：schema 变更需同步 <code>README.md</code> 与 <code>tool-annotations.test.mjs</code> 断言。<b>B-3 不在本仓库可控范围——B-1 是必须做的兜底，不能等 B-3。</b></div>
+
+<h3>批次 C · v0.7.0 —— 审批分类精度（安全边界，独立立项）</h3>
+<div class="box red"><b>目标</b>：修 N-05 / N-11 / N-12，只读命令审批拦截降到 0，同时不放宽任何写操作。</div>
+<div class="box purple">
+<b>前置原则（不可妥协）</b>
+<ul>
+<li>放宽条件必须是「<b>子命令白名单 + 参数形状校验</b>」双条件，禁止「包含即放行」</li>
+<li>白名单<b>逐条人工签核</b>，禁止用通配符形态做白名单键（<code>crontab -l</code> ✅ / <code>crontab*</code> ❌）</li>
+<li>判定失败一律 fail-closed（拒绝），不得回落放行</li>
+</ul>
+</div>
+<table>
+<thead><tr><th style="width:52px">ID</th><th>任务</th><th style="width:190px">落点</th><th style="width:58px">难度</th><th style="width:170px">验收样本</th></tr></thead>
+<tbody>
+<tr><td><b>C-1</b></td><td>只读等价白名单：<code>.properties</code> 读取、<code>crontab -l</code>、<code>ufw status</code>、<code>mysql -e 'SELECT/SHOW'</code>、<code>hdbsql</code> 只读形态</td><td><code>src/security/command-classifier.ts</code></td><td class="c">中</td><td>446 条 UNKNOWN 全量回归</td></tr>
+<tr><td><b>C-2</b></td><td>危险字面量只在<b>命令位置</b>匹配：<code>shutdown</code>/<code>reboot</code> 不在 grep 参数里匹配</td><td><code>command-classifier.ts</code></td><td class="c">中</td><td><code>grep 'a|shutdown' f</code> → READ</td></tr>
+<tr><td><b>C-3</b></td><td>解析式判定替代关键字：<code>crontab -l</code> vs <code>-e/-r</code>；<code>mysql -e 'select'</code> vs <code>'drop'</code>；<code>kubectl exec</code> 内层 <code>config get</code>/<code>cluster nodes</code>/<code>info</code> → READ</td><td><code>command-classifier.ts</code></td><td class="c">高</td><td>99 条 DENIED 逐条标注</td></tr>
+<tr><td><b>C-4</b></td><td>命令存在性前置探测（<code>command -v</code>），不存在直接返回 <code>COMMAND_NOT_FOUND</code>，不进执行与审批</td><td><code>session-manager.ts</code> exec 前置</td><td class="c">中</td><td>exit 127：80 → ~0</td></tr>
+<tr><td><b>C-5</b></td><td>敏感探查独立 scope：域名/连接串/端口探查单独成批，敏感判定只作用于该批</td><td><code>src/security/permission-gate.ts</code></td><td class="c">低</td><td>采集批次不再整批 0 执行</td></tr>
+<tr><td><b>C-6</b></td><td>单条拒绝不吞整批：敏感/高危命令只拦自身，其余正常执行并标注拒绝原因</td><td><code>runTargetBatchGated</code></td><td class="c">中</td><td>混合批次 1 拒 + N 执行</td></tr>
+<tr><td><b>C-7</b></td><td>复合命令拒绝时给<b>可复制的拆分建议</b>（不改拦截策略）</td><td><code>errors.ts</code> + <code>tools-common.ts</code></td><td class="c">低</td><td>拦截不再需人机往返</td></tr>
+<tr><td><b>C-8</b></td><td>审批误判标记闭环：审计页支持「误判」标记，人工授权即写回</td><td><code>src/runtime/audit-viewer.ts</code></td><td class="c">中</td><td>误判率可统计</td></tr>
+<tr><td><b>C-9</b></td><td>Typesafe 风险判定分级调用：只读白名单命令不调用；仅 mutation/dangerous 候选送模型复核；判定失败按「拒绝」兜底</td><td><code>src/security/risk-judge.ts</code></td><td class="c">中</td><td>不影响只读排障可用性</td></tr>
+</tbody>
+</table>
+<div class="box"><b>门禁验收</b>：① 446 条 UNKNOWN 回归语料召回率 ≥ 90%；② 99 条 DENIED 原样重跑人工标注期望风险，<b>零写操作误放行</b>；③ exit 127 ≈ 0；④ <code>command-classifier-corpus/</code> 扩充真实误判样本，<code>unknown-command.mjs</code> 保持「规则一改就红」守门机制。</div>
+<div class="box amber"><b>风险（高）</b>：白名单过宽 = MODIFY 混入 READ = 安全事故。必须逐条人工签核 + 零写操作误放行为硬门禁 + 独立发布。</div>
+
+<h3>批次 D · v0.7.1 —— 输出预算与可观测性</h3>
+<div class="box red"><b>目标</b>：修 N-09 / N-10 / N-13 / N-23，输出入上下文量降一个量级。</div>
+<table>
+<thead><tr><th style="width:52px">ID</th><th>任务</th><th style="width:200px">落点</th><th style="width:58px">复杂度</th></tr></thead>
+<tbody>
+<tr><td><b>D-1</b></td><td><code>MAX_OUTPUT_BYTES</code> 1 MiB → 64 KiB</td><td><code>src/config/types.ts:344</code></td><td class="c">低</td></tr>
+<tr><td><b>D-2</b></td><td>超长<b>行</b>中间折叠（保留头尾 + 标注 <code>[…省略 N 字节…]</code>），不是整段字节截断</td><td><code>src/jumpserver/output-buffer.ts</code></td><td class="c">中</td></tr>
+<tr><td><b>D-3</b></td><td>超阈值自动落盘，返回「已落盘 + 行数 + 前 N 行 + 路径」并给针对性建议（改用 <code>wc -l</code> / <code>tail -c</code>）</td><td><code>output-buffer.ts</code> + <code>tools-common.ts</code></td><td class="c">中</td></tr>
+<tr><td><b>D-4</b></td><td>命令结束强制补换行；完成标记改为<b>行首唯一前缀</b>而非行尾唯一后缀</td><td><code>session.ts</code> + <code>terminal-observer.ts</code></td><td class="c">中</td></tr>
+<tr><td><b>D-5</b></td><td>输出归一化层：剥离 IPv4-mapped 前缀（<code>[::ffff:x]</code> → <code>x</code>）、压缩空白、归一时间戳</td><td><code>output-buffer.ts</code></td><td class="c">低</td></tr>
+<tr><td><b>D-6</b></td><td>审计字段规范化：所有失败记录补 <code>errorCode</code> / <code>riskRuleId</code> / <code>durationMs</code>（当前 117/216 条取不到错误码）</td><td><code>src/security/audit.ts</code></td><td class="c">低</td></tr>
+<tr><td><b>D-7</b></td><td>审计轮转：<code>audit.jsonl</code> 按天切分 + 保留 N 天 + 每日聚合指标文件</td><td><code>src/runtime/audit-store.ts</code></td><td class="c">低</td></tr>
+<tr><td><b>D-8</b></td><td>失败率口径修正：<code>interrupt</code> 无作业的 <code>unverified</code> 剔除；<code>EXIT_NONZERO</code>（395 次，占 command 级失败 78%）单独成类</td><td><code>audit-store.ts</code> + 控制台 stats</td><td class="c">低</td></tr>
+<tr><td><b>D-9</b></td><td><code>doctor</code> 增加就绪度检查：owner pid / 控制台 URL 有效性 / 已授权资产数 / 外部依赖可达性</td><td><code>src/runtime/doctor.ts</code></td><td class="c">中</td></tr>
+<tr><td><b>D-10</b></td><td>危险命令执行护栏：DANGEROUS/UNKNOWN 的写操作加最大执行时长与影响行数提示</td><td><code>command-runner.ts</code></td><td class="c">中</td></tr>
+</tbody>
+</table>
+<div class="box"><b>门禁验收</b>：① catalina.out 场景复测 grep 耗时，输出稳定 ≤ 64 KiB；② 单条日志命令 token 从 ~30K 降到 ~2K；③ 扫 <code>audit.jsonl</code>，<code>errorCode</code> 覆盖率 100%；④ <code>--doctor</code> 零副作用（不绑端口、不连 SSH、不输出凭据、不在被诊断输入上抛异常）。</div>
+<div class="box amber"><b>风险</b>：截断可能丢关键行 → 必须保留首尾 + 明确标注 <code>truncated</code> + 支持按需取全。<b><code>renderResult()</code> 是白名单渲染</b>，加字段不会进模型文本，除非显式加一行（V0.5.12 教训）。</div>
+
+<h3>并行线 · 工程治理（不占功能批次，随时可做）</h3>
+<table>
+<thead><tr><th style="width:52px">ID</th><th>任务</th><th style="width:190px">修的问题</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><b>E-1</b></td><td>三份副本收敛</td><td>N-14</td><td>保留 <code>C:\Users\114976\WorkBuddy\jumpserver-mcp</code> 为唯一源码/构建目录（目录联接抗挪盘）；<code>plugins/jumpserver</code>（v0.5.0，<code>accountIndex</code> 出现 0 次）删除或标 <code>deprecated</code>；凭据与 profile 留在 <code>~/.workbuddy/jumpserver-mcp</code>。本项目已因此发生至少 2 次「改了没生效」</td></tr>
+<tr><td><b>E-2</b></td><td>构建指纹</td><td>N-14</td><td>构建时写 <code>build-info.json</code>（commit + 特性位图），启动时读并暴露到 <code>jumpserver_status</code>。当前只能用 mtime 判断版本，而 <code>lib/</code>(09-23) 与 commit(10-08) 时间倒挂</td></tr>
+<tr><td><b>E-3</b></td><td>feature flag 分层发布</td><td>N-22</td><td>配置项/UI 开关走 flag；UI 改动与协议改动分开版本。避免「13 次补丁修 UI，每次全量回归」</td></tr>
+<tr><td><b>E-4</b></td><td>控制台 URL 不钉 pid</td><td>N-15</td><td><code>?inst=&lt;pid&gt;</code> 改为可失效降级为 owner 自愈 + 单实例保障。实测 25 分钟内 8765 owner 换了 3 次，预览面板报「暂无数据」实为面板文件回退错误</td></tr>
+<tr><td><b>E-5</b></td><td>资产别名反查缓存</td><td>N-17</td><td><code>jumpserver_assets</code> 结果落盘，提供 <code>alias → ServerId/hostname/IP</code> 反查，<code>run</code> 找不到精确匹配时给最接近候选。ESB 环境 4 组错位映射做回归</td></tr>
+<tr><td><b>E-6</b></td><td>工具表瘦身</td><td>N-20</td><td>6 个多目标工具合并为单一 <code>mode</code> 参数入口（23821 B → ~19 KB）。<b>破坏公共工具面</b>，等第二个使用者再动</td></tr>
+<tr><td><b>E-7</b></td><td>受控文件拉取 <code>jumpserver_fetch</code></td><td>N-18</td><td>走堡垒机通道取文件到宿主临时目录，带大小上限与路径白名单，替代临时 <code>SimpleHTTPServer</code> 敞口</td></tr>
+<tr><td><b>E-8</b></td><td>Windows 通道 + API 资产发现</td><td>N-16</td><td>项目内已验证 53 台 Windows 中 39 台可达（<code>:19182/metrics</code>），连接器未内建</td></tr>
+<tr><td><b>E-9</b></td><td>探针提速</td><td>N-21</td><td>basic profile 50.5s/台 → 拆分并行子命令或走 job 模式</td></tr>
+</tbody>
+</table>
+
+<h2>四、量化验收指标（发布门禁）</h2>
+<table>
+<thead><tr><th>指标</th><th style="width:180px">当前</th><th style="width:140px">目标</th><th style="width:120px">归属</th></tr></thead>
+<tbody>
+<tr><td>跨目标首调失败率</td><td>~100%</td><td>≤ 5%</td><td>A-1/A-5</td></tr>
+<tr><td>假成功事件</td><td>未统计（至少 1 起已确认）</td><td><b>0</b></td><td>A-2/A-3</td></tr>
+<tr><td>批量工具参数校验失败率</td><td>batch 3/3、compare 4/4、inspect 6/7 失败</td><td>≤ 5%</td><td>B-1</td></tr>
+<tr><td>只读命令审批拦截</td><td>99 次 DENIED（其中 67 次是只读）</td><td>0</td><td>C-1/C-3</td></tr>
+<tr><td>exit 127</td><td>80 次</td><td>≈ 0</td><td>C-4</td></tr>
+<tr><td>单命令输出入上下文</td><td>91 KB ~ 26 万字符</td><td>≤ 64 KB</td><td>D-1/D-2</td></tr>
+<tr><td><code>audit.jsonl</code> 错误码覆盖率</td><td>117/216 缺失</td><td>100%</td><td>D-6</td></tr>
+<tr><td><code>tools/list</code> payload</td><td>23821 B（5955 token/对话）</td><td>观察期不动 → ~19 KB</td><td>E-6</td></tr>
+<tr><td>单目标探针耗时</td><td>50.5s</td><td>≤ 15s</td><td>E-9</td></tr>
+<tr><td>命令级失败率</td><td>8.5%</td><td>≤ 3%</td><td>A+C 合计</td></tr>
+</tbody>
+</table>
+
+<h2>五、每批次标准回归流程</h2>
+<pre><code>export PATH="/usr/bin:/bin:$PATH"
+NODE="C:/Users/114976/.workbuddy/binaries/node/versions/22.22.2-6/node.exe"
+
+# 1. 类型检查（改 TS 后必跑）
+$NODE node_modules/typescript/bin/tsc --noEmit -p tsconfig.json
+
+# 2. 全量测试（基线 575 tests / ~122s）
+$NODE scripts/run-tests.mjs
+
+# 3. 冒烟
+$NODE scripts/smoke.mjs
+$NODE scripts/validate-connector.mjs
+$NODE scripts/measure-context.mjs   # 改工具描述前必跑
+#   当前 23821 B / 上限 24500 B / 单工具上限 1700 B
+
+# 4. 自检
+$NODE lib/server.js --doctor
+
+# 5. 入口校验
+$NODE scripts/verify-connector-entry.mjs</code></pre>
+<div class="box amber">
+<b>发布纪律</b>：版本号两处同步（<code>package.json</code> + <code>connector/connector-meta.json</code>）；<code>lib/</code> 是 gitignore 产物，<b>只改 <code>src/</code></b>；改完 <code>tsc -p tsconfig.json</code> 构建；改 <code>lib/</code> 后<b>必须重启连接器进程 + UI 断开重连</b>（spawn 时已缓存，不热更新）；改工具后同步 <code>README.md</code> 的 <code>## Tools (N)</code>。
+</div>
+
+<h2>六、风险登记</h2>
+<table>
+<thead><tr><th style="width:44px">等级</th><th>风险</th><th style="width:130px">影响</th><th>缓解</th></tr></thead>
+<tbody>
+<tr><td><span class="tag t-red">极高</span></td><td>分类器白名单过宽，写操作混入 READ</td><td>安全事故</td><td>双条件校验 + 逐条人工签核 + 零写操作误放行硬门禁 + 独立发布</td></tr>
+<tr><td><span class="tag t-amber">中</span></td><td>A-2 多网卡资产误报</td><td>误阻断正常采集</td><td><code>stripPrefixes</code> 白名单；先 20 台真实资产回归再放开</td></tr>
+<tr><td><span class="tag t-amber">中</span></td><td>退避重试把不可达目标拖成长循环</td><td>2m53s 复现</td><td>不可达目标不进重试；复用 v0.5.5 冷却 + <code>ASSET_UNREACHABLE</code> STOP 指引</td></tr>
+<tr><td><span class="tag t-amber">中</span></td><td>客户端数组序列化不修</td><td>批量通道继续退化</td><td>B-1 降级入参兜底（不等 B-3）</td></tr>
+<tr><td><span class="tag t-blue">低</span></td><td>工具表瘦身破坏既有自动化</td><td>外部依赖断</td><td>推迟到 v0.8，等第二个使用者</td></tr>
+<tr><td><span class="tag t-blue">低</span></td><td>并发提升压垮堡垒机</td><td>限流/审计异常</td><td><code>batchConcurrency</code> 默认 1 → 4，先小样本 20 台验证</td></tr>
+<tr><td><span class="tag t-blue">低</span></td><td><code>renderResult()</code> 白名单遗漏字段</td><td>模型看不到诊断</td><td>新增字段显式加一行；V0.5.12 教训</td></tr>
+</tbody>
+</table>
+
+<h2>七、外部依赖（连接器无法单独解决）</h2>
+<table>
+<thead><tr><th>依赖</th><th style="width:130px">归属</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>WorkBuddy MCP 客户端数组参数序列化修复</td><td>平台侧</td><td>需提工单确认是否可修；连接器侧已做降级兜底</td></tr>
+<tr><td>资产授权补全（Windows / 73.134 / NFS 77.101）</td><td>JumpServer 管理端</td><td>账号可见范围按人隔离（欧建达 138 台 / 温智景 96 台）</td></tr>
+<tr><td>资产清单 IP ↔ 资产名对照表（30.123→S030122 等）</td><td>应用清单侧</td><td>外部数据源，连接器只能做反查提示</td></tr>
+<tr><td>SSH 绕行通道（159.55 / 159.68）<code>core:8080 EOF</code></td><td>堡垒机侧</td><td>外部不稳定，必须走 MCP</td></tr>
+</tbody>
+</table>
+
+<h2>八、事实与推断分离</h2>
+<div class="box green">
+<b>事实（有日志 / 代码 / 审计支撑）</b>
+<ul>
+<li>审计 7222 条 / 154 台资产 / 44 天；命令级失败率 8.5%</li>
+<li><code>session.ts:719</code> <code>leave()</code> 确认为「一次 exit + 一次 <code>waitForScreen</code>」，失败即抛 <code>MENU_RETURN_FAILED</code> 并置 <code>UNKNOWN</code>，无重试</li>
+<li><code>MENU_RETURN_FAILED</code> 4 份报告独立记录，跨 5 个不同工作日</li>
+<li><code>TARGET_VERIFICATION_FAILED</code> 错误码<b>已存在</b>（<code>errors.ts:25</code>）但无调用方</li>
+<li><code>MAX_OUTPUT_BYTES = 1024 * 1024</code>（<code>config/types.ts:344</code>），截断在字节层而非行层</li>
+<li><code>tools/list</code> 实测 23821 B / 23 工具 / 5955 token 每对话</li>
+<li><code>classifyCommand</code> 中 <code>crontab</code> 属 <code>MODIFY_VERBS</code>，<code>shutdown|reboot</code> 属 DANGEROUS 全文匹配</li>
+<li><code>SessionMutex</code> 仅单 session-manager 实例内串行；KoKo 菜单是堡垒机侧单例</li>
+<li><code>lib/</code> mtime 2026-09-23 / <code>src/</code> 最新提交 2026-10-08 —— 时间倒挂<b>已排除</b>为版本滞后</li>
+<li><code>plugins/jumpserver</code> 为 v0.5.0，<code>session-manager.js</code> 中 <code>accountIndex</code> 出现 0 次</li>
+</ul>
+</div>
+<div class="box">
+<b>推断（需在对应批次中验证）</b>
+<ul>
+<li>跨目标首调失败占命令级失败约一半 → 修复 A-1 后总失败率有望降到 3% 以内</li>
+<li>分类器放宽可放回 67/99 条 DENIED（kubectl exec 34 + crontab -l 11 + docker exec 11 + 部分复合命令）</li>
+<li><code>batchConcurrency</code> 1 → 4，巡检吞吐提升 3~4 倍，127 台全采从 ~1.8h 降至 ~30min（需实测）</li>
+<li>数组入参「偶发成功」说明 schema 合法，问题在客户端生成侧而非 schema 定义</li>
+</ul>
+</div>
+
+<div class="foot">
+本计划为排期文档，未对连接器做任何修改。数据来源：<code>data/audit.jsonl</code>（7222 条）、<code>src/</code> 源码走查、4 份审阅报告（ESB-测试 / CRM-深圳 / 泛微OA-肇庆 / 服务器采集）。
+</div>
+
+</div>
+</body>
+</html>

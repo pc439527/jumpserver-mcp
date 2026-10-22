@@ -274,6 +274,15 @@ export function renderResult(value: ResultValue): string {
   if (value.hostname !== undefined) lines.push('hostname: ' + String(value.hostname))
   if (value.user !== undefined) lines.push('user: ' + String(value.user))
   if (value.exitCode !== undefined) lines.push('exitCode: ' + String(value.exitCode))
+  // V0.6.0 (A-4): the batch counters. renderResult is a whitelist — without
+  // these lines the model sees the batch output text but never learns that
+  // ZERO commands were executed (all targets failed to be entered).
+  if (value.executedCount !== undefined) lines.push('executedCount: ' + String(value.executedCount))
+  if (value.rejectedCount !== undefined) lines.push('rejectedCount: ' + String(value.rejectedCount))
+  if (Array.isArray(value.failedTargets)) {
+    const failed = value.failedTargets.map((t) => String(t))
+    lines.push('failedTargets: ' + (failed.length === 0 ? 'none' : failed.join(', ')))
+  }
   if (typeof value.output === 'string' && value.output.length > 0) {
     lines.push('--- output ---')
     lines.push(value.output)
@@ -286,13 +295,25 @@ export function renderBatchResult(tasks: TargetBatchResult[]): ResultValue {
   const lines: string[] = []
   let totalDurationMs = 0
   let failed = 0
+  // V0.6.0 (A-4): the batch must tell apart "nothing was executed" from
+  // "everything failed". Without these counters a batch whose targets were
+  // all unreachable looked exactly like a batch that ran 3 commands.
+  let executedCount = 0
+  let rejectedCount = 0
+  const failedTargets: string[] = []
   for (const task of tasks) {
     const durationMs = task.commands.reduce((acc, c) => acc + (c.durationMs ?? 0), 0)
     totalDurationMs += durationMs
-    if (task.error !== null) failed += 1
+    if (task.error !== null) {
+      failed += 1
+      failedTargets.push(task.target)
+    }
     for (const cmd of task.commands) {
       // V0.4.3: a non-zero exit / timeout is a FAILURE, not a completed command.
       if (cmd.error !== null || (cmd.exitCode !== null && cmd.exitCode !== 0)) failed += 1
+      // A refused command never ran — it is not "executed" and not "failed".
+      if (cmd.error !== null && cmd.error.code === 'COMMAND_APPROVAL_REQUIRED') rejectedCount += 1
+      else if (cmd.error === null) executedCount += 1
     }
     lines.push('target=' + task.target + ' hostname=' + (task.hostname ?? '?') + ' commands=' + task.commands.length)
     if (task.error !== null) {
@@ -321,7 +342,14 @@ export function renderBatchResult(tasks: TargetBatchResult[]): ResultValue {
   return {
     ok: failed === 0,
     completed: failed === 0,
-    message: 'batch completed: ' + tasks.length + ' target(s), ' + failed + ' error(s), ' + totalDurationMs + ' ms',
+    // V0.6.0 (A-4): the message must state what actually happened — "0
+    // executed" and "all failed" are different outcomes and need different
+    // reactions from the model.
+    message: 'batch completed: ' + tasks.length + ' target(s), ' + executedCount + ' command(s) executed, ' + rejectedCount + ' rejected, ' + failedTargets.length + ' target(s) failed, ' + failed + ' error(s), ' + totalDurationMs + ' ms',
+    // V0.6.0 (A-4): structured counters, so the caller can branch on them.
+    executedCount,
+    rejectedCount,
+    failedTargets,
     output: lines.join('\n'),
     durationMs: totalDurationMs,
   }
