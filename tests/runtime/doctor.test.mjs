@@ -17,7 +17,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { checkCompiledToolSurface, formatConfigError, renderDoctor, runDoctor, wantsDoctor } from '../../lib/runtime/doctor.js'
+import { checkCompiledToolSurface, formatConfigError, nextProbeFileName, renderDoctor, runDoctor, wantsDoctor } from '../../lib/runtime/doctor.js'
 import { MISSING_CONFIG } from '../helpers/mcp.mjs'
 
 /** Same four keys the connector form injects, blanked. */
@@ -411,5 +411,33 @@ test('V0.6.1 (B-4): an unbuilt tree is reported as "never built", not as a stale
     assert.match(result.detail, /never been built/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('V0.6.1: concurrent doctor runs do not delete each other\'s write probe', async () => {
+  // The write probe used a FIXED file name, so two doctor processes running
+  // at the same time (two WorkBuddy windows, or a test run next to a real
+  // invocation) removed each other's probe. On Windows the surviving write
+  // then failed with EBUSY/ENOENT, and the doctor reported a perfectly
+  // writable directory as NOT writable — exiting 1 for a directory that was
+  // fine. The probe name must therefore be unique, both within one process
+  // and across processes.
+  const dir = join(tmpdir(), 'jumpserver-mcp-doctor-probe-')
+  const a = nextProbeFileName(dir)
+  const b = nextProbeFileName(dir)
+  assert.notEqual(a, b, 'two probes in one process must not share a file name')
+  assert.match(String(a), /\.doctor-probe-/, 'the probe must keep its recognisable prefix')
+  assert.match(String(a), new RegExp('-' + String(process.pid) + '-'), 'the probe name must carry the pid, so two processes differ')
+
+  const results = await Promise.all([
+    doctor({ env: { ...BLANK, JUMPSERVER_MCP_CONFIG: MISSING_CONFIG }, probePort: NO_PORT }),
+    doctor({ env: { ...BLANK, JUMPSERVER_MCP_CONFIG: MISSING_CONFIG }, probePort: NO_PORT }),
+    doctor({ env: { ...BLANK, JUMPSERVER_MCP_CONFIG: MISSING_CONFIG }, probePort: NO_PORT }),
+  ])
+  for (const report of results) {
+    const sink = checkNamed(report, 'audit sink')
+    assert.equal(sink.status, 'ok', 'the audit sink must be reported writable: ' + sink.detail)
+    const baseline = checkNamed(report, 'baseline store')
+    assert.equal(baseline.status, 'ok', 'the baseline store must be reported writable: ' + baseline.detail)
   }
 })

@@ -20,6 +20,10 @@ JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server. Ported
 
 
 
+**v0.6.1 post-release fix — the doctor's write probe** — `--doctor` proves a directory is writable by writing a probe file into it, and that probe used a **fixed** name (`data/.doctor-probe`). Two doctor runs at the same time — two WorkBuddy windows, or the test suite next to a live invocation — therefore deleted each other's probe, and on Windows the surviving `writeFileSync` failed with `EBUSY`/`ENOENT`. The doctor then reported a perfectly writable directory as **not writable** and exited 1, blaming the wrong layer. The probe name now carries the pid and a per-process counter (`nextProbeFileName`), so concurrent runs cannot collide; the cleanup moved into `finally` so a failed removal can no longer turn a good directory into a failed check.
+
+## Tools (23)
+
 | Tool | Purpose |
 |---|---|
 | `jumpserver_status` | Session state / gateway / current target / permission mode / runtime version / conversation scope; live console URL + token expiry. Strictly read-only |

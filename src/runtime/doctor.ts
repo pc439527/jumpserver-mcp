@@ -113,12 +113,36 @@ export function formatConfigError(error: unknown): string {
 }
 
 /**
+ * A monotonic counter for probe file names — see `probeWritable`.
+ */
+let probeCounter = 0
+
+/**
+ * The probe file name for one write check.
+ *
+ * Exported so the uniqueness rule can be tested directly: the name must
+ * differ between two checks in the same process AND between two processes
+ * (the pid part), because the whole point is that concurrent doctor runs
+ * cannot delete each other's probe.
+ */
+export function nextProbeFileName(dir: string): string {
+  return join(dir, '.doctor-probe-' + String(process.pid) + '-' + String(probeCounter++))
+}
+
+/**
  * Prove a directory can actually be written to by writing to it. `access(W_OK)`
  * is not enough: it reports the permission bits, not whether the filesystem is
  * read-only, out of space, or a container overlay that discards writes.
+ *
+ * The probe file name is UNIQUE per process (V0.6.1): a fixed name made two
+ * concurrent doctor runs delete each other's probe, and on Windows the
+ * surviving `writeFileSync` then failed with EBUSY/ENOENT — the directory was
+ * perfectly writable, but the doctor reported it as NOT writable and the run
+ * exited 1. A diagnostic that blames the wrong layer is worse than no
+ * diagnostic, so the probe must not be able to collide.
  */
 function probeWritable(dir: string): { ok: boolean; detail: string } {
-  const probe = join(dir, '.doctor-probe')
+  const probe = nextProbeFileName(dir)
   try {
     mkdirSync(dir, { recursive: true })
   } catch (error) {
@@ -126,10 +150,17 @@ function probeWritable(dir: string): { ok: boolean; detail: string } {
   }
   try {
     writeFileSync(probe, 'ok', 'utf8')
-    rmSync(probe, { force: true })
     return { ok: true, detail: 'writable' }
   } catch (error) {
     return { ok: false, detail: 'not writable: ' + (error instanceof Error ? error.message : String(error)) }
+  } finally {
+    // Best-effort cleanup: a leftover probe file is litter, but failing to
+    // remove it must NOT turn a writable directory into a failed check.
+    try {
+      rmSync(probe, { force: true })
+    } catch {
+      /* ignore */
+    }
   }
 }
 
