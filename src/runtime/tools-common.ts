@@ -283,6 +283,24 @@ export function renderResult(value: ResultValue): string {
     const failed = value.failedTargets.map((t) => String(t))
     lines.push('failedTargets: ' + (failed.length === 0 ? 'none' : failed.join(', ')))
   }
+  // V0.6.1 (B-4): the tool-surface self-check. Without these lines the model
+  // sees "connection: complete" and cannot tell a healthy connector from one
+  // whose tools never reached the host.
+  if (value.toolsRegistered !== undefined) {
+    const missing = Array.isArray(value.toolsMissing) ? value.toolsMissing.map((m) => String(m)) : []
+    lines.push(
+      'tools: ' + String(value.toolsRegistered) + '/' + String(value.toolsExpected ?? value.toolsRegistered) +
+      ' registered' + (missing.length === 0 ? '' : ' — MISSING: ' + missing.join(', ')),
+    )
+  }
+  if (value.consoleRole !== undefined) {
+    lines.push(
+      'console: role=' + String(value.consoleRole) +
+      ' ownerPid=' + String(value.consoleOwnerPid ?? 'none') +
+      ' served=' + String(value.consoleUrlServed === true) +
+      ' instances=' + String(value.consoleInstances ?? 0),
+    )
+  }
   if (typeof value.output === 'string' && value.output.length > 0) {
     lines.push('--- output ---')
     lines.push(value.output)

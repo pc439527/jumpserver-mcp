@@ -34,8 +34,12 @@ import { JUMPSERVER_NOT_ARMED, NOT_ARMED_MESSAGE, type SessionGrant } from './se
 import { redactCommandSecrets } from './security/command-redaction.js'
 import { createRuntime, type Runtime } from './runtime/runtime.js'
 import { renderDoctor, runDoctor, wantsDoctor } from './runtime/doctor.js'
-import { auditViewerUrl, consoleTokenInfo, readAuditEntries, rotateConsoleAccessToken, stripInternalMarkers } from './runtime/audit-viewer.js'
+import { auditViewerUrl, consoleOwnership, consoleTokenInfo, readAuditEntries, rotateConsoleAccessToken, stripInternalMarkers } from './runtime/audit-viewer.js'
 import { registerOpsTools } from './runtime/tools-ops.js'
+// V0.6.1 (B-4): the tool-surface self-check.
+import { ALWAYS_TOOL_NAMES, missingAlwaysToolNames, registeredToolCount, trackToolRegistrations } from './runtime/tool-names.js'
+// V0.6.1 (B-1): batch tasks also accept the string / single-object / nested form.
+import { commandListSchema, taskListSchema } from './runtime/arg-normalize.js'
 import { requireReady, toolText, toolTextRaw } from './runtime/tool-host.js'
 import { progressReporter } from './runtime/progress.js'
 import { projectSessionScope } from './runtime/session-scope.js'
@@ -140,6 +144,10 @@ async function main(): Promise<void> {
   })
 
   const server = new McpServer({ name: 'jumpserver-mcp', version: PLUGIN_VERSION })
+  // V0.6.1 (B-4): record every registration so `jumpserver_status` can say
+  // whether the tool surface is complete. Must come BEFORE the first
+  // registerTool call — including the ones made by registerOpsTools.
+  trackToolRegistrations(server)
 
   const confirmShape = { confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION) }
   const timeoutShape = { timeout: z.number().optional().describe(TIMEOUT_DESCRIPTION) }
@@ -171,6 +179,7 @@ async function main(): Promise<void> {
         // it carries each field's source layer (and, for the password, the
         // account label via `via`) and never a credential value or `v1:` token.
         const connection = runtime.connection()
+        const ownership = consoleOwnership()
         return {
           ...statusToValue(bundle.manager.status()),
           ...runtimeVersion(),
@@ -192,6 +201,19 @@ async function main(): Promise<void> {
           consoleTokenTtlMinutes: tokenInfo.ttlMinutes,
           consoleTokenExpiresAt: tokenInfo.expiresAt,
           consoleTokenExpired: tokenInfo.expired,
+          // V0.6.1 (B-4): tool-surface self-check. "The host shows the
+          // connector as connected but `mcp__jumpserver` has zero sub-tools"
+          // has three indistinguishable causes, and the model could answer
+          // none of them. These fields say whether THIS process published the
+          // expected tools, who owns the console address, and whether the
+          // console URL is still served by a live process.
+          toolsRegistered: registeredToolCount(),
+          toolsExpected: ALWAYS_TOOL_NAMES.length,
+          toolsMissing: missingAlwaysToolNames(),
+          consoleRole: ownership.role,
+          consoleOwnerPid: ownership.ownerPid,
+          consoleUrlServed: ownership.urlServed,
+          consoleInstances: ownership.instanceCount,
         }
       }))
     },
@@ -414,14 +436,18 @@ async function main(): Promise<void> {
       description:
         'Run simple commands across one or more targets in a single call. All commands of a target run before the next target is entered (target affinity). Put ONE simple read-only command per commands[] entry — no for/while loops, if branches, $(...) substitution or chained redirection; each entry is classified independently and statically.',
       inputSchema: {
-        tasks: z.array(z.object({
-          target: z.string().describe('Target asset IP or name.'),
-          commands: z.array(z.string()).describe('Simple shell commands for this target, run sequentially with per-command results.'),
-          // V0.5.3: per-task accountIndex — a batch may mix single-user and
-          // multi-user targets, so the connector lets each task carry its own.
-          accountIndex: z.number().int().min(0).optional().describe('The account ID shown by KoKo at this task\'s `ID>` prompt (usually 1 or 2).'),
-          timeout: z.number().optional().describe('Per-command timeout in seconds for this task (max 600).'),
-        })).min(1).describe('One or more target tasks.'),
+        tasks: taskListSchema({
+          element: z.object({
+            target: z.string().describe('Target asset IP or name.'),
+            commands: commandListSchema({ field: 'commands' }).describe('Simple shell commands for this target, run sequentially with per-command results.'),
+            // V0.5.3: per-task accountIndex — a batch may mix single-user and
+            // multi-user targets, so the connector lets each task carry its own.
+            accountIndex: z.number().int().min(0).optional().describe('The account ID shown by KoKo at this task\'s `ID>` prompt (usually 1 or 2).'),
+            timeout: z.number().optional().describe('Per-command timeout in seconds for this task (max 600).'),
+          }),
+          field: 'tasks',
+          example: '[{"target":"1.1.1.1","commands":["uptime"]}]',
+        }).describe('One or more target tasks.'),
         ...confirmShape,
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },

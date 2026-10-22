@@ -2503,6 +2503,53 @@ export function notifyAuditRecord(): void {
   /* no-op: see consoleHintForModel() */
 }
 
+/**
+ * V0.6.1 (B-4): who owns the console right now, and is the advertised URL
+ * actually served?
+ *
+ * The symptom this answers: "the console link 404s / shows another
+ * conversation's terminal / the page says the token expired". All three are
+ * ownership questions, and the connector could not answer any of them —
+ * `jumpserver_status` published a URL and an expiry, nothing about whether
+ * the URL still belongs to a live process.
+ */
+export interface ConsoleOwnership {
+  /** This process's role in the workspace. */
+  role: 'owner' | 'follower' | 'none'
+  /** This process's pid. */
+  pid: number
+  /** The port this process publishes (owned or private follower port). */
+  port: number
+  /** The pid that owns the shared address, when one is alive. */
+  ownerPid: number | null
+  /** The URL handed to the model (stable address + ?inst=<pid>). */
+  url: string | null
+  /**
+   * True when the advertised URL is served by a LIVE process — i.e. the
+   * discovery heartbeat of the instance that owns it is fresh.
+   */
+  urlServed: boolean
+  /** How many live console instances the workspace has. */
+  instanceCount: number
+}
+
+export function consoleOwnership(): ConsoleOwnership {
+  const instances = listConsoleInstances()
+  const url = advertisedConsoleUrl()
+  // The owner is the live instance whose role is 'owner'; when this process
+  // owns the address it is that instance.
+  const owner = instances.instances.find((item) => item.role === 'owner')
+  return {
+    role: consoleRole,
+    pid: process.pid,
+    port: publishedPort(),
+    ownerPid: owner !== undefined ? owner.pid : null,
+    url,
+    urlServed: owner !== undefined && url !== null,
+    instanceCount: instances.instances.length,
+  }
+}
+
 /** Current console URL (null until the listener is bound / when disabled). */
 export function auditViewerUrl(): string | null {
   return viewerUrl

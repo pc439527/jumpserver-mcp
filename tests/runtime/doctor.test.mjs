@@ -14,10 +14,10 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { formatConfigError, renderDoctor, runDoctor, wantsDoctor } from '../../lib/runtime/doctor.js'
+import { checkCompiledToolSurface, formatConfigError, renderDoctor, runDoctor, wantsDoctor } from '../../lib/runtime/doctor.js'
 import { MISSING_CONFIG } from '../helpers/mcp.mjs'
 
 /** Same four keys the connector form injects, blanked. */
@@ -369,5 +369,47 @@ test('a selected account with no stored password warns, and says which account',
     assert.match(credential.detail, /no password saved/)
   } finally {
     store.cleanup()
+  }
+})
+
+test('V0.6.1 (B-4): the compiled tool surface is checked, and a stale build is called STALE', async () => {
+  const report = await doctor({
+    env: { ...BLANK, JUMPSERVER_MCP_CONFIG: MISSING_CONFIG },
+    probePort: NO_PORT,
+  })
+  const surface = checkNamed(report, 'tool surface')
+  // The repository's own lib/ is the build under test here, so the check must
+  // pass in CI — and it must be an 'ok', not a silent skip.
+  assert.equal(surface.status, 'ok', 'the tool surface check must pass on a fresh build: ' + surface.detail)
+  assert.match(surface.detail, /publishes all 23 always-on tools/)
+})
+
+test('V0.6.1 (B-4): a missing tool name is reported as a stale build, with the fix', () => {
+  // The checker reads the COMPILED files, so the failure is exercised against
+  // a tree whose lib/ carries none of the tool names — the state a source
+  // edit without a rebuild leaves behind.
+  const dir = mkdtempSync(join(tmpdir(), 'jumpserver-mcp-doctor-lib-'))
+  try {
+    const libDir = join(dir, 'lib')
+    mkdirSync(libDir, { recursive: true })
+    writeFileSync(join(libDir, 'server.js'), '// an old build with almost nothing in it\n', 'utf8')
+    const result = checkCompiledToolSurface(dir)
+    assert.equal(result.status, 'fail')
+    assert.match(result.detail, /STALE/)
+    assert.match(result.detail, /jumpserver_status/)
+    assert.match(String(result.fix), /npm run build/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('V0.6.1 (B-4): an unbuilt tree is reported as "never built", not as a stale build', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'jumpserver-mcp-doctor-nolib-'))
+  try {
+    const result = checkCompiledToolSurface(dir)
+    assert.equal(result.status, 'fail')
+    assert.match(result.detail, /never been built/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })

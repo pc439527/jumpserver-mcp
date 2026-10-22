@@ -178,15 +178,27 @@ ol,ul{margin:8px 0;padding-left:22px}li{margin:5px 0}
 <table>
 <thead><tr><th style="width:52px">ID</th><th>任务</th><th style="width:210px">落点</th><th style="width:66px">复杂度</th></tr></thead>
 <tbody>
-<tr><td><b>B-1</b></td><td>数组入参降级：schema 改 <code>anyOf: [array, string]</code>，string 用逗号/空格分隔，工具内部归一</td><td><code>src/runtime/tools-ops.ts</code> + <code>server.ts</code></td><td class="c">低</td></tr>
-<tr><td><b>B-2</b></td><td>归一函数单测：逗号分隔、空串、重复项、非法 IP 全覆盖</td><td><code>tests/</code></td><td class="c">低</td></tr>
-<tr><td><b>B-3</b></td><td>客户端侧修复提工单：定位 WorkBuddy MCP 调用层把 <code>array</code> 降级为非数组的路径</td><td>平台侧（本仓库外）</td><td class="c">—</td></tr>
-<tr><td><b>B-4</b></td><td>工具可用性自检：<code>jumpserver_status</code> 输出「工具已注册 / 未注册」+ 当前 owner pid + 控制台 URL 有效性</td><td><code>src/runtime/doctor.ts</code></td><td class="c">低</td></tr>
-<tr><td><b>B-5</b></td><td>兜底提示：检测到入参是字符串而 schema 期望数组时，错误文案直接给出「请用逗号分隔字符串」的可用写法</td><td><code>src/runtime/tools-common.ts</code></td><td class="c">低</td></tr>
+<tr><td><b>B-1</b></td><td>数组入参降级：schema 改 <code>anyOf: [array, string]</code>，string 内部归一（分隔符：逗号/分号/tab/换行，<b>空格不是</b>）</td><td><code>src/runtime/arg-normalize.ts</code> + <code>tools-ops.ts</code> + <code>server.ts</code></td><td class="c">低</td></tr>
+<tr><td><b>B-2</b></td><td>归一函数单测：逗号分隔、空串、重复项、非法 IP 全覆盖</td><td><code>tests/runtime/arg-normalize.test.mjs</code></td><td class="c">低</td></tr>
+<tr><td><b>B-3</b></td><td>客户端侧修复提工单：定位 WorkBuddy MCP 调用层把 <code>array</code> 降级为非数组的路径</td><td><code>docs/issue-b3-client-array-validation-20261022.md</code>（平台侧）</td><td class="c">—</td></tr>
+<tr><td><b>B-4</b></td><td>工具可用性自检：<code>jumpserver_status</code> 输出「工具已注册 / 未注册」+ 当前 owner pid + 控制台 URL 有效性</td><td><code>src/runtime/tool-names.ts</code> + <code>doctor.ts</code></td><td class="c">低</td></tr>
+<tr><td><b>B-5</b></td><td>兜底提示：检测到入参是字符串而 schema 期望数组时，错误文案直接给出「请用逗号分隔字符串」的可用写法</td><td><code>src/runtime/arg-normalize.ts</code></td><td class="c">低</td></tr>
 </tbody>
 </table>
-<div class="box"><b>门禁验收</b>：① 用 <code>"1.1.1.1,2.2.2.2"</code> 调 <code>inspect</code>，结果与数组入参等价；② 连发 20 次双 target <code>inspect</code>，成功率 ≥ 95%；③ 断开 MCP 后跑 <code>jumpserver_status</code> 显式报「未注册」。</div>
+<div class="box"><b>门禁验收</b>：① 用 <code>"1.1.1.1,2.2.2.2"</code> 调 <code>inspect</code>，结果与数组入参等价 ✅；② 连发 20 次双 target <code>inspect</code>，成功率 ≥ 95%（待真实环境门禁）；③ 断开 MCP 后跑 <code>jumpserver_status</code> 显式报「未注册」✅。</div>
 <div class="box amber"><b>风险</b>：schema 变更需同步 <code>README.md</code> 与 <code>tool-annotations.test.mjs</code> 断言。<b>B-3 不在本仓库可控范围——B-1 是必须做的兜底，不能等 B-3。</b></div>
+
+<div class="box purple">
+<b>B-1 实施偏差修正（2026-10-22，实施后回写）</b>
+<ul>
+<li><b>校验闸门在客户端，不在连接器。</b> 宿主在发出 MCP 调用<b>之前</b>用 AJV 校验参数：<code>app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs</code> 偏移 5994979 附近 <code>validateParams()</code> → <code>new Ajv({allErrors:true, coerceTypes:true})</code>。<code>coerceTypes:true</code> 只启用 <b>number 模式</b>强转，<b>不会</b>把 string 变成 array；报错措辞 <code>must be array</code> 是 AJV 原生措辞（zod 会说 <code>Expected array, received string</code>），与 N-04 报告文案逐字吻合 ⇒ <b>失败发生在客户端，请求根本没发到服务端</b>。
+<br>⇒ <b>推翻了「只加 <code>z.preprocess</code>、发布形态保持 array-only」的原设计</b>：发布形态若是 array-only，客户端先拒，连接器内的归一就是<b>死代码</b>。发布形态<b>必须</b>是 <code>anyOf: [{type:'array',…},{type:'string'}]</code>——<b>方向与原计划一致，但理由完全不同</b>。</li>
+<li><b><code>z.preprocess</code> 必须在 union 之外</b>，不能在 array 分支之内。若在分支内，string 会命中 union 的 <code>z.string()</code> 分支而<b>永远走不到 array 分支</b>，于是 <code>min</code>/<code>max</code> 边界对字符串形态<b>完全失效</b>——<code>jumpserver_compare</code> 要求 ≥2 个 target，而 <code>"1.1.1.1"</code>（1 个）会被放行 ⇒ <b>fail-closed 违规</b>。正确形态：<code>z.preprocess(normalize, z.union([arrayWithBounds, z.string()]))</code>。该缺陷由新增单测「the connector still normalizes the string into an array, and the bounds still apply」捕获。</li>
+<li><b>分隔符收紧</b>：原计划写「逗号/空格」，实施改为<b>空格不是分隔符</b>（资产名可能含空格，如 "Web Server 01"），唯一例外是整段按空格切开后每段都是 IPv4 字面量。命令列表<b>只按换行切分</b>且<b>不去重</b>。</li>
+<li><b>额外加固</b>：<code>tasks</code> 的 string 分支要求文本看起来像 JSON（以 <code>[</code> 或 <code>{</code> 开头），否则 <code>"not json"</code> 会被放行并把垃圾交给 handler；<code>profiles</code> / <code>stripPrefixes</code> 也改为容错形态。</li>
+<li><b>预算影响</b>：<code>tools/list</code> payload 23821 B → <b>24091 B</b>（+270 B），上限 24500 B，单工具上限 1700 B，最大工具 <code>jumpserver_inspect</code> 1685 B。<code>z.optional()</code> 放在 union <b>外层</b>（内层会发布 <code>anyOf:[{not:{}},…]</code>，每个 optional 字段多约 30 B）。</li>
+</ul>
+</div>
 
 <h3>批次 C · v0.7.0 —— 审批分类精度（安全边界，独立立项）</h3>
 <div class="box red"><b>目标</b>：修 N-05 / N-11 / N-12，只读命令审批拦截降到 0，同时不放宽任何写操作。</div>

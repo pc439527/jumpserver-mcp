@@ -39,6 +39,8 @@ import { defaultProfileFilePath, ProfileStore, type ProfileView } from './profil
 import { DEFAULT_RISK_JUDGE } from '../config/types.js'
 import { resolveApiKey } from '../security/risk-judge.js'
 import { PLUGIN_VERSION } from '../version.js'
+// V0.6.1 (B-4): the expected tool surface, checked against the COMPILED build.
+import { ALWAYS_TOOL_NAMES } from './tool-names.js'
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail'
 
@@ -159,6 +161,54 @@ function readConfigFile(configPath: string): { present: boolean; value: Record<s
     return { present: true, value: parsed as Record<string, unknown>, broken: null }
   } catch (error) {
     return { present: true, value: {}, broken: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
+ * V0.6.1 (B-4): does the COMPILED build publish the whole tool surface?
+ *
+ * Reads `lib/server.js` and `lib/runtime/tools-ops.js` and looks for each
+ * expected tool name. A name that is missing means the build is stale (the
+ * source was edited but `tsc` never ran) — the single most common cause of
+ * "the connector is connected but the host sees no tools".
+ *
+ * Read-only by construction: two file reads, no imports of the server
+ * module (which would boot it), no sockets.
+ */
+export function checkCompiledToolSurface(root: string): { status: DoctorStatus; detail: string; fix?: string } {
+  const candidates = [
+    join(root, 'lib', 'server.js'),
+    join(root, 'lib', 'runtime', 'tools-ops.js'),
+  ]
+  const present = candidates.filter((p) => existsSync(p))
+  if (present.length === 0) {
+    return {
+      status: 'fail',
+      detail: 'no compiled build found at lib/ — the connector has never been built',
+      fix: 'run `npm run build` (tsc -p tsconfig.json) in the connector directory',
+    }
+  }
+  let blob = ''
+  for (const path of present) {
+    try {
+      blob += readFileSync(path, 'utf8')
+    } catch {
+      /* unreadable file — the missing-name report below will show it */
+    }
+  }
+  const missing = ALWAYS_TOOL_NAMES.filter((name) => !blob.includes(name))
+  if (missing.length > 0) {
+    return {
+      status: 'fail',
+      detail: 'the compiled build is missing ' + String(missing.length) + ' tool(s): ' + missing.join(', ') +
+        ' — lib/ is STALE relative to src/',
+      fix: 'run `npm run build` and RESTART the connector process (the tool table is fixed when the process starts — a new conversation is required for the host to see the new table)',
+    }
+  }
+  return {
+    status: 'ok',
+    detail: 'the compiled build publishes all ' + String(ALWAYS_TOOL_NAMES.length) + ' always-on tools' +
+      (present.length < candidates.length ? ' (ops tools file not found)' : ''),
   }
 }
 
@@ -411,6 +461,25 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
         ', runbooks=' + String(Object.keys(config.runbooks ?? {}).length),
     })
   }
+
+  // ---- the COMPILED tool surface (V0.6.1 / B-4) ------------------------
+  // The recurring "the host says connected but `mcp__jumpserver` has zero
+  // sub-tools" complaint has a mundane cause that the connector can prove:
+  // the `lib/` build is STALE. `lib/` is a build artifact — editing `src/`
+  // changes nothing until `tsc` runs, and the MCP process caches its
+  // schema at spawn time. So a source edit without a rebuild looks exactly
+  // like a host-side registration failure.
+  //
+  // This check reads the BUILT files and looks for each expected tool name.
+  // It opens no socket, binds no port and starts no server — `--doctor`
+  // stays side-effect free.
+  const toolSurface = checkCompiledToolSurface(root)
+  checks.push({
+    name: 'tool surface',
+    status: toolSurface.status,
+    detail: toolSurface.detail,
+    ...(toolSurface.fix !== undefined ? { fix: toolSurface.fix } : {}),
+  })
 
   // ---- ssh2 is the only non-trivial dependency --------------------------
   try {

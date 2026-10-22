@@ -104,20 +104,62 @@ A-7 的连带改造：`navigateToTarget()` 返回 `{ session, status }`（自愈
 
 | ID | 任务 | 落点 | 复杂度 | 依赖 |
 |---|---|---|---|---|
-| B-1 | 连接器侧数组入参降级：schema 改 `anyOf: [array, string]`，string 用逗号/空格分隔，工具内部归一 | `src/runtime/tools-ops.ts` `targets` 字段 + `server.ts` batch `tasks` | 低 | — |
-| B-2 | 归一函数单测：逗号分隔、空串、重复项、非法 IP 全覆盖 | `tests/` | 低 | B-1 |
-| B-3 | 客户端侧修复提工单：定位 WorkBuddy MCP 调用层把 `array` 降级为非数组的路径 | 工作区外，需平台侧确认 | — | 外部 |
-| B-4 | 工具可用性自检：`jumpserver_status` 输出「工具已注册 / 未注册」+ 当前 owner pid + 控制台 URL 有效性 | `src/runtime/doctor.ts` + `status` 工具 | 低 | — |
-| B-5 | 兜底入参提示：当检测到入参是字符串而 schema 期望数组时，错误文案直接给出「请用逗号分隔字符串」的可用写法 | `src/runtime/tools-common.ts` | 低 | B-1 |
+| B-1 | 连接器侧数组入参降级：schema 改 `anyOf: [array, string]`，string 用逗号/空格分隔，工具内部归一 | `src/runtime/arg-normalize.ts` + `tools-ops.ts` `targets` + `server.ts` batch `tasks` | 低 | — |
+| B-2 | 归一函数单测：逗号分隔、空串、重复项、非法 IP 全覆盖 | `tests/runtime/arg-normalize.test.mjs` | 低 | B-1 |
+| B-3 | 客户端侧修复提工单：定位 WorkBuddy MCP 调用层把 `array` 降级为非数组的路径 | `docs/issue-b3-client-array-validation-20261022.md`（工作区外，需平台侧确认） | — | 外部 |
+| B-4 | 工具可用性自检：`jumpserver_status` 输出「工具已注册 / 未注册」+ 当前 owner pid + 控制台 URL 有效性 | `src/runtime/tool-names.ts` + `doctor.ts` + `status` 工具 | 低 | — |
+| B-5 | 兜底入参提示：当检测到入参是字符串而 schema 期望数组时，错误文案直接给出「请用逗号分隔字符串」的可用写法 | `src/runtime/arg-normalize.ts`（zod message + union errorMap） | 低 | B-1 |
 
 **门禁验收**
-- 用 `"1.1.1.1,2.2.2.2"` 字符串调 `inspect`，结果与数组入参等价
-- 连发 20 次双 target `inspect`，统计成功率 ≥ 95%
-- 断开 MCP 后跑 `jumpserver_status`，显式报「未注册」
+- 用 `"1.1.1.1,2.2.2.2"` 字符串调 `inspect`，结果与数组入参等价 ✅（`arg-shape-e2e.test.mjs`）
+- 连发 20 次双 target `inspect`，统计成功率 ≥ 95%（**待真实环境门禁**）
+- 断开 MCP 后跑 `jumpserver_status`，显式报「未注册」✅（`tools: N/23 registered`）
 
 **风险**
-- schema 变更需同步 `README.md` 与 `tool-annotations.test.mjs` 断言
-- B-3 不在本仓库可控范围 —— **B-1 是必须做的兜底，不能等 B-3**
+- schema 变更需同步 `README.md` 与 `tool-annotations.test.mjs` 断言 ✅
+- B-3 不在本仓库可控范围 —— **B-1 是必须做的兜底，不能等 B-3** ✅
+
+#### B-1 实施偏差修正（2026-10-22，实施后回写）
+
+**原计划**：「schema 改 `anyOf: [array, string]`，string 用逗号/**空格**分隔」。
+
+**实施中发现的两个关键事实**（均已用宿主同版本 ajv 8.20.0 实测）：
+
+1. **校验闸门在客户端，不在连接器。**
+   宿主在发出 MCP 调用**之前**用 AJV 校验参数：
+   `app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs` 偏移 5994979 附近
+   `validateParams()` → `new Ajv({allErrors:true, coerceTypes:true})`。
+   `coerceTypes: true` 只启用 **number 模式**强转，**不会**把 string 变成 array；
+   报错措辞 `must be array` 是 AJV 原生措辞（zod 会说 `Expected array, received string`），
+   与 N-04 报告文案逐字吻合 ⇒ **失败发生在客户端，请求根本没发到服务端**。
+
+   ⇒ **推翻了「只加 `z.preprocess`、发布形态保持 array-only」的原设计**：
+   发布形态若是 array-only，客户端先拒，连接器内的归一就是**死代码**。
+   ⇒ 发布形态**必须**是 `anyOf: [{type:'array',…}, {type:'string'}]`，
+   这样客户端闸门放行 string，服务端再归一。**这与原计划的方向一致，但理由完全不同。**
+
+2. **`z.preprocess` 必须在 union 之外，不能在 array 分支之内。**
+   若 preprocess 在 array 分支内，string 会命中 union 的 `z.string()` 分支而**永远走不到 array 分支**，
+   于是 `min`/`max` 边界对字符串形态**完全失效** —— `jumpserver_compare` 要求 ≥2 个 target，
+   而 `"1.1.1.1"`（1 个）会被放行 ⇒ **fail-closed 违规**。
+   正确形态：`z.preprocess(normalize, z.union([arrayWithBounds, z.string()]))`，
+   string 先归一为 array，再走带边界的 array 分支。
+   （该缺陷由新增单测「the connector still normalizes the string into an array, and the bounds still apply」捕获。）
+
+**分隔符也做了收紧**（原计划写「逗号/空格」）：**空格不是分隔符**，
+因为资产名可能含空格（"Web Server 01"）；唯一例外是整段按空格切开后**每段都是 IPv4 字面量**。
+命令列表**只按换行切分**且**不去重**。
+
+**额外加固**（计划外）：
+- `tasks` 的 string 分支要求文本**看起来像 JSON**（以 `[` 或 `{` 开头），
+  否则 `"not json"` 会被 string 分支放行并把垃圾交给 handler。
+- `profiles` / `stripPrefixes` 也改为容错形态（顺带加固）。
+
+**预算影响**：`tools/list` payload 23821 B → **24091 B**（+270 B），
+上限 24500 B，单工具上限 1700 B，最大工具 `jumpserver_inspect` 1685 B。
+`z.optional()` 放在 union **外层**（内层会发布 `anyOf:[{not:{}},…]`，每个 optional 字段多约 30 B）。
+
+
 
 ---
 

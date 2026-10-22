@@ -37,6 +37,8 @@ import { gateCommandForNavigation } from '../security/permission-gate.js'
 import { JumpServerError } from '../jumpserver/errors.js'
 import { redactCommandSecrets } from '../security/command-redaction.js'
 import { guardText, guardValue, renderResult, type ResultValue } from './tools-common.js'
+// V0.6.1 (B-1): list-shaped arguments also accept the string form.
+import { enumListSchema, optionalStringListSchema, stringListSchema } from './arg-normalize.js'
 import { renderFailureLines } from '../jumpserver/errors.js'
 import { createToolHost, toolText, toolTextRaw, type ToolHost } from './tool-host.js'
 // V0.5.2: per-target progress for the long multi-host operations.
@@ -56,7 +58,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       description:
         'Collect a STRUCTURED host inventory from one or more servers using FIXED read-only probes (the connector decides the commands — do not invent shell). Returns parsed facts (OS, kernel, uptime, load, memory, disks, IPs, listening ports, connections, processes, services, nginx upstreams, java, docker, roles) instead of raw shell text. Use this rather than a pile of jumpserver_exec calls. Profiles: basic / network / process / service / web / java / database / container / full.',
       inputSchema: {
-        targets: z.array(z.string()).min(1).max(20).describe('Target IPs or asset names (max 20).'),
+        targets: stringListSchema({ min: 1, max: 20, field: 'targets', example: '1.1.1.1' }).describe('Target IPs or asset names (max 20).'),
         profile: z.union([z.enum(INSPECT_PROFILES), z.array(z.enum(INSPECT_PROFILES))]).optional().describe('Probe profile(s), default "basic". "full" runs every profile.'),
         group: z.string().optional().describe('Instead of targets: a configured asset group whose assets are all inspected.'),
         format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured inventory).'),
@@ -106,9 +108,9 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       description:
         'Build the relationship graph between servers: which host proxies or connects to which, on which port, with what evidence (nginx upstream, ESTABLISHED socket, /etc/hosts). Internally runs the read-only inspect probes and returns nodes (roles, ports, OS, load, memory) plus edges (type, port, confidence, evidence). Use it for "what is the relationship between these hosts" instead of guessing from names. depth>=2 also links app nodes sharing one upstream.',
       inputSchema: {
-        targets: z.array(z.string()).optional().describe('Target IPs or asset names (max 20). Omit when using group.'),
+        targets: optionalStringListSchema({ field: 'targets', example: '1.1.1.1' }).describe('Target IPs or asset names (max 20). Omit when using group.'),
         group: z.string().optional().describe('Configured asset group — every asset of that group is surveyed.'),
-        profiles: z.array(z.enum(INSPECT_PROFILES)).optional().describe('Probe profiles (default: network, process, web).'),
+        profiles: enumListSchema({ values: INSPECT_PROFILES, field: 'profiles' }).describe('Probe profiles (default: network, process, web).'),
         depth: z.number().int().min(1).max(3).optional().describe('1 = direct evidence only (default); 2+ also links nodes sharing one upstream.'),
         format: z.enum(['text', 'json']).optional().describe('text (default, tree) or json (nodes + edges).'),
         concurrency: z.number().int().min(1).max(8).optional().describe('Targets surveyed at once (default: batchConcurrency setting).'),
@@ -168,7 +170,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
         'Run a NAMED runbook (a reviewed, reusable recipe from config "runbooks") across one or more servers: the SAME steps run on every host, and the results come back grouped per target and per step. Each step is an inspect profile or an explicit READ command; a non-READ step is SKIPPED and reported, never executed. Steps carrying `expect` assertions yield a PASS/FAIL verdict per step, per target and overall.',
       inputSchema: {
         runbook: z.string().describe('Runbook name as defined in config.json under "runbooks", e.g. "oa-health".'),
-        targets: z.array(z.string()).optional().describe('Target IPs or asset names (max 20). Omit when using group.'),
+        targets: optionalStringListSchema({ field: 'targets', example: '1.1.1.1' }).describe('Target IPs or asset names (max 20). Omit when using group.'),
         group: z.string().optional().describe('Configured asset group — the runbook runs on every asset of that group.'),
         format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured result).'),
         concurrency: z.number().int().min(1).max(8).optional().describe('Targets run at once (default: batchConcurrency setting).'),
@@ -208,10 +210,10 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
       description:
         'Run the SAME read-only command or inspect profile across several servers and report what DIFFERS — which host has a different config, a missing listener, a full disk. Returns groups of identical hosts plus, for each outlier, the lines it is missing or has extra versus the majority. Use it for "are these nodes configured the same?" instead of eyeballing raw dumps. Only READ is accepted; a mutating command refuses the whole call.',
       inputSchema: {
-        targets: z.array(z.string()).min(2).max(20).describe('Target IPs or asset names to compare (2..20).'),
+        targets: stringListSchema({ min: 2, max: 20, field: 'targets', example: '1.1.1.1,2.2.2.2' }).describe('Target IPs or asset names to compare (2..20).'),
         command: z.string().optional().describe('One read-only command to run on every target (mutually exclusive with profile).'),
         profile: z.enum(INSPECT_PROFILES).optional().describe('Inspect profile to run on every target (mutually exclusive with command).'),
-        stripPrefixes: z.array(z.string()).optional().describe('Line prefixes to strip before diffing (e.g. volatile timestamps).'),
+        stripPrefixes: optionalStringListSchema({ field: 'stripPrefixes', example: 'Timestamp:' }).describe('Line prefixes to strip before diffing (e.g. volatile timestamps).'),
         format: z.enum(['text', 'json']).optional().describe('text (default, compact) or json (full structured diff).'),
         concurrency: z.number().int().min(1).max(8).optional().describe('Targets at once (default: batchConcurrency setting).'),
         accountByTarget: z.record(z.string(), z.number().int().min(0)).optional().describe('{ [target]: displayedAccountId } for multi-user assets (KoKo `ID>` prompt).'),
@@ -252,7 +254,7 @@ export function registerOpsTools(server: McpServer, runtime: import('./runtime.j
         'Capture a NAMED baseline snapshot of one or more servers: the read-only inspect probes run and a compact state (OS, kernel, cores, memory, disks, listening ports, services, roles) is SAVED to data/baselines/<name>.json. Pair it with jumpserver_baseline_compare before and after a change window to prove what actually changed. Writes a file, so this is NOT a read-only operation.',
       inputSchema: {
         name: z.string().describe('Baseline name (letters/digits/._-, max 64), e.g. "oa-prechange-20260910".'),
-        targets: z.array(z.string()).min(1).max(20).describe('Target IPs or asset names to snapshot (max 20).'),
+        targets: stringListSchema({ min: 1, max: 20, field: 'targets', example: '1.1.1.1' }).describe('Target IPs or asset names to snapshot (max 20).'),
         group: z.string().optional().describe('Instead of targets: a configured asset group whose assets are snapshotted.'),
         profile: z.enum(INSPECT_PROFILES).optional().describe('Probe profile used for the snapshot (default "full").'),
         overwrite: z.boolean().optional().describe('Allow replacing an existing baseline of the same name (default false).'),
