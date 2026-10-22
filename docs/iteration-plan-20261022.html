@@ -200,6 +200,15 @@ ol,ul{margin:8px 0;padding-left:22px}li{margin:5px 0}
 </ul>
 </div>
 
+<div class="box purple">
+<b>批次 B 收尾修正（2026-10-22，提交 <code>84e9822</code>）</b>
+<ul>
+<li><b>README 的 <code>## Tools (23)</code> 标题被吞</b>：插入 v0.6.1 段落时吞掉了标题行，契约测试 <code>the README tool table matches the registered tools</code> 会失败。已补回。<b>顺带证实契约本身有效</b>：把 README 恢复成提交版再跑全量，测试确实报 fail（642 pass / 1 fail）——此前的「全量漏检」是工作区状态记忆误差。⇒ <b>纪律：怀疑测试失灵前，先做一次「回退到坏状态再跑」的对照实验</b>。</li>
+<li><b><code>--doctor</code> 写探针用固定文件名</b> <code>data/.doctor-probe</code>：两个 doctor 进程并发时互删对方探针，Windows 上幸存的 <code>writeFileSync</code> 撞 <code>EBUSY</code>/<code>ENOENT</code> ⇒ 可写目录被判<b>不可写</b>、<code>exitCode</code> 变 1 ⇒ <b>诊断归错层</b>。探针名改为 <code>.doctor-probe-&lt;pid&gt;-&lt;counter&gt;</code>（<code>nextProbeFileName()</code>，导出以便测试冻结），清理移入 <code>finally</code>。回归用例已验证：把探针名回退即 fail（19/20）。⇒ <b>纪律：任何探测文件都要带 pid + 计数器</b>。</li>
+<li><b>收尾后门禁</b>：<code>tsc</code> ✅ ／ <b>644 tests 全绿</b>（643 + 1）／ smoke ✅ ／ validate-connector ✅ ／ <code>--doctor</code> usable ／ <code>tools/list</code> 24091 B。</li>
+</ul>
+</div>
+
 <h3>批次 C · v0.7.0 —— 审批分类精度（安全边界，独立立项）</h3>
 <div class="box red"><b>目标</b>：修 N-05 / N-11 / N-12，只读命令审批拦截降到 0，同时不放宽任何写操作。</div>
 <div class="box purple">

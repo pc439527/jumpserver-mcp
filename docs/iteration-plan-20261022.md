@@ -159,6 +159,26 @@ A-7 的连带改造：`navigateToTarget()` 返回 `{ session, status }`（自愈
 上限 24500 B，单工具上限 1700 B，最大工具 `jumpserver_inspect` 1685 B。
 `z.optional()` 放在 union **外层**（内层会发布 `anyOf:[{not:{}},…]`，每个 optional 字段多约 30 B）。
 
+#### 批次 B 收尾修正（2026-10-22，提交 `84e9822`）
+
+批次 B 提交后在收尾验证中查出两个问题，均已修复：
+
+1. **README 的 `## Tools (23)` 标题在插入 v0.6.1 段落时被吞掉**，
+   契约测试 `the README tool table matches the registered tools` 会失败。
+   已补回。**顺带证实契约本身有效**：把 README 恢复成提交版再跑全量，
+   测试确实报 fail（642 pass / 1 fail），此前的「全量漏检」是工作区状态记忆误差。
+   ⇒ 纪律：**怀疑测试失灵前，先做一次「回退到坏状态再跑」的对照实验**。
+
+2. **`--doctor` 的可写性探针用固定文件名 `data/.doctor-probe`**，
+   两个 doctor 进程并发时互删对方探针，Windows 上幸存的 `writeFileSync`
+   撞 `EBUSY`/`ENOENT` ⇒ 可写目录被判**不可写**、`exitCode` 变 1 ⇒ 诊断归错层。
+   探针名改为 `.doctor-probe-<pid>-<counter>`（`nextProbeFileName()`，导出以便测试冻结），
+   清理移入 `finally`。回归用例已验证：把探针名回退即 fail（19/20）。
+   ⇒ 纪律：**任何探测文件都要带 pid + 计数器**。
+
+**收尾后门禁**：`tsc` ✅ ／ **644 tests 全绿**（643 + 1）／ smoke ✅ ／
+validate-connector ✅ ／ `--doctor` usable ／ `tools/list` 24091 B。
+
 
 
 ---
