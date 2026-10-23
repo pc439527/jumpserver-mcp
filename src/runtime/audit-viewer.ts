@@ -40,6 +40,7 @@ import { interruptSession } from './interrupt.js'
 import { consoleTabSources, resolveConsoleTabs, type ConsoleTabSource } from './console-tabs.js'
 import { CONSOLE_TAB_IDS, type ConsoleTabId } from '../config/types.js'
 import { computeAuditStats } from './audit-metrics.js'
+import { consoleAddressFor, isPinLive, stalePinFallback } from './console-address.js'
 
 export interface AuditViewerOptions {
   enabled: boolean
@@ -610,6 +611,10 @@ var SELFPORT = ${JSON.stringify(selfPort)};
 var OPENPID = ${JSON.stringify(openPid)};
 var HANDOVER = ${JSON.stringify(handover)};
 var EMBED = (new URLSearchParams(location.search)).get('embed') === '1';
+/* V0.7.2 (E-4): the server redirected here because ?inst= named an instance
+   that no longer exists. Say so — a silent redirect would look like the
+   console had been replaced by somebody else's. */
+var GONEPID = (new URLSearchParams(location.search)).get('gone');
 var HOME = (OPENPID !== null && OPENPID > 0) ? OPENPID : SELFPID;
 var instances = [], selPid = HOME, instReady = false, movedAway = false, shownGone = false, polls = 0;
 function instById(pid){
@@ -697,6 +702,12 @@ function applyInstance(){
       /* The requested instance is gone. Say it, instead of presenting another
          conversation's console as if it were this conversation's. */
       $('instnote').textContent = '本对话实例（pid ' + HOME + '）已退出 · 现显示 pid ' + SELFPID + '（本页服务进程）';
+      $('instnote').style.display = '';
+    } else if (GONEPID) {
+      /* V0.7.2 (E-4): the address carried a ?inst= pin to an instance that
+         has since exited. The server redirected to the live console; this
+         note explains why the operator landed here instead of there. */
+      $('instnote').textContent = '本对话实例（pid ' + GONEPID + '）已退出 · 现显示 pid ' + SELFPID + '（本页服务进程）';
       $('instnote').style.display = '';
     }
     showTab(tab);
@@ -2056,7 +2067,6 @@ export function startAuditViewer(
         }
         return
       }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       // V0.5.8: who asked for this page (?inst=) and where that instance really
       // lives. Embedded pages (?embed=1) never re-locate: they ARE the target.
       const embedded = query.get('embed') === '1'
@@ -2064,8 +2074,22 @@ export function startAuditViewer(
       const parsedInst = rawInst === null ? null : Number(rawInst)
       const openPid =
         embedded || parsedInst === null || !Number.isFinite(parsedInst) || parsedInst <= 0 ? null : Math.trunc(parsedInst)
+      // V0.7.2 (E-4): a pin that no longer resolves must not leave the operator
+      // on an empty frame. Redirect to the live console and carry the reason
+      // along, so the page can say "that instance is gone" instead of silently
+      // showing somebody else's terminal.
+      const liveInstances = listConsoleInstances().instances
+      if (openPid !== null && !isPinLive(openPid, process.pid, liveInstances)) {
+        const fallback = stalePinFallback(viewerUrl, openPid)
+        if (fallback !== null) {
+          res.writeHead(302, { Location: fallback })
+          res.end()
+          return
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       const handover =
-        openPid === null ? null : resolveConsoleHandover(openPid, process.pid, publishedPort(), listConsoleInstances().instances)
+        openPid === null ? null : resolveConsoleHandover(openPid, process.pid, publishedPort(), liveInstances)
       // V0.5.10: the tab switches are read per page load, so editing
       // auditViewer.tabs takes effect on the next refresh — no console restart.
       const visibleTabs = resolveVisibleTabs(services)
@@ -2544,16 +2568,18 @@ export function auditViewerUrl(): string | null {
  * instance that ASKED for the console instead of whichever process owns the
  * port. `auditViewerUrl()` stays parameter-free for callers that need the
  * canonical, bookmark-stable address.
+ *
+ * V0.7.2 (E-4): the pid is now pinned ONLY when there is more than one live
+ * console to disambiguate. With a single console the bare address is
+ * unambiguous, and a pinned pid could only ever go stale (the owner of 8765
+ * changed three times in 25 minutes on this workspace). See
+ * `console-address.ts`.
  */
 export function advertisedConsoleUrl(): string | null {
   if (viewerUrl === null) return null
-  // The picker only exists in stable-address mode — that is the address several
-  // processes share. In legacy (?token=…) mode every process owns its own
-  // ephemeral port, so there is nothing to switch between and the handover URL
-  // must stay byte-identical to auditViewerUrl(): a duplicate `?` would also
-  // corrupt the query string.
   if (!stableAddress) return viewerUrl
-  return viewerUrl + (viewerUrl.includes('?') ? '&' : '?') + 'inst=' + String(process.pid)
+  const address = consoleAddressFor(viewerUrl, process.pid, stableAddress)
+  return address.url
 }
 
 /**

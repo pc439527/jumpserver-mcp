@@ -39,6 +39,7 @@ import { defaultProfileFilePath, ProfileStore, type ProfileView } from './profil
 import { DEFAULT_RISK_JUDGE } from '../config/types.js'
 import { resolveApiKey } from '../security/risk-judge.js'
 import { PLUGIN_VERSION } from '../version.js'
+import { formatBuildInfo, readBuildInfo } from '../build-info.js'
 // V0.6.1 (B-4): the expected tool surface, checked against the COMPILED build.
 import { ALWAYS_TOOL_NAMES } from './tool-names.js'
 import { computeReadiness, parseEndpointHostPort } from './readiness.js'
@@ -595,6 +596,15 @@ export function renderDoctor(report: DoctorReport): string {
   const glyph: Record<DoctorStatus, string> = { ok: 'OK  ', warn: 'WARN', fail: 'FAIL' }
   const lines: string[] = []
   lines.push('jumpserver-mcp ' + PLUGIN_VERSION + ' — self-check')
+  // V0.7.2 (E-2): the build fingerprint. `--doctor` is the first thing anyone
+  // runs when "my change did not take effect", so it is where the commit
+  // hash belongs: it answers "which build am I actually looking at?" without
+  // a second command.
+  const build = readBuildInfo()
+  lines.push(
+    'build: ' + formatBuildInfo(build) +
+    (build.features.length > 0 ? ' features=' + build.features.join(',') : ''),
+  )
   lines.push('')
   for (const check of report.checks) {
     lines.push('[' + glyph[check.status] + '] ' + check.name + ': ' + check.detail)

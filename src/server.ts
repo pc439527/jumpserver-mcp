@@ -347,6 +347,16 @@ async function main(): Promise<void> {
           health: result.health,
           assets: result.assets,
         })
+        // V0.7.2 (E-5): refresh the alias cache. Only a HEALTHY, COMPLETE,
+        // UNFILTERED listing is worth caching — a failed, paged or filtered
+        // capture would poison the reverse lookup with half an asset list, and
+        // a wrong candidate is worse than no candidate.
+        const unfiltered =
+          (typeof args.filter !== 'string' || args.filter.length === 0) &&
+          (typeof args.group !== 'string' || args.group.length === 0)
+        if (result.health === 'ok' && unfiltered && result.assets.length > 0) {
+          runtime.aliases.update(result.assets)
+        }
         return assetsToValue(result, { includeRawText: args.includeRawText === true })
       })
       return textRaw(renderAssetsResult(value))

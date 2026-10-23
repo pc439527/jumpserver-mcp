@@ -24,6 +24,7 @@ import { JobStore } from './job-store.js'
 import { TopologyStore } from './topology-store.js'
 import { BaselineStore } from './baseline-store.js'
 import { AssetStore } from './asset-store.js'
+import { AliasStore, aliasStorePath, formatAliasSuggestions } from './asset-alias-store.js'
 import { resolveTimeZone } from './time.js'
 import { startAuditViewer, notifyAuditRecord } from './audit-viewer.js'
 import { SessionManager } from '../jumpserver/session-manager.js'
@@ -68,6 +69,11 @@ export interface Runtime {
   baselines: BaselineStore
   /** V0.4.1: last asset listing, shared with the console's 资产 tab. */
   assets: AssetStore
+  /**
+   * V0.7.2 (E-5): the persisted alias reverse-lookup cache. Answers "which
+   * asset did you mean?" for a target that did not resolve.
+   */
+  aliases: AliasStore
   /** V0.4.0: display timezone for audit timestamps (storage stays UTC). */
   timeZone: string
   /**
@@ -382,6 +388,17 @@ export function createRuntime(): Runtime {
   // V0.4.3: one gate for the whole process — `maxSessions` now really caps how
   // many targets are entered at once when batchConcurrency > 1.
   const sessionGate = new Semaphore(config.maxSessions ?? DEFAULT_MAX_SESSIONS)
+  // V0.7.2 (E-5): the alias reverse-lookup cache. Persisted next to the audit
+  // log so a connector restart keeps the ground truth about which assets this
+  // account may use — and so a failed target can be answered with candidates
+  // instead of a bare "no such asset".
+  //
+  // Created BEFORE the registry: the managers close over it.
+  const aliases = new AliasStore(aliasStorePath(auditPath))
+  // The manager asks the alias cache for candidates when a target does not
+  // resolve.
+  const aliasHintFor = (target: string): string | null =>
+    formatAliasSuggestions(aliases.candidates(target, 5))
   const registry = new SessionRegistry({
     create: (sessionId: string): SessionBundle => {
       const cfg = getConfig()
@@ -393,6 +410,7 @@ export function createRuntime(): Runtime {
         onLog: (message: string) => log(sessionId + ': ' + message),
         observer,
         sessionGate,
+        aliasHint: aliasHintFor,
       })
       return { manager, observer, lastUsedAt: Date.now() }
     },
@@ -618,6 +636,7 @@ export function createRuntime(): Runtime {
     topology,
     baselines,
     assets,
+    aliases,
     timeZone: resolveTimeZone(config.timeZone),
     connection,
     accounts,

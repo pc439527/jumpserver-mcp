@@ -202,3 +202,39 @@ test('the handover URL pins the instance that asked for the console', async () =
   // so each one's preview panel lands on its own sessions.
   assert.ok(hint.includes(`http://127.0.0.1:${port}/?inst=${process.pid}`), hint)
 })
+
+test('E-4: a pin to a DEAD instance redirects to the live console', async () => {
+  const port = await freePort()
+  const dir = mkdtempSync(join(tmpdir(), 'jumpserver-mcp-inst-deadpin-'))
+  boot(dir, port)
+  await waitForValue(() => heartbeatOf(dir))
+
+  // The pid this URL was minted with is gone — the process restarted. The
+  // page used to sit on an empty frame (「暂无数据」); now it heals.
+  const dead = 77777777
+  const res = await fetch(`http://127.0.0.1:${port}/?inst=${dead}`, { redirect: 'manual' })
+  assert.equal(res.status, 302)
+  const location = res.headers.get('location')
+  assert.ok(location !== null)
+  // The redirect must point at the LIVE address and say which pid died —
+  // and it must NOT carry the dead ?inst= (that is what killed it).
+  assert.equal(location.includes('inst='), false)
+  assert.ok(location.includes('gone=' + String(dead)), location)
+
+  // Following it must actually serve the console.
+  const html = await (await fetch(`http://127.0.0.1:${port}/?gone=${dead}`)).text()
+  assert.match(html, /<title>JumpServer MCP 控制台<\/title>/)
+  // And the page must EXPLAIN the redirect instead of silently showing
+  // another conversation's terminal.
+  assert.match(html, /已退出/)
+})
+
+test('E-4: a pin to a LIVE instance is served directly (no redirect)', async () => {
+  const port = await freePort()
+  const dir = mkdtempSync(join(tmpdir(), 'jumpserver-mcp-inst-livepin-'))
+  boot(dir, port)
+  await waitForValue(() => heartbeatOf(dir))
+
+  const res = await fetch(`http://127.0.0.1:${port}/?inst=${process.pid}`, { redirect: 'manual' })
+  assert.equal(res.status, 200)
+})

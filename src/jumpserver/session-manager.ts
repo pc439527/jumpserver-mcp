@@ -99,6 +99,17 @@ export interface SessionManagerOptions {
    * with batchConcurrency>1 at most `maxSessions` targets are entered at once.
    */
   sessionGate?: { acquire: () => Promise<() => void> }
+  /**
+   * V0.7.2 (E-5): suggest candidate assets for a target that did not resolve.
+   *
+   * The bare `ASSET_NOT_FOUND` ("check the name/IP") was a dead end for the
+   * model: the asset was in the authorized list under a DIFFERENT label, and
+   * nothing in the error pointed at it. This hook lets the manager attach the
+   * closest cached assets to the error detail — a suggestion, never an
+   * automatic rewrite (executing a different machine than the one named is
+   * worse than a clear failure).
+   */
+  aliasHint?: (target: string) => string | null
 }
 
 export interface ExecRequest {
@@ -648,6 +659,26 @@ export class SessionManager {
   }
 
   /**
+   * V0.7.2 (E-5): enrich an ASSET_NOT_FOUND with the closest cached assets.
+   *
+   * The error itself is correct — the target really is not in KoKo's list.
+   * What it lacked was the NEXT question's answer: "then which one did you
+   * mean?". The alias cache holds the last authorized listing, so a partial
+   * or differently-formatted name can be matched against it.
+   *
+   * The hint is appended to `detail` — it is diagnostic context, not a
+   * rewrite of the target. The command still fails; the model just learns
+   * what to try instead of guessing.
+   */
+  private withAliasHint(error: unknown, target: string): unknown {
+    if (!(error instanceof JumpServerError) || error.code !== 'ASSET_NOT_FOUND') return error
+    const hint = this.options.aliasHint?.(target)
+    if (hint === undefined || hint === null || hint.length === 0) return error
+    const detail = error.detail === undefined || error.detail.length === 0 ? hint : error.detail + ' ' + hint
+    return new JumpServerError(error.code, error.message, detail)
+  }
+
+  /**
    * V0.6.0 (A-3): verify that the live session is really sitting on
    * `target`. Returns null when the binding holds, otherwise the failure
    * detail the caller must report.
@@ -683,6 +714,11 @@ export class SessionManager {
       return await this.navigateToTarget(session, target, accountIndex, signal)
     } catch (error) {
       const code = error instanceof JumpServerError ? error.code : null
+      // V0.7.2 (E-5): a target that does not exist is enriched with the
+      // closest cached assets BEFORE the transient check, so the model gets
+      // "did you mean X" instead of "check the name/IP".
+      const enriched = this.withAliasHint(error, target)
+      if (enriched !== error) throw enriched
       const transient = code === 'ASSET_UNREACHABLE' || code === 'ASSET_ENTER_TIMEOUT'
       if (!transient) throw error
       this.options.onLog?.('enter ' + target + ' failed (' + code + '); retrying once')

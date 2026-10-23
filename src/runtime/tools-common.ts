@@ -279,6 +279,21 @@ export function renderResult(value: ResultValue): string {
   // V0.5.2: completeness is the whole point of the deferred refusal, so it has
   // to reach the model as text. renderResult is a whitelist — a field that is
   // not listed here is invisible no matter what the tool returns.
+  // V0.7.2 (E-2): the build fingerprint. "Did my change actually ship?" was
+  // unanswerable — the version moves only when someone remembers to bump it,
+  // and `lib/` can be older than the commit that produced it. The commit hash
+  // settles it. Whitelist rendering: this line is the ONLY way the model
+  // learns which build it is talking to.
+  if (value.buildCommit !== undefined) {
+    const features = Array.isArray(value.buildFeatures) ? value.buildFeatures.map((f) => String(f)) : []
+    lines.push(
+      'build: ' + String(value.pluginVersion ?? '?') +
+      ' @ ' + String(value.buildCommitShort ?? String(value.buildCommit)) +
+      (value.buildDirty === true ? ' (dirty)' : '') +
+      ' built ' + String(value.buildAt ?? 'unknown') +
+      (features.length > 0 ? ' features=' + features.join(',') : ''),
+    )
+  }
   if (value.connectionComplete !== undefined) {
     const missing = Array.isArray(value.connectionMissing) ? value.connectionMissing.map((item) => String(item)) : []
     lines.push(missing.length === 0 ? 'connection: complete' : 'connection: INCOMPLETE — missing ' + missing.join(', '))
