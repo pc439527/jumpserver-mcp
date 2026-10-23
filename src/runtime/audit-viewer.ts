@@ -39,6 +39,7 @@ import type { ConnectionView } from '../config/env.js'
 import { interruptSession } from './interrupt.js'
 import { consoleTabSources, resolveConsoleTabs, type ConsoleTabSource } from './console-tabs.js'
 import { CONSOLE_TAB_IDS, type ConsoleTabId } from '../config/types.js'
+import { computeAuditStats } from './audit-metrics.js'
 
 export interface AuditViewerOptions {
   enabled: boolean
@@ -1822,43 +1823,25 @@ export function startAuditViewer(
         return
       }
       if (href === '/api/stats') {
-        const list = entries()
-        const byRisk: Record<string, number> = {}
-        const byOperation: Record<string, number> = {}
-        const byTarget: Record<string, number> = {}
-        const byDayMap: Record<string, number> = {}
-        let failed = 0
-        for (const e of list) {
-          const risk = String(e['risk'] ?? '?')
-          const op = String(e['operation'] ?? '?')
-          const targetName = String(e['target'] ?? e['hostname'] ?? '(未进入资产)')
-          const day = String(e['timestamp'] ?? '').slice(0, 10)
-          byRisk[risk] = (byRisk[risk] ?? 0) + 1
-          byOperation[op] = (byOperation[op] ?? 0) + 1
-          byTarget[targetName] = (byTarget[targetName] ?? 0) + 1
-          if (day.length > 0) byDayMap[day] = (byDayMap[day] ?? 0) + 1
-          const approvalPending = e['approvalRequired'] === true && String(e['approvalResult']) === 'pending'
-          // V0.4.3: `result` now carries commandStatus (SUCCESS/EXIT_NONZERO/
-          // TIMEOUT/...). Judging failure on result !== 'COMPLETED' alone hid
-          // real failures: `jps -lv` exiting 127 was recorded COMPLETED and
-          // counted as healthy. Fall back to the exit code so older records
-          // (pre-V0.4.3) are still classified correctly.
-          const status = String(e['result'] ?? '')
-          const exitCode = e['exitCode']
-          const statusFailed = status !== '' && status !== 'SUCCESS' && status !== 'COMPLETED' && status !== 'ok' && status !== 'RUNNING'
-          const exitFailed = typeof exitCode === 'number' && exitCode !== 0
-          if (statusFailed || exitFailed || approvalPending) failed += 1
-        }
-        const byDay = Object.keys(byDayMap).sort().map((d) => [d.slice(5), byDayMap[d] ?? 0] as [string, number])
+        // V0.7.1 (D-8): the statistics come from the shared pure model, so
+        // the console, the daily aggregation files and the tests can never
+        // disagree about what "failed" means.
+        const stats = computeAuditStats(entries())
         sendJson(res, {
-          total: list.length,
-          failed,
-          targets: Object.keys(byTarget).length,
-          days: byDay.length,
-          byRisk,
-          byOperation,
-          byTarget,
-          byDay,
+          total: stats.total,
+          failed: stats.failed,
+          exitNonzero: stats.exitNonzero,
+          failedIncludingExitNonzero: stats.failedIncludingExitNonzero,
+          failureRate: stats.failureRate,
+          unverified: stats.unverified,
+          byClass: stats.byClass,
+          byErrorCode: stats.byErrorCode,
+          targets: stats.targets,
+          days: stats.days,
+          byRisk: stats.byRisk,
+          byOperation: stats.byOperation,
+          byTarget: stats.byTarget,
+          byDay: stats.byDay,
         })
         return
       }

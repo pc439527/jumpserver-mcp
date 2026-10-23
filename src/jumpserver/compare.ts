@@ -18,6 +18,7 @@
 import { classifyCommand } from '../security/permission.js'
 import { requireTargetAllowed } from '../security/target-scope.js'
 import { commandStatusToError } from './command-status.js'
+import { normalizeTimestampText, stripIpv4MappedPrefix } from './output-normalize.js'
 import { JumpServerError } from './errors.js'
 import { mapWithConcurrency } from './concurrency.js'
 import { resolveProfile } from './profiles.js'
@@ -81,19 +82,42 @@ export interface CompareResult {
   warnings: string[]
 }
 
-/** Normalize one output block into comparable lines. */
+/**
+ * Normalize one output block into comparable lines.
+ *
+ * V0.7.1 (D-5): the IPv4-mapped prefix is stripped here. `::ffff:192.168.1.10`
+ * and `192.168.1.10` are the SAME address — one host prints it one way, the
+ * other the other way, and without this the comparison reports a difference
+ * that does not exist.
+ *
+ * The timestamp normalization is deliberately NOT on by default: two hosts
+ * running the same probe at different moments is a REAL difference, and
+ * hiding it would be worse than the noise it removes. Callers that compare
+ * static configuration can opt in.
+ */
 export function normalizeLines(
   text: string,
-  options: { ignoreBlank?: boolean; normalizeWhitespace?: boolean; stripPrefixes?: string[] } = {},
+  options: {
+    ignoreBlank?: boolean
+    normalizeWhitespace?: boolean
+    stripPrefixes?: string[]
+    stripIpv4Mapped?: boolean
+    normalizeTimestamps?: boolean
+  } = {},
 ): string[] {
   const ignoreBlank = options.ignoreBlank ?? true
   const normalizeWhitespace = options.normalizeWhitespace ?? true
+  const stripMapped = options.stripIpv4Mapped ?? true
+  const stamps = options.normalizeTimestamps ?? false
   const prefixes = options.stripPrefixes ?? []
   const out: string[] = []
-  for (let line of text.split(/\r?\n/)) {
+  for (let raw of text.split(/\r?\n/)) {
+    let line = raw
     for (const prefix of prefixes) {
       if (prefix.length > 0 && line.startsWith(prefix)) line = line.slice(prefix.length)
     }
+    if (stamps) line = normalizeTimestampText(line)
+    if (stripMapped) line = stripIpv4MappedPrefix(line)
     if (normalizeWhitespace) line = line.replace(/[ \t]+/g, ' ').trim()
     else line = line.trimEnd()
     if (ignoreBlank && line.length === 0) continue

@@ -8,6 +8,8 @@ import { AbortRequestedError, JumpServerError, UNREACHABLE_STOP_LINE } from '../
 import { commandStatusToError } from '../jumpserver/command-status.js'
 import type { ExecOutcome, SessionStatus } from '../jumpserver/session.js'
 import type { TargetBatchResult } from '../jumpserver/session-manager.js'
+import { applyOutputBudget, type OutputBudgetOptions } from '../jumpserver/output-budget.js'
+import { summarizeOutput } from '../jumpserver/output-normalize.js'
 import type { SessionBundle } from '../jumpserver/session-registry.js'
 import { ANONYMOUS_SESSION } from '../jumpserver/session-registry.js'
 import { SessionState } from '../jumpserver/state-machine.js'
@@ -130,7 +132,11 @@ function completedFailure(outcome: { commandStatus: string; exitCode: number; ex
   return failure === null ? {} : { code: failure.code, message: failure.message }
 }
 
-export function execOutcomeToValue(status: SessionStatus & { configured: boolean; permissionMode: string }, outcome: ExecOutcome): ResultValue {  const base = {
+export function execOutcomeToValue(
+  status: SessionStatus & { configured: boolean; permissionMode: string },
+  outcome: ExecOutcome,
+  budget?: OutputBudgetOptions,
+): ResultValue {  const base = {
     ok: true as boolean,
     gateway: status.gateway,
     state: status.state,
@@ -149,8 +155,7 @@ export function execOutcomeToValue(status: SessionStatus & { configured: boolean
         executionState: 'COMPLETED',
         commandStatus: outcome.commandStatus,
         exitCode: outcome.exitCode,
-        output: outcome.output,
-        truncated: outcome.truncated,
+        ...budgetedOutput(outcome.output, budget),
         // V0.4.5: one shared decode of commandStatus -> error code/message.
         ...completedFailure(outcome),
       } as unknown as Record<string, unknown>) as unknown as ResultValue
@@ -166,8 +171,7 @@ export function execOutcomeToValue(status: SessionStatus & { configured: boolean
             : 'command timed out and the shell could NOT be re-verified; the session collapsed to UNKNOWN - reconnect before continuing',
         completed: false,
         executionState: outcome.executionState,
-        output: outcome.output,
-        truncated: outcome.truncated,
+        ...budgetedOutput(outcome.output, budget),
       } as unknown as Record<string, unknown>) as unknown as ResultValue
     case 'signal-lost':
       return dropNulls({
@@ -180,6 +184,33 @@ export function execOutcomeToValue(status: SessionStatus & { configured: boolean
         executionState: 'UNKNOWN',
       } as unknown as Record<string, unknown>) as unknown as ResultValue
   }
+}
+
+/**
+ * V0.7.1 (D-1/D-2/D-3): apply the model-facing output budget.
+ *
+ * The budget lives at the RESULT layer, not at capture time: truncating the
+ * capture would destroy the output before D-3 could spill it to disk, and it
+ * would make the audit trail lie about what the remote host printed.
+ *
+ * Every loss is announced. A silently shortened output is worse than a long
+ * one — the model would conclude the command printed nothing.
+ */
+function budgetedOutput(output: string, budget?: OutputBudgetOptions): Record<string, unknown> {
+  if (budget === undefined) return { output, truncated: false }
+  const result = applyOutputBudget(output, budget)
+  return dropNulls({
+    output: result.text,
+    truncated: result.truncated,
+    outputBytes: result.totalBytes,
+    outputLines: result.totalLines,
+    outputOmittedLines: result.omittedLines > 0 ? result.omittedLines : undefined,
+    outputSpillPath: result.spillPath ?? undefined,
+    outputAdvice: result.advice ?? undefined,
+    // V0.7.1 (D-5): a digest of the FULL output, so the model can see what the
+    // command was about even when the body was cut. Cheap: a handful of lines.
+    outputDigest: result.truncated ? summarizeOutput(output).digest : undefined,
+  })
 }
 
 /** Errors are constructed without secrets; one projection point for future redaction rules. */
@@ -305,11 +336,41 @@ export function renderResult(value: ResultValue): string {
     lines.push('--- output ---')
     lines.push(value.output)
   }
+  // V0.7.1 (D-1/D-2/D-3): the output budget's verdict. Without these lines
+  // the model sees a shortened output and concludes the command printed
+  // nothing — a silent truncation is worse than a long one.
+  if (value.outputBytes !== undefined) {
+    lines.push('outputBytes: ' + String(value.outputBytes))
+  }
+  if (value.outputLines !== undefined) {
+    lines.push('outputLines: ' + String(value.outputLines))
+  }
+  if (value.outputOmittedLines !== undefined) {
+    lines.push('outputOmittedLines: ' + String(value.outputOmittedLines))
+  }
+  if (value.outputSpillPath !== undefined) {
+    lines.push('outputSpillPath: ' + String(value.outputSpillPath))
+  }
+  if (value.outputAdvice !== undefined) {
+    lines.push('outputAdvice: ' + String(value.outputAdvice))
+  }
+  if (value.outputDigest !== undefined) {
+    lines.push('--- output digest ---')
+    lines.push(String(value.outputDigest))
+  }
+  // V0.7.1 (D-10): the guardrail verdict. Without this line the model sees a
+  // command that was cut short and cannot tell a cap from a fast failure.
+  if (value.guardrailNote !== undefined) {
+    lines.push('guardrail: ' + String(value.guardrailNote))
+  }
+  if (value.guardrailCapped === true) {
+    lines.push('guardrailCapped: true')
+  }
   return lines.join('\n')
 }
 
 /** Compact readable projection of a multi-target batch. */
-export function renderBatchResult(tasks: TargetBatchResult[]): ResultValue {
+export function renderBatchResult(tasks: TargetBatchResult[], budget?: OutputBudgetOptions): ResultValue {
   const lines: string[] = []
   let totalDurationMs = 0
   let failed = 0
@@ -350,11 +411,27 @@ export function renderBatchResult(tasks: TargetBatchResult[]): ResultValue {
         continue
       }
       lines.push('    exitCode=' + rc + ' status=' + cmd.commandStatus + ' state=' + cmd.executionState + ' durationMs=' + cmd.durationMs)
-      const out = cmd.output.trim()
+      // V0.7.1 (D-1/D-2/D-3): the budget is applied PER COMMAND, so one
+      // enormous output is marked on its own line instead of hiding every
+      // other command's result behind it.
+      const budgeted = budget === undefined
+        ? { text: cmd.output.trim(), truncated: false, note: '' }
+        : (() => {
+            const r = applyOutputBudget(cmd.output.trim(), { ...budget, command: cmd.command })
+            const notes: string[] = []
+            if (r.truncated) {
+              notes.push('    note: output truncated (' + String(r.totalBytes) + ' bytes / ' + String(r.totalLines) + ' lines)')
+              if (r.spillPath !== null) notes.push('    outputSpillPath: ' + r.spillPath)
+              if (r.advice !== null) notes.push('    outputAdvice: ' + r.advice)
+            }
+            return { text: r.text, truncated: r.truncated, note: notes.join('\n') }
+          })()
+      const out = budgeted.text.trim()
       if (out.length > 0) {
         lines.push('    --- output ---')
         lines.push(indent(out, 4))
       }
+      if (budgeted.note.length > 0) lines.push(budgeted.note)
     }
   }
   return {

@@ -41,6 +41,7 @@ import { resolveApiKey } from '../security/risk-judge.js'
 import { PLUGIN_VERSION } from '../version.js'
 // V0.6.1 (B-4): the expected tool surface, checked against the COMPILED build.
 import { ALWAYS_TOOL_NAMES } from './tool-names.js'
+import { computeReadiness, parseEndpointHostPort } from './readiness.js'
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail'
 
@@ -73,6 +74,11 @@ export interface DoctorOptions {
    * fixture turns into "connection: complete".
    */
   profilesPath?: string
+  /**
+   * V0.7.1 (D-9): injected reachability probe. A test must never open a
+   * socket, so the readiness check takes its probe from here.
+   */
+  probeReachability?: (host: string, port: number) => Promise<import('./readiness.js').Reachability>
 }
 
 /** The default probe: CONNECT to 127.0.0.1:port, never bind it. */
@@ -522,6 +528,62 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
       status: 'fail',
       detail: 'cannot load ssh2: ' + (error instanceof Error ? error.message : String(error)),
       fix: 'reinstall the package — the connector cannot reach the bastion without it',
+    })
+  }
+
+  // ---- readiness (V0.7.1 / D-9) -----------------------------------------
+  // The question an operator actually has is not "is the config valid?" but
+  // "can I start work on the bastion right now?". The readiness check answers
+  // that in one verdict, using only READ-ONLY probes: the console discovery
+  // files on disk, the target scope in the config, and TCP CONNECT probes to
+  // the bastion and to the risk judge. It binds no port, opens no SSH session
+  // and writes nothing.
+  if (config !== null) {
+    const judge = config.riskJudge ?? DEFAULT_RISK_JUDGE
+    const judgeEndpoint = judge.enabled === true ? parseEndpointHostPort(judge.endpoint) : null
+    const account = readActiveAccount(options.profilesPath ?? defaultProfileFilePath())
+    const gatewayHost = account !== null ? account.host : config.host
+    const gatewayPort = account !== null ? account.port : config.port
+    const readiness = await computeReadiness({
+      consoleDir: join(dirname(config.auditPath ?? join(root, 'data', 'audit.jsonl')), 'consoles'),
+      gatewayHost,
+      gatewayPort,
+      allowedTargets: (config.allowedTargets ?? []).length,
+      deniedTargets: (config.deniedTargets ?? []).length,
+      assetGroups: Object.keys(config.assetGroups ?? {}).length,
+      judgeEnabled: judge.enabled === true,
+      ...(judgeEndpoint !== null ? { judgeHost: judgeEndpoint.host, judgePort: judgeEndpoint.port } : {}),
+      ...(options.probeReachability !== undefined ? { probe: options.probeReachability } : {}),
+    })
+
+    const consoleDetail = readiness.consoleUrl !== null
+      ? 'live at ' + readiness.consoleUrl + ' (pid ' + String(readiness.consoles[0]?.pid ?? '?') +
+        ', ' + String(readiness.consoles.length) + ' instance(s))'
+      : (readiness.staleConsoles.length > 0
+        ? 'none live — ' + String(readiness.staleConsoles.length) + ' stale discovery file(s) from a process that is gone'
+        : 'none live yet (the console starts with the connector)')
+
+    checks.push({
+      name: 'readiness',
+      // V0.7.1 (D-9): a NETWORK blocker is a warning, not a failure. The
+      // doctor's exit code has always meant "is the CONFIGURATION usable";
+      // a bastion that is momentarily unreachable is an operational
+      // condition. A CONFIGURATION blocker (the scope allows nothing) IS a
+      // failure — no command could ever run.
+      status: readiness.verdict === 'ready'
+        ? 'ok'
+        : (readiness.blockerIsConfig === true ? 'fail' : 'warn'),
+      detail: readiness.verdict.toUpperCase() + ' — ' + readiness.reason +
+        ' | gateway ' + readiness.gatewayAddress + ' = ' + readiness.gateway +
+        ' | console: ' + consoleDetail +
+        ' | scope allow=' + String(readiness.allowedTargets) + ' deny=' + String(readiness.deniedTargets) +
+        ' groups=' + String(readiness.assetGroups) +
+        (readiness.judgeEnabled ? ' | judge=' + readiness.judge : ''),
+      ...(readiness.verdict === 'not-ready'
+        ? { fix: 'fix the blocking item above before starting work on the bastion' }
+        : readiness.verdict === 'degraded'
+          ? { fix: 'work can start, but the degraded item above will cost you something' }
+          : {}),
     })
   }
 

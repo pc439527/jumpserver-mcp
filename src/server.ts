@@ -25,6 +25,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
+import { dirname, join } from 'node:path'
 import type { ConnectionSource } from './config/env.js'
 import type { JumpServerConfig } from './config/types.js'
 import { AbortRequestedError, JumpServerError } from './jumpserver/errors.js'
@@ -35,6 +36,7 @@ import { redactCommandSecrets } from './security/command-redaction.js'
 import { createRuntime, type Runtime } from './runtime/runtime.js'
 import { renderDoctor, runDoctor, wantsDoctor } from './runtime/doctor.js'
 import { auditViewerUrl, consoleOwnership, consoleTokenInfo, readAuditEntries, rotateConsoleAccessToken, stripInternalMarkers } from './runtime/audit-viewer.js'
+import { applyGuardrail } from './security/guardrail.js'
 import { registerOpsTools } from './runtime/tools-ops.js'
 // V0.6.1 (B-4): the tool-surface self-check.
 import { ALWAYS_TOOL_NAMES, missingAlwaysToolNames, registeredToolCount, trackToolRegistrations } from './runtime/tool-names.js'
@@ -144,6 +146,17 @@ async function main(): Promise<void> {
   })
 
   const server = new McpServer({ name: 'jumpserver-mcp', version: PLUGIN_VERSION })
+  // V0.7.1 (D-1/D-2/D-3): the model-facing output budget.
+  //
+  // The budget belongs here, at the tool layer: it caps what enters the
+  // model's context WITHOUT touching what the bastion actually printed (the
+  // audit trail must keep the truth). An over-budget output is written to
+  // `data/outputs/` so the full text is still retrievable, and the model is
+  // told how to ask the remote host for the slice it actually wants.
+  const outputBudget = {
+    spillDir: join(dirname(runtime.auditPath), 'outputs'),
+    spillName: 'output',
+  } as const
   // V0.6.1 (B-4): record every registration so `jumpserver_status` can say
   // whether the tool surface is complete. Must come BEFORE the first
   // registerTool call — including the ones made by registerOpsTools.
@@ -360,7 +373,16 @@ async function main(): Promise<void> {
         const bundle = bundleFor(exec, registry)
         const gated = await gateCommand(servicesFor(bundle), exec, args.command)
         requireTargetAllowed(runtime.getConfig(), bundle.manager.status().target)
-        const timeoutMs = args.timeout !== undefined ? Math.max(1, args.timeout) * 1000 : undefined
+        // V0.7.1 (D-10): the dangerous-command guardrail caps the execution
+        // time of a DANGEROUS/UNKNOWN command and reports the impact estimate
+        // next to the result. READ commands are never touched.
+        const guard = applyGuardrail(
+          gated.classification.risk as Parameters<typeof applyGuardrail>[0],
+          args.command,
+          args.timeout !== undefined ? Math.max(1, args.timeout) * 1000 : undefined,
+          runtime.getConfig().commandTimeout * 1000,
+        )
+        const timeoutMs = guard.timeoutMs
         const { status, outcome } = await bundle.manager.exec({
           command: args.command,
           timeoutMs,
@@ -372,8 +394,10 @@ async function main(): Promise<void> {
           riskJudge: gated.judgeNote,
           signal: exec.signal,
         })
-        const value = execOutcomeToValue(status, outcome)
+        const value = execOutcomeToValue(status, outcome, { ...outputBudget, command: args.command })
         if (gated.judgeAutoAllowed === true && gated.judgeNote !== undefined) value.riskJudge = gated.judgeNote
+        if (guard.note !== null) value.guardrailNote = guard.note
+        if (guard.capped) value.guardrailCapped = true
         return value
       }))
     },
@@ -404,7 +428,14 @@ async function main(): Promise<void> {
         // V0.4.2: fail fast on out-of-scope targets before any classification work.
         requireTargetAllowed(runtime.getConfig(), args.target)
         const gated = await gateCommandForNavigation(servicesFor(bundle), exec, args.command)
-        const timeoutMs = args.timeout !== undefined ? Math.max(1, args.timeout) * 1000 : undefined
+        // V0.7.1 (D-10): the same guardrail as jumpserver_exec.
+        const guard = applyGuardrail(
+          gated.classification.risk as Parameters<typeof applyGuardrail>[0],
+          args.command,
+          args.timeout !== undefined ? Math.max(1, args.timeout) * 1000 : undefined,
+          runtime.getConfig().commandTimeout * 1000,
+        )
+        const timeoutMs = guard.timeoutMs
         const result = await bundle.manager.run({
           target: args.target,
           command: args.command,
@@ -421,10 +452,12 @@ async function main(): Promise<void> {
         })
         const { target, hostname, status, outcome } = result
         return {
-          ...execOutcomeToValue(status, outcome),
+          ...execOutcomeToValue(status, outcome, { ...outputBudget, command: args.command }),
           target,
           hostname,
           riskJudge: gated.judgeAutoAllowed === true ? gated.judgeNote : undefined,
+          ...(guard.note !== null ? { guardrailNote: guard.note } : {}),
+          ...(guard.capped ? { guardrailCapped: true } : {}),
         }
       }))
     },
@@ -529,7 +562,7 @@ async function main(): Promise<void> {
             executed.push({ target, hostname: null, error: thisJumpError(error), commands: [] })
           }
         }
-        return renderBatchResult(executed)
+        return renderBatchResult(executed, outputBudget)
       })
       const batchValue = value as ResultValue
       if (autoAllowed.length > 0) batchValue.riskJudge = autoAllowed.join(' | ')

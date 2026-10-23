@@ -32,6 +32,13 @@ const BLANK = {
 const NO_PORT = async () => 'free'
 
 /**
+ * V0.7.1 (D-9): the readiness check probes reachability. No test may touch
+ * the network, so the probe is injected here too — reachable by default, so
+ * a test that does not care about readiness sees the normal path.
+ */
+const REACHABLE = async () => 'reachable'
+
+/**
  * V0.5.12: every run is pinned to an account store that does not exist.
  * ProfileStore resolves under the developer's home, so without this the "no
  * configuration at all" fixture reads whatever bastion accounts this machine
@@ -40,7 +47,7 @@ const NO_PORT = async () => 'free'
  * WANT an account pass their own `profilesPath`.
  */
 const NO_ACCOUNTS = join(tmpdir(), 'jumpserver-mcp-doctor-no-such-profiles.json')
-const doctor = (options = {}) => runDoctor({ profilesPath: NO_ACCOUNTS, ...options })
+const doctor = (options = {}) => runDoctor({ profilesPath: NO_ACCOUNTS, probeReachability: REACHABLE, ...options })
 
 function tempConfig(contents) {
   const dir = mkdtempSync(join(tmpdir(), 'jumpserver-mcp-doctor-'))

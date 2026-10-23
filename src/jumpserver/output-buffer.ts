@@ -65,6 +65,11 @@ export class OutputBuffer {
  * Waits for a marker pattern across arbitrarily fragmented data chunks.
  * Matching is incremental on a bounded tail; once matched it stays matched
  * until reset. Feed the SAME chunks through buffer.push() to capture output.
+ *
+ * V0.7.1 (D-4): the needle may be a RegExp. The completion criterion must be
+ * line-anchored (the echoed copy of the connector's own script contains the
+ * marker text, so a substring match would fire on the echo and declare the
+ * command finished before it ran).
  */
 export class MarkerWatcher {
   private tail = ''
@@ -74,6 +79,7 @@ export class MarkerWatcher {
   constructor(
     private readonly marker: string,
     limit: number,
+    private readonly pattern?: RegExp,
   ) {
     this.buffer = new OutputBuffer(limit)
   }
@@ -84,7 +90,13 @@ export class MarkerWatcher {
     this.buffer.push(chunk)
     if (this.done) return false
     this.tail = (this.tail + text).slice(-(this.marker.length + 4096))
-    if (this.tail.includes(this.marker)) this.done = true
+    if (this.pattern !== undefined) {
+      // A line-anchored pattern needs the line start to still be in the tail;
+      // the leading newline restores it without changing the stored tail.
+      if (this.pattern.test('\n' + this.tail)) this.done = true
+    } else if (this.tail.includes(this.marker)) {
+      this.done = true
+    }
     return this.done
   }
 

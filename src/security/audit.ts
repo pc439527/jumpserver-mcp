@@ -43,6 +43,8 @@ export const auditRecordSchema = z.object({
   batchIndex: z.number().optional(),
   permissionMode: z.string(),
   result: z.string(),
+  /** V0.7.1 (D-6): the structured error code of a failed record. */
+  errorCode: z.string().optional(),
   exitCode: z.number().nullable(),
   durationMs: z.number().nullable(),
 })

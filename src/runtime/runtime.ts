@@ -19,7 +19,7 @@ import {
   type ConnectionView,
   type EnvConnection,
 } from '../config/env.js'
-import { AuditStore, DEFAULT_AUDIT_RING_SIZE } from './audit-store.js'
+import { AuditStore, DEFAULT_AUDIT_RETAIN_DAYS, DEFAULT_AUDIT_RING_SIZE } from './audit-store.js'
 import { JobStore } from './job-store.js'
 import { TopologyStore } from './topology-store.js'
 import { BaselineStore } from './baseline-store.js'
@@ -330,6 +330,8 @@ export function createRuntime(): Runtime {
 
   const audit = new AuditStore(auditPath, {
     ringSize: DEFAULT_AUDIT_RING_SIZE,
+    // V0.7.1 (D-7): keep 30 days of rotated daily files; older ones are swept.
+    retainDays: DEFAULT_AUDIT_RETAIN_DAYS,
     log: (message) => log(message),
   })
   // The sink directory is created once at boot; appends are asynchronous and
@@ -342,8 +344,38 @@ export function createRuntime(): Runtime {
 
   const onAudit = (record: AuditRecord): void => {
     if (getConfig().enableAudit !== true) return
+    rotateAuditIfDayChanged()
     audit.append(record)
     notifyAuditRecord()
+  }
+
+  // V0.7.1 (D-7): rotate the audit file on a DAY boundary.
+  //
+  // The check is cheap (one date string per record) and runs on the write
+  // path, so no timer is needed and no rotation can be missed because the
+  // process was idle across midnight. The rotation itself is asynchronous and
+  // never blocks the tool call that produced the record.
+  let auditDay = new Date().toISOString().slice(0, 10)
+  let auditRotation: Promise<void> = Promise.resolve()
+  const rotateAuditIfDayChanged = (): void => {
+    const today = new Date().toISOString().slice(0, 10)
+    if (today === auditDay) return
+    const closedDay = auditDay
+    auditDay = today
+    auditRotation = auditRotation
+      .then(() => audit.rotateForDay(closedDay))
+      .then((result) => {
+        if (result.rotated) {
+          log(
+            'audit rotated: ' + String(result.path) +
+              (result.metricsPath !== null ? ' metrics=' + String(result.metricsPath) : '') +
+              (result.pruned.length > 0 ? ' pruned=' + String(result.pruned.length) : ''),
+          )
+        }
+      })
+      .catch((error) => {
+        log('audit rotation failed: ' + String(error))
+      })
   }
 
   const grants = new SessionGrant()

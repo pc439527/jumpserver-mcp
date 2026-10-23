@@ -4,7 +4,7 @@ import { MarkerWatcher } from './output-buffer.js'
 import { cleanAnsi } from './output-buffer.js'
 import { nextState, SessionState } from './state-machine.js'
 import { looksLikeAccountSelection, looksLikeMenuPrompt, looksLikeShellPrompt, ScreenDetector, type ScreenState } from './detector.js'
-import { buildDoneScript, buildProbeScript, cleanCommandOutput, parseDoneLine, PROBE_PREFIX } from './command-runner.js'
+import { buildDoneScript, buildProbeScript, cleanCommandOutput, doneMarkerPattern, parseDoneLine, probeMarkerPattern, DONE_PREFIX, PROBE_PREFIX } from './command-runner.js'
 import { parseProbeOutput } from './probe.js'
 import { verifyTargetIdentity } from './target-verify.js'
 import { MAX_ASSET_CAPTURE_BYTES, MAX_OUTPUT_BYTES } from '../config/types.js'
@@ -620,7 +620,7 @@ export class JumpServerSession {
       // The probe script is connector-internal: it must NOT be recorded as a
       // user-visible input line. Its H=/U=/P= results arrive as output events
       // and are surfaced through onTarget (the terminal shows a target meta row).
-      const run = await this.runOp(probeScript, PROBE_PREFIX + marker, this.cfg.probeMs, signal)
+      const run = await this.runOp(probeScript, PROBE_PREFIX + marker, this.cfg.probeMs, signal, probeMarkerPattern(marker))
       if (run.aborted) throw new AbortRequestedError()
       if (run.closed) {
         this.setState(SessionState.DISCONNECTED)
@@ -683,7 +683,7 @@ export class JumpServerSession {
     this.callbacks.onInput?.(command)
     this.touch()
     try {
-      const run = await this.runOp(script, marker, timeoutMs, options.signal)
+      const run = await this.runOp(script, DONE_PREFIX + marker, timeoutMs, options.signal, doneMarkerPattern(marker))
       const durationMs = Date.now() - started
       if (run.aborted) {
         // V0.4.0 P0: an ABORT is not a timeout, but the risk is the same —
@@ -735,7 +735,7 @@ export class JumpServerSession {
         // V0.4.3: the command itself succeeded or failed — separate from the
         // transport having completed the exchange.
         commandStatus: done.exitCode === 0 ? 'SUCCESS' : 'EXIT_NONZERO',
-        output: cleanCommandOutput(run.text, marker),
+        output: cleanCommandOutput(run.text, marker, script),
         truncated: run.truncated,
         durationMs,
         executionState: 'COMPLETED',
@@ -1115,10 +1115,11 @@ export class JumpServerSession {
     marker: string,
     timeoutMs: number,
     signal?: AbortSignal,
+    pattern?: RegExp,
   ): Promise<{ matched: boolean; closed: boolean; aborted: boolean; text: string; truncated: boolean }> {
     const wire = this.wire
     if (wire === null || this.wireClosed) return { matched: false, closed: true, aborted: false, text: '', truncated: false }
-    const watcher = new MarkerWatcher(marker, MAX_OUTPUT_BYTES)
+    const watcher = new MarkerWatcher(marker, MAX_OUTPUT_BYTES, pattern)
     this.opWatcher = watcher
     wire.write(script + '\n')
     try {

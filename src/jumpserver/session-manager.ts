@@ -9,6 +9,7 @@ import { JumpServerSession, type ExecOutcome, type SessionRuntimeConfig, type Se
 import { SessionState } from './state-machine.js'
 import { sleep } from './timing.js'
 import { normalizedRedactedCommand, redactCommandSecrets } from '../security/command-redaction.js'
+import { commandStatusToError } from './command-status.js'
 
 export interface AuditRecord {
   timestamp: string
@@ -61,6 +62,19 @@ export interface AuditRecord {
   sequence?: number
   permissionMode: PermissionMode
   result: string
+  /**
+   * V0.7.1 (D-6): the STRUCTURED error code of a failed record.
+   *
+   * Before this, a failed audit record said only "error" or "EXIT_NONZERO" —
+   * the caller could not tell a timeout from a lost connection from a
+   * refused command. Measured on the real audit file: 963 of 963 failure
+   * records carried no machine-readable code. This field is the decoded
+   * `commandStatus` (COMMAND_EXIT_NONZERO / COMMAND_TIMEOUT / ...) or the
+   * gate's own code (COMMAND_BLOCKED / APPROVAL_DENIED).
+   *
+   * Absent on successful records — a success has no error code.
+   */
+  errorCode?: string
   exitCode: number | null
   durationMs: number | null
 }
@@ -419,6 +433,9 @@ export class SessionManager {
       command: null,
       risk: 'READ',
       result: result.verified ? 'ok' : 'unverified',
+      // V0.7.1 (D-6): an interrupt that could not be verified is a real
+      // outcome, not a success — it gets its own code.
+      errorCode: result.verified ? undefined : 'INTERRUPT_UNVERIFIED',
       exitCode: null,
       durationMs: null,
     })
@@ -514,6 +531,10 @@ export class SessionManager {
         toolCallId: request.toolCallId,
         batchId: request.batchId,
         result: outcome.commandStatus,
+        errorCode: commandStatusToError(outcome.commandStatus, {
+          exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
+          executionState: outcome.kind === 'completed' ? null : outcome.executionState,
+        })?.code,
         exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
         durationMs,
       })
@@ -579,6 +600,10 @@ export class SessionManager {
         toolCallId: request.toolCallId,
         batchId: request.batchId,
         result: outcome.commandStatus,
+        errorCode: commandStatusToError(outcome.commandStatus, {
+          exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
+          executionState: outcome.kind === 'completed' ? null : outcome.executionState,
+        })?.code,
         exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
         durationMs,
       })
@@ -792,6 +817,7 @@ export class SessionManager {
               taskId: request.jobId,
               toolCallId: request.toolCallId,
               result: 'DENIED',
+              errorCode: 'APPROVAL_DENIED',
               exitCode: null,
               durationMs: null,
             })
@@ -995,6 +1021,10 @@ export class SessionManager {
             batchId: item.batchId ?? request.batchId,
             batchIndex: item.batchIndex,
             result: outcome.commandStatus,
+            errorCode: commandStatusToError(outcome.commandStatus, {
+              exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
+              executionState: outcome.kind === 'completed' ? null : outcome.executionState,
+            })?.code,
             exitCode: outcome.kind === 'completed' ? outcome.exitCode : null,
             durationMs,
           })
@@ -1028,6 +1058,11 @@ export class SessionManager {
             batchId: item.batchId ?? request.batchId,
             batchIndex: item.batchIndex,
             result: denied ? 'DENIED' : 'error',
+            // V0.7.1 (D-6): the thrown error's own code — a refusal and a
+            // runtime failure must be distinguishable in the trail.
+            errorCode: denied
+              ? 'APPROVAL_DENIED'
+              : (error instanceof JumpServerError ? error.code : 'COMMAND_FAILED'),
             exitCode: null,
             durationMs: null,
           })
@@ -1366,6 +1401,9 @@ export class SessionManager {
       batchId: input.batchId,
       batchIndex: input.batchIndex,
       result: input.kind === 'denied' ? 'DENIED' : 'BLOCKED',
+      // V0.7.1 (D-6): a refusal has an error code too — this is exactly the
+      // case where the caller needs to know WHICH gate stopped the command.
+      errorCode: input.kind === 'denied' ? 'APPROVAL_DENIED' : 'COMMAND_BLOCKED',
       exitCode: null,
       durationMs: null,
     })
@@ -1393,6 +1431,8 @@ export class SessionManager {
     batchIndex?: number
     risk: string
     result: string
+    /** V0.7.1 (D-6): the structured error code of a FAILED record. */
+    errorCode?: string
     exitCode?: number | null
     durationMs?: number | null
   }): Promise<void> {
@@ -1431,6 +1471,7 @@ export class SessionManager {
       batchIndex: partial.batchIndex,
       permissionMode: cfg.permissionMode,
       result: partial.result,
+      errorCode: partial.errorCode,
       exitCode: partial.exitCode ?? null,
       durationMs: partial.durationMs ?? null,
     }
