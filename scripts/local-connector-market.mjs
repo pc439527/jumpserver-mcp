@@ -40,6 +40,7 @@ import {
   writeFileSync,
   statSync,
   readdirSync,
+  realpathSync,
 } from 'node:fs'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -182,6 +183,26 @@ function buildManifestEntry() {
 }
 
 /**
+ * 稳定路径（目录联接）：`~/WorkBuddy/jumpserver-mcp` → 本 checkout。
+ *
+ * dev 模式的包必须把一个绝对路径烤进 mcp.json（stdio 服务器没法用别的方式表达），
+ * 而「从市场重新绑定」会把该路径原样抄进连接器注册表。若烤的是 checkout 实体路径，
+ * 整个目录一挪动，此前构建的产物全部指向空处 —— 连接器仍显示已启用，但工具表是空的。
+ * 所以这里优先烤联接路径；联接不存在或指向别处时才退回实体路径。
+ */
+function stableCheckoutPath() {
+  const link = join(homedir(), 'WorkBuddy', 'jumpserver-mcp')
+  if (!existsSync(link)) return null
+  try {
+    const a = resolve(realpathSync(link)).toLowerCase()
+    const b = resolve(realpathSync(ROOT)).toLowerCase()
+    return a === b ? link : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * 组装 mcp.json。
  *
  * dev 模式跑本地 `lib/server.js`：npm 上的 jumpserver-mcp 尚未发布，
@@ -209,7 +230,9 @@ function buildMcpConfig({ release }) {
       },
     }
   }
-  const serverJs = join(ROOT, 'lib', 'server.js')
+  const stable = stableCheckoutPath()
+  const base = stable ?? ROOT
+  const serverJs = join(base, 'lib', 'server.js')
   if (!existsSync(serverJs)) fail(`未找到 ${serverJs}，请先运行 npm run build`)
   return {
     mcpServers: {
@@ -465,6 +488,62 @@ function cmdStatus() {
   console.log('')
 }
 
+// ---------------------------------------------------------------- install
+
+/**
+ * 把构建好的 jumpserver 包就地同步进客户端市场缓存目录。
+ *
+ * 为什么需要这一步：客户端每次同步市场都会 rmSync 整体替换 `connectors-marketplace/`，
+ * 所以「已安装的包」永远等于「最后一次同步时客户端拿到的包」。若本地市场服务没在跑
+ * （或客户端还没重启触发重同步），缓存里会一直躺着旧版 SKILL.md / 旧版本元数据 ——
+ * 症状是工具面明明更新了，说明文档却停留在上一个版本。
+ *
+ * 这里直接写缓存目录，等价于「客户端刚刚完成了一次同步」，且不需要本地服务在线。
+ * 只动 jumpserver 一个连接器，其余 184 个原样保留。
+ */
+function cmdInstall(args) {
+  if (!existsSync(OUT_DIR)) fail(`未找到构建目录 ${OUT_DIR}，请先运行 npm run market:build`)
+  const srcPkg = join(OUT_DIR, 'connectors', ID)
+  if (!existsSync(srcPkg)) fail(`构建目录缺少 ${srcPkg}，请先运行 npm run market:build`)
+
+  const dstPkg = join(CACHE_DIR, 'connectors', ID)
+  mkdirSync(dstPkg, { recursive: true })
+  const n = copyTreeChecked(srcPkg, dstPkg, `connectors/${ID}`)
+  ok(`同步 connectors/${ID}：${n} 个文件`)
+
+  // 索引条目：版本元数据必须跟上，否则连接器卡片仍显示旧版本
+  const manifestPath = join(CACHE_DIR, '.codebuddy-connector', 'connectors.json')
+  if (existsSync(manifestPath)) {
+    const manifest = readJson(manifestPath)
+    if (!Array.isArray(manifest.connectors)) fail('缓存索引缺少 connectors 数组')
+    const idx = manifest.connectors.findIndex((c) => c && c.id === ID)
+    const entry = buildManifestEntry()
+    if (idx >= 0) {
+      const was = manifest.connectors[idx].version
+      manifest.connectors[idx] = entry
+      ok(`索引条目 ${ID}：版本 ${was} → ${entry.version}`)
+    } else {
+      manifest.connectors.push(entry)
+      ok(`索引条目 ${ID}：新增（版本 ${entry.version}）`)
+    }
+    writeJson(manifestPath, manifest)
+  } else {
+    info(`缓存索引不存在，跳过：${manifestPath}`)
+  }
+
+  // 图标
+  const srcIcon = join(OUT_DIR, 'icons', `${ID}.svg`)
+  if (existsSync(srcIcon)) {
+    mkdirSync(join(CACHE_DIR, 'icons'), { recursive: true })
+    copyTreeChecked(srcIcon, join(CACHE_DIR, 'icons', `${ID}.svg`), 'icon')
+    ok(`同步 icons/${ID}.svg`)
+  }
+
+  const frozen = readJson(join(dstPkg, 'mcp.json')).mcpServers[ID]
+  info(`冻结入口：${frozen.args[0]}`)
+  console.log('\n现在重启 WorkBuddy（或在连接器中心手动刷新），即可用上最新版本。\n')
+}
+
 // ---------------------------------------------------------------- main
 
 const args = parseArgs(process.argv.slice(2))
@@ -473,6 +552,9 @@ const cmd = args._[0]
 switch (cmd) {
   case 'build':
     cmdBuild(args)
+    break
+  case 'install':
+    cmdInstall(args)
     break
   case 'serve':
     cmdServe(args)
@@ -491,6 +573,7 @@ switch (cmd) {
 用法：node scripts/local-connector-market.mjs <命令> [选项]
 
   build [--release]    构建本地市场 zip（默认 dev 模式，跑本机 lib/server.js）
+  install              把构建好的 jumpserver 包就地同步进客户端市场缓存目录
   serve [--port N]     起本地 HTTP 市场服务（默认 ${DEFAULT_PORT}）
   enable [--port N]    写入覆盖配置并清除指纹，触发 WorkBuddy 重同步
   disable              撤销覆盖，恢复官方连接器市场

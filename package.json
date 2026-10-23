@@ -51,6 +51,7 @@
     "link:stable": "node scripts/link-stable-checkout.mjs",
     "pack:connector": "node scripts/validate-connector.mjs && node scripts/pack-connector.mjs",
     "market:build": "node scripts/local-connector-market.mjs build",
+    "market:install": "node scripts/local-connector-market.mjs install",
     "market:serve": "node scripts/local-connector-market.mjs serve",
     "market:enable": "node scripts/local-connector-market.mjs enable",
     "market:disable": "node scripts/local-connector-market.mjs disable",
