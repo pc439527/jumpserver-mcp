@@ -44,20 +44,52 @@ export interface Classification {
 
 // ---------------- whole-command DANGEROUS ----------------
 
+/**
+ * Compound destructive patterns: matched against the RAW command text (quotes
+ * included) because the destructive payload may be a quoted argument of a
+ * wrapper (e.g. `bash -c "rm -rf /"`).
+ */
 const DANGEROUS_COMMANDS: RegExp[] = [
   /\brm\s+(?:-[a-zA-Z]*[rf][a-zA-Z]*\s+)*\/(?:\s|\*|$)/, // rm -rf /
   /\bmkfs(?:\.\w+)?\b/,
   /\bwipefs\b/,
   /\bdd\b/,
-  /\bshutdown\b|\breboot\b|\bpoweroff\b|\bhalt\b/,
   /\biptables\s+-[FX]\b/,
   /\biptables\s+-P\b/, // set a chain policy — can lock the host out
   /\bDROP\s+DATABASE\b|\bTRUNCATE\s+TABLE\b/i,
   /:\s*\(\s*\)\s*\{[^}]*\|/, // fork bomb :(){ :|:& };:
   /\bkill\s+-9\s+-1\b/,
   /\bchmod\s+-[a-zA-Z]*R[a-zA-Z]*[^&|;]*\s+0*777\s+\//, // chmod -R 777 /
-  /\b(?:yes|yum|dnf)\s+\|\s+.*\b(?:rm|mkfs|shutdown|reboot)\b/i, // piped destructive (conservative)
+  /\b(?:yes|yum|dnf)\s+\|\s+.*\b(?:rm|mkfs)\b/i, // piped destructive (conservative)
 ]
+
+/**
+ * Bare destructive VERBS: dangerous as a COMMAND (`shutdown -h now`,
+ * `systemctl reboot`) but harmless as a literal argument
+ * (`grep -i 'shutdown' /var/log/messages`).
+ *
+ * The word must not be part of a longer identifier or a path, so
+ * `/etc/init.d/rc.shutdown` is NOT a destructive command.
+ */
+const DANGEROUS_COMMAND_WORDS: readonly string[] = ['shutdown', 'reboot', 'poweroff', 'halt']
+
+/**
+ * Destructive executables: only dangerous in the COMMAND POSITION.
+ *
+ * NOTE: `fdisk` / `sgdisk` / `parted` are deliberately NOT here — the reader
+ * registry covers their read-only forms (`fdisk -l` is READ), and their
+ * writing forms are already UNKNOWN (fail-closed) there.
+ */
+const DANGEROUS_EXECUTABLES: ReadonlySet<string> = new Set(['dd', 'wipefs'])
+
+/** Destructive executable name prefixes (mkfs.ext4, mkfs.xfs, ...). */
+const DANGEROUS_EXECUTABLE_PREFIXES: readonly string[] = ['mkfs']
+
+/**
+ * Tools whose SUBCOMMAND verb is destructive: `systemctl reboot` /
+ * `systemctl poweroff` destroy the host just like the bare word does.
+ */
+const DANGEROUS_VERB_HOSTS: ReadonlySet<string> = new Set(['systemctl', 'service', 'shutdown', 'reboot', 'halt', 'poweroff'])
 
 const DANGEROUS_REASON = (source: string): string => 'dangerous pattern: ' + source
 
@@ -67,22 +99,38 @@ const DANGEROUS_REASON = (source: string): string => 'dangerous pattern: ' + sou
  *  never claimed modifying either. UNKNOWN keeps READ_ONLY closed and AUTO/
  *  FULL_ACCESS prompting, with honest copy. */
 const OPAQUE_SYNTAX_PATTERN =
-  /\$\(|\`|\b(?:bash|sh|su|sudo)\s+-c\b|\bpython3?\s+-c\b|\bperl\s+-e\b|\bsystem\s*\(/i
+  /\b(?:bash|sh|su|sudo)\s+-c\b|\bpython3?\s+-c\b|\bperl\s+-e\b|\bsystem\s*\(/i
 
 // ---------------- whole-command CONFIRMED mutation ----------------
 
 /** Plain modifier verbs (word-boundary, anywhere in the masked command).
- *  mount/sed/tar are handled by dedicated rules below. */
+ *  mount/sed/tar are handled by dedicated rules below.
+ *
+ *  NOTE (V0.7.0): `crontab` is deliberately NOT here. `crontab -l` only lists
+ *  the crontab, so matching the word made a read-only query look like a write.
+ *  The form is parsed in semanticV21 instead (list / edit / install). */
 const MODIFY_VERBS =
-  /\b(?:rm|mv|cp|touch|mkdir|rmdir|install|chmod|chown|chgrp|ln|kill|pkill|killall|tee|truncate|umount|useradd|userdel|usermod|groupadd|groupdel|groupmod|crontab|at|systemd-run|unzip|gunzip|chroot|git|svn|make|cmake|npm|yarn|pnpm|pip|pip3|apt|apt-get|yum|dnf|zypper|pacman|setfacl|chattr|chacl|restorecon|semanage|mkuser|htpasswd|vipw|vigr|cgcreate|nulloep|newgrp)\b/i
+  /\b(?:rm|mv|cp|touch|mkdir|rmdir|install|chmod|chown|chgrp|ln|kill|pkill|killall|tee|truncate|umount|useradd|userdel|usermod|groupadd|groupdel|groupmod|at|systemd-run|unzip|gunzip|zip|chroot|git|svn|make|cmake|npm|yarn|pnpm|pip|pip3|apt|apt-get|yum|dnf|zypper|pacman|setfacl|chattr|chacl|restorecon|semanage|mkuser|htpasswd|vipw|vigr|cgcreate|nulloep|newgrp)\b/i
 
 const SYSTEMCTL_MODIFY = /\bsystemctl\b[^&|;]*\s(?:start|stop|restart|reload|reload-or-restart|try-restart|condrestart|force-reload|enable|disable|reenable|mask|unmask|daemon-reload|daemon-reexec|kill|reset-failed|set-default|set-property|edit|add-wants|add-requires|preset|preset-all|isolate|switch-root|halt|poweroff|reboot|kexec|suspend|hibernate|hybrid-sleep|freeze|exit|rescue|emergency)\b/
 const SERVICE_MODIFY = /\bservice\b[^&|;]*\s(?:start|stop|restart|reload|force-reload|condrestart|try-restart)\b/
 const PKG_MODIFY = /\b(?:apt|apt-get|yum|dnf|zypper|pacman|apk)\b[^&|;]*\s(?:install|remove|purge|erase|update|upgrade|full-upgrade|dist-upgrade|distro-sync|autoremove|downgrade|reinstall|clean|autoclean|makecache|download|source)\b/
 const SED_INPLACE = /\bsed\b[^&|;]*\s-{1,2}i[a-zA-Z]*(?:\.\S+)?\b/
-const TAR_EXTRACT = /\btar\b[^&|;]*\s-x[a-zA-Z]*\b/
-const TAR_CREATE = /\btar\b[^&|;]*\s-c[a-zA-Z]*\b/
-const SU_EXEC = /\b(?:su|sudo)\s+(?:-c|--command)\b/
+/*
+ * tar's mode letters can be bundled into ONE short-option cluster
+ * (`tar czf out.tar.gz dir` == `tar -c -z -f out.tar.gz`), so the `-` is
+ * optional as long as the cluster CONTAINS `c` / `x`.
+ */
+const TAR_EXTRACT = /\btar\b[^&|;]*\s(?:-[a-zA-Z]*)?x[a-zA-Z]*\b/
+const TAR_CREATE = /\btar\b[^&|;]*\s(?:-[a-zA-Z]*)?c[a-zA-Z]*\b/
+/**
+ * `su`/`sudo` running a command via `-c`.
+ *
+ * The user may be named between `su` and `-c` (`su - prdadm -c "..."`), so the
+ * pattern allows an optional login dash and an optional user name. Missing
+ * that gap let a privilege-switching command escape the modifier-verb scan.
+ */
+const SU_EXEC = /\b(?:su|sudo)\s+(?:-\w+\s+)*(?:-c|--command)\b/
 const HOSTNAMECTL_MODIFY = /\bhostnamectl\b[^&|;]*\s(?:set-|transient\b|pretty\b)/
 const TIMEDATECTL_MODIFY = /\btimedatectl\b[^&|;]*\s(?:set-|ntp\b)/
 const LOGINCTL_MODIFY = /\bloginctl\b[^&|;]*\s(?:terminate-|kill-|lock-|unlock-|set-|enable-linger|disable-linger)/
@@ -92,8 +140,15 @@ const NMCli_MODIFY = /\bnmcli\b[^&|;]*\s(?:device|connection|general|radio|netwo
 const ETHTOOL_MODIFY = /\bethtool\b[^&|;]*\s-(?:s|K|G|A|C|N|W|L|S|coalesce|features|pause|ring|channels|offload|eee|fec)\b/
 const IPTABLES_MODIFY = /\biptables\s+-[ADIRZ]\b/
 
-/** Write-redirection operator with an optional FD prefix: ">", "2>", ">>", "2>>". */
-const REDIRECT_OP = /(?:^|\b)(\d{1,2})?\s*[>»]{1,2}\s*([^;|>\s»]*)/g
+/**
+ * Write-redirection operator with an optional FD prefix: ">", "2>", ">>", "2>>".
+ *
+ * The prefix must accept a NON-word character before the operator, otherwise
+ * `echo 'x' >> file` (the `>` follows a closing quote, not a word character)
+ * would not match and the write would be silently classified as READ.
+ * `-` and `=` are excluded so that arrows (`->`, `=>`) are not redirections.
+ */
+const REDIRECT_OP = /(?:^|\b|[^\w>=-])(\d{1,2})?\s*[>»]{1,2}\s*([^;|>\s»]*)/g
 
 /**
  * Read-only FD redirections must NOT be classified as file writes.
@@ -264,6 +319,30 @@ const READ_RULES: Record<string, ReaderRule> = {
   service: { special: serviceSpecial },
   fdisk: new Set(['l']),
   top: new Set(['bn1', 'b', 'n1', 'h']),
+  // ---- V0.7.0 (C-1): gzip/grep twins and process-listing helpers. These are
+  // pure readers: zgrep/zcat only decompress to stdout, pgrep only lists.
+  zgrep: 'any', zcat: 'any', zless: 'any', zmore: 'any', zdiff: 'any',
+  pgrep: 'any', pidof: 'any',
+  // `cd` only changes the shell's working directory: no file is written and no
+  // server state changes. It is the standard prefix of a read-only
+  // investigation ("cd /data && awk ... && wc -l"), and rejecting it made the
+  // whole compound unknown.
+  cd: 'any',
+  // `printf`/`echo` write to stdout only. A file-writing form would be caught
+  // by the write-redirect scan.
+  printf: 'any',
+  // `[ ... ]` / `test ...` are the POSIX test builtins: they evaluate a
+  // condition and print true/false. They run no external program and change
+  // nothing. `read` reads one line into a variable — also side-effect free
+  // with respect to the host.
+  '[': 'any', test: 'any', read: 'any',
+  // `bash -n` / `sh -n` parse a script WITHOUT executing it (syntax check).
+  // `bash -c` executes and stays in the opaque bucket.
+  ifconfig: 'any',
+  mysqldumpslow: 'any',
+  // `rpcinfo -p` lists the registered RPC programs: read-only. The bare form
+  // (`rpcinfo host`) queries a host, also read-only.
+  rpcinfo: 'any',
 }
 
 /** Runtime guard: a Rule that is a Set-of-verbs (the values are created with new Set). */
@@ -341,12 +420,60 @@ function dockerSpecial(tokens: string[], _segment: string): CommandRisk | null {
   return null
 }
 
+/**
+ * Global kubectl flags that take a VALUE. A global flag may appear BEFORE the
+ * verb (`kubectl -n kube-system patch configmap ...`), so the verb cannot be
+ * taken as `tokens[1]`.
+ */
+const KUBECTL_GLOBAL_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '--namespace', '-n', '--context', '--kubeconfig', '--cluster', '--user',
+  '--server', '-s', '--token', '--certificate-authority', '--client-certificate',
+  '--client-key', '--request-timeout', '--password', '--as', '--as-group',
+  '--tls-server-name',
+])
+
+/** Global kubectl flags that take NO value. */
+const KUBECTL_GLOBAL_BOOL_FLAGS: ReadonlySet<string> = new Set([
+  '--insecure-skip-tls-verify', '--match-server-version', '--warnings-as-errors',
+  '--disable-compression', '--alsologtostderr',
+])
+
+/**
+ * The index of the kubectl VERB token, skipping global flags and their values.
+ *
+ * `kubectl -n kube-system patch configmap` has its verb at index 3, not 1.
+ * Taking `tokens[1]` made every flagged kubectl call fall through to UNKNOWN
+ * — including MUTATIONS, which then looked like "unknown" instead of "modify".
+ *
+ * Returns -1 when no verb can be located (=> the caller keeps the strict path).
+ */
+function kubectlVerbIndex(tokens: string[]): number {
+  let i = 1
+  while (i < tokens.length) {
+    const t = tokens[i]!
+    if (t === '--') return -1
+    if (!t.startsWith('-')) return i
+    if (t.includes('=')) { i += 1; continue }
+    if (KUBECTL_GLOBAL_BOOL_FLAGS.has(t)) { i += 1; continue }
+    if (KUBECTL_GLOBAL_VALUE_FLAGS.has(t)) { i += 2; continue }
+    // An unknown flag: the next token might be its value, so the verb start
+    // cannot be determined => fail closed.
+    return -1
+  }
+  return -1
+}
+
 /** kubectl semantic classification (auth can-i / config view are the read sub-forms). */
 function kubectlSpecial(tokens: string[], _segment: string): CommandRisk | null {
-  const verb = tokens[1]
+  const verbIndex = kubectlVerbIndex(tokens)
+  if (verbIndex < 0) {
+    // The verb cannot be located reliably (unknown global flag) => UNKNOWN.
+    return null
+  }
+  const verb = tokens[verbIndex]
   if (verb === undefined) return 'READ' // bare 'kubectl' prints help
   if (verb === 'auth') {
-    const sub = tokens[2]
+    const sub = tokens[verbIndex + 1]
     if (sub === 'can-i') return 'READ'
     if (sub === 'reconcile') return 'MODIFY'
     return null
@@ -387,8 +514,11 @@ function numactlSpecial(tokens: string[], _segment: string): CommandRisk | null 
 function nmcliSpecial(tokens: string[], _segment: string): CommandRisk | null {
   const group = tokens[1]
   const sub = tokens[2]
-  if (group === 'general' && (sub === 'status' || sub === 'permissions' || sub === 'hostname')) return 'READ'
-  if ((group === 'device' || group === 'connection') && (sub === 'show' || sub === 'status')) return 'READ'
+  // nmcli accepts unique-prefix abbreviations of its object groups
+  // (`nmcli dev` == `nmcli device`, `nmcli con` == `nmcli connection`).
+  const groupName = group === 'dev' ? 'device' : group === 'con' ? 'connection' : group === 'gen' ? 'general' : group
+  if (groupName === 'general' && (sub === 'status' || sub === 'permissions' || sub === 'hostname')) return 'READ'
+  if ((groupName === 'device' || groupName === 'connection') && (sub === 'show' || sub === 'status')) return 'READ'
   if (sub === 'list') return 'READ'
   if (NMCli_MODIFY.test(tokens.join(' '))) return 'MODIFY'
   return null
@@ -434,6 +564,170 @@ function serviceSpecial(tokens: string[], _segment: string): CommandRisk | null 
   return null
 }
 
+// ---------------- exec wrapper: kubectl exec / docker exec ----------------
+
+/**
+ * A shell token that keeps BOTH the raw text (quotes included) and the
+ * unquoted value. The raw text is needed to rebuild an inner command without
+ * losing its inner quoting (e.g. `sh -c 'cat x | grep "y"'`).
+ */
+interface ShellToken {
+  raw: string
+  value: string
+}
+
+/**
+ * Quote-aware tokenizer that keeps each token's raw text.
+ * Returns null when quotes are unbalanced (=> not analyzable).
+ */
+function rawTokens(command: string): ShellToken[] | null {
+  const out: ShellToken[] = []
+  let i = 0
+  while (i < command.length) {
+    while (i < command.length && /\s/.test(command[i]!)) i++
+    if (i >= command.length) break
+    const start = i
+    let raw = ''
+    let value = ''
+    while (i < command.length && !/\s/.test(command[i]!)) {
+      const ch = command[i]!
+      if (ch === '\\' && i + 1 < command.length) {
+        raw += ch + command[i + 1]!
+        value += command[i + 1]!
+        i += 2
+        continue
+      }
+      if (ch === "'" || ch === '"') {
+        const quote = ch
+        raw += ch
+        i++
+        while (i < command.length && command[i] !== quote) {
+          if (quote === '"' && command[i] === '\\' && i + 1 < command.length) {
+            raw += command[i]! + command[i + 1]!
+            value += command[i + 1]!
+            i += 2
+            continue
+          }
+          raw += command[i]!
+          value += command[i]!
+          i++
+        }
+        if (i >= command.length) return null // unbalanced quote
+        raw += quote
+        i++
+        continue
+      }
+      raw += ch
+      value += ch
+      i++
+    }
+    if (i > start) out.push({ raw, value })
+  }
+  return out
+}
+
+/** Strip one pair of enclosing quotes (the inner content keeps its quotes). */
+function stripOuterQuotes(text: string): string {
+  const t = text.trim()
+  if (t.length >= 2) {
+    const first = t[0]!
+    const last = t[t.length - 1]!
+    if ((first === "'" && last === "'") || (first === '"' && last === '"')) return t.slice(1, -1)
+  }
+  return t
+}
+
+/** docker exec options that consume the following token as their value. */
+const DOCKER_EXEC_VALUE_OPTIONS = new Set(['-u', '--user', '-e', '--env', '-w', '--workdir', '--env-file'])
+
+/**
+ * Extract the INNER command of an exec wrapper.
+ *
+ *   kubectl exec [-flags] POD -- CMD [args...]      -> CMD [args...]
+ *   docker  exec [-flags] CONTAINER CMD [args...]   -> CMD [args...]
+ *
+ * Returns null when the segment is not an exec wrapper, or when the inner
+ * command cannot be determined unambiguously (fail-closed => the caller keeps
+ * the ordinary, stricter classification).
+ */
+function extractExecInner(segment: string): string | null {
+  const tokens = rawTokens(segment)
+  if (tokens === null || tokens.length < 3) return null
+  const program = tokens[0]!.value
+  const verb = tokens[1]!.value
+  if (verb !== 'exec') return null
+
+  if (program === 'kubectl') {
+    let sep = -1
+    for (let i = 2; i < tokens.length; i++) {
+      if (tokens[i]!.value === '--') {
+        sep = i
+        break
+      }
+    }
+    if (sep < 0) return null // no '--' => ambiguous, keep the strict path
+    const rest = tokens.slice(sep + 1)
+    if (rest.length === 0) return null
+    return rest.map((t) => t.raw).join(' ')
+  }
+
+  if (program === 'docker') {
+    let i = 2
+    while (i < tokens.length) {
+      const t = tokens[i]!
+      if (!t.value.startsWith('-')) break
+      const name = t.value.split('=')[0]!
+      if (!t.value.includes('=') && DOCKER_EXEC_VALUE_OPTIONS.has(name)) i++
+      i++
+    }
+    if (i >= tokens.length) return null // no container name
+    i++ // skip the container name
+    const rest = tokens.slice(i)
+    if (rest.length === 0) return null
+    return rest.map((t) => t.raw).join(' ')
+  }
+
+  return null
+}
+
+/** FD-only redirections that may trail a `sh -c '<script>'` argument. */
+const FD_REDIRECTION_ONLY = /^\d{0,2}(?:>>?|>&|&>)\d{0,2}$/
+
+/**
+ * `sh -c '<script>'` / `bash -lc '<script>'` -> the script body.
+ * Returns null when the form is a shell invocation that cannot be unwrapped
+ * safely (missing script, extra arguments, unbalanced quotes).
+ */
+function unwrapShellC(inner: string): string | null {
+  const tokens = rawTokens(inner)
+  if (tokens === null || tokens.length < 2) return null
+  const shell = tokens[0]!.value
+  if (!['sh', 'bash', 'dash', 'ksh', 'zsh'].includes(shell)) return null
+  const flag = tokens[1]!.value
+  if (!/^-[a-z]*c$/.test(flag)) return null
+  if (tokens.length < 3) return null
+  const script = tokens[2]!
+  if (script.raw.length === 0) return null
+  // trailing arguments after the script: only FD redirections are ignorable
+  for (let i = 3; i < tokens.length; i++) {
+    if (!FD_REDIRECTION_ONLY.test(tokens[i]!.raw)) return null
+  }
+  return stripOuterQuotes(script.raw)
+}
+
+/**
+ * Risk of the inner command of an exec wrapper.
+ * The inner command goes through the SAME full pipeline (danger / opaque /
+ * mutation / per-segment), so an inner write stays MODIFY and an inner
+ * unanalyzable command stays UNKNOWN.
+ */
+function classifyExecInner(inner: string): CommandRisk {
+  const unwrapped = unwrapShellC(inner)
+  const effective = unwrapped === null ? inner : unwrapped
+  if (effective.trim().length === 0) return 'UNKNOWN'
+  return classifyInnerFully(effective)
+}
+
 // ---------------- segment-level forbidden args (a reader may not ...) ----------------
 
 const FORBIDDEN_ARGUMENT_PATTERNS: Array<{ match: RegExp; reason: string }> = [
@@ -463,6 +757,47 @@ const TRUSTED_COMMAND_ALIASES: Record<string, readonly string[]> = {
   'redis-cli': ['/usr/emp/cachesrv/redis/bin/redis-cli'],
 }
 
+/**
+ * Trusted ABSOLUTE paths for known binaries that live outside the system
+ * directories (SAP Control Center, bundled JDKs, the PHP/MySQL stack of the
+ * panel-based installs, ...).
+ *
+ * Double condition, deliberately:
+ *   1. the BASENAME must be a known tool (an unknown basename is never
+ *      accepted, no matter where it lives), and
+ *   2. the path must sit under one of the allowed directory prefixes.
+ *
+ * A bare basename alone is NOT enough (an operator could point PATH at an
+ * arbitrary directory), and a trusted directory alone is NOT enough either
+ * (the directory may contain other executables).
+ */
+const TRUSTED_ABSOLUTE_ALIASES: Record<string, readonly string[]> = {
+  sapcontrol: ['/usr/sap/hostctrl/exe'],
+  saphostexec: ['/usr/sap/hostctrl/exe'],
+  saposcol: ['/usr/sap/hostctrl/exe'],
+  hdbnsutil: ['/usr/sap'],
+  hdbuserstore: ['/usr/sap'],
+  hdbbackup: ['/usr/sap'],
+  hdbcompress: ['/usr/sap'],
+  hdbconsistencycheck: ['/usr/sap'],
+  jstat: ['/usr/local/java', '/usr/lib/jvm', '/opt/java'],
+  jinfo: ['/usr/local/java', '/usr/lib/jvm', '/opt/java'],
+  javap: ['/usr/local/java', '/usr/lib/jvm', '/opt/java'],
+  nginx: ['/www/server/nginx/sbin', '/usr/local/nginx/sbin'],
+  php: ['/www/server/php'],
+  'php-fpm': ['/www/server/php'],
+  mysqld: ['/www/server/mysql/bin'],
+  jq: ['/usr/local/bin', '/usr/bin'],
+}
+
+/** True when `normalized` sits directly under one of the `prefix` directories. */
+function isUnderTrustedPrefix(normalized: string, prefixes: readonly string[]): boolean {
+  for (const prefix of prefixes) {
+    if (normalized.startsWith(prefix + '/')) return true
+  }
+  return false
+}
+
 export function canonicalExecutable(token: string): string | undefined {
   if (!token.includes('/')) return token
   if (!token.startsWith('/')) return undefined
@@ -473,7 +808,36 @@ export function canonicalExecutable(token: string): string | undefined {
   if (base === undefined) return undefined
   const parent = '/' + parts.slice(0, -1).join('/')
   if (TRUSTED_SYSTEM_DIRS.has(parent)) return base
+  if (isUnderTrustedPrefix(normalized, TRUSTED_ABSOLUTE_ALIASES[base] ?? [])) return base
   return TRUSTED_COMMAND_ALIASES[base]?.includes(normalized) === true ? base : undefined
+}
+
+/**
+ * The command of a `su [-] [user] -c '<command>'` invocation.
+ *
+ * Returns null when the segment is not such an invocation (a bare `su`, or a
+ * form that cannot be parsed unambiguously) — the caller then keeps the
+ * fail-closed verdict.
+ */
+function extractSuCommand(segment: string): string | null {
+  const tokens = rawTokens(segment)
+  if (tokens === null || tokens.length < 3) return null
+  if (tokens[0]!.value !== 'su') return null
+  let i = 1
+  // optional flags (`-`, `-l`) and the optional user name
+  while (i < tokens.length) {
+    const v = tokens[i]!.value
+    if (v === '-c' || v === '--command') break
+    if (v.startsWith('-')) { i++; continue }
+    // A bare word here is the user name.
+    i++
+  }
+  if (i >= tokens.length) return null
+  const flag = tokens[i]!.value
+  if (flag !== '-c' && flag !== '--command') return null
+  const cmd = tokens[i + 1]
+  if (cmd === undefined) return null
+  return stripOuterQuotes(cmd.raw)
 }
 
 function firstToken(segment: string): string | undefined {
@@ -510,7 +874,10 @@ function maskQuoted(command: string): string {
       continue
     }
     if (ch === '\\' && i + 1 < command.length) {
-      out += ' '
+      // An escaped character is LITERAL data (`\c` is the letter c), so the
+      // character itself is kept and only the backslash disappears. Masking
+      // it away hid the escaped command name (`\cp` looks like nothing).
+      out += command[i + 1]!
       i += 2
       continue
     }
@@ -520,7 +887,14 @@ function maskQuoted(command: string): string {
   return out
 }
 
-/** Split on ; && || | at quote/escape boundaries (quoted pipes stay intact). */
+/**
+ * Split on ; && || | at quote/escape boundaries (quoted pipes stay intact).
+ *
+ * A command substitution `$( ... )` is a NESTED command list: the `;` and `|`
+ * inside it belong to the inner command, not to the outer one. Splitting them
+ * apart turned `SS=$(grep -E ... file | grep -c x)` into two broken halves.
+ * So the substitution body is kept intact and split separately.
+ */
 export function splitSegments(command: string): string[] {
   const segments: string[] = []
   let current = ''
@@ -545,6 +919,28 @@ export function splitSegments(command: string): string[] {
       i += 2
       continue
     }
+    // A command substitution: copy it verbatim (with its nested parens) so
+    // that the inner `;`/`|` are not treated as outer separators.
+    if (ch === '$' && command[i + 1] === '(') {
+      let depth = 1
+      let j = i + 2
+      while (j < command.length && depth > 0) {
+        if (command[j] === '(') depth++
+        else if (command[j] === ')') depth--
+        j++
+      }
+      current += command.slice(i, Math.min(j, command.length))
+      i = j
+      continue
+    }
+    if (ch === '`' && command[i + 1] !== undefined) {
+      const end = command.indexOf('`', i + 1)
+      if (end >= 0) {
+        current += command.slice(i, end + 1)
+        i = end + 1
+        continue
+      }
+    }
     if (ch === ';' || ch === '&' || ch === '|') {
       if (ch === '&' && i > 0 && command[i - 1] === '>') {
         current += ch
@@ -563,9 +959,116 @@ export function splitSegments(command: string): string[] {
   return segments
 }
 
+// ---------------- shell control structure ----------------
+
+/**
+ * Shell keywords that introduce an EXECUTED command list. The keyword itself
+ * runs nothing, the payload does — the payload is classified recursively.
+ *
+ * `if`/`while`/`until`/`elif` are here too, and that is deliberate: their
+ * payload is a CONDITION, but a condition can still be a command
+ * (`if shutdown -h now; then ... fi`). Skipping the condition would hide the
+ * destructive verb, so the payload is classified instead.
+ */
+const SHELL_COMMAND_PREFIX: ReadonlySet<string> = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until'])
+
+/**
+ * Shell keywords that introduce a WORD LIST / expression. Nothing is executed
+ * by the keyword itself; a `$(...)` inside such a list was already rejected by
+ * the opaque-syntax scan, so the list is inert.
+ */
+const SHELL_LIST_PREFIX: ReadonlySet<string> = new Set(['for', 'select'])
+
+/** Shell keywords with no payload at all. */
+const SHELL_PURE_PREFIX: ReadonlySet<string> = new Set(['done', 'fi', 'esac', 'in'])
+
+/**
+ * A single shell word (no unquoted whitespace) — the value of a pure
+ * assignment. `$( ... )` counts as one word even with spaces inside it.
+ */
+const SHELL_ASSIGN_VALUE = /^(?:"[^"]*"|'[^']*'|`[^`]*`|\$\([\s\S]*\)|[^\s'"`();&|<>]+)$/
+
+interface ShellStructure {
+  /** 'none' = ordinary command, 'pure' = keyword only, 'list' = word list, 'command' = executed payload */
+  kind: 'none' | 'pure' | 'list' | 'command'
+  rest: string
+}
+
+/**
+ * Peel shell control-structure keywords off the front of a segment.
+ *
+ *   do|then|else|elif|if|while|until  -> the payload is an executed command list
+ *   for|select                         -> the payload is a word list (runs nothing)
+ *   done|fi|esac|in                    -> no payload
+ *   NAME=<one word>                    -> a pure assignment (runs nothing)
+ *   ( | {                             -> a group opener, the payload follows
+ *
+ * Why this matters for safety: the dangerous-command scan used to look at the
+ * FIRST WORD of a segment only, so `if shutdown -h now; then ... fi` hid the
+ * destructive verb behind a keyword and was NOT flagged. Now the keyword is
+ * peeled off before the command position is determined, so the destructive
+ * verb is found (see `segmentExecutable`).
+ */
+/**
+ * True when the text consists only of redirections (and the words they
+ * point at) — i.e. it runs no command at all.
+ *
+ * `done < /tmp/list`, `fi > /tmp/out` and `2>&1` are redirections, not
+ * commands. Treating them as commands made every `while ... done < file`
+ * loop UNKNOWN.
+ */
+function isRedirectionOnly(text: string): boolean {
+  const masked = maskQuoted(text)
+  const tokens = masked.split(/\s+/).filter((t) => t.length > 0)
+  for (const t of tokens) {
+    if (/^\d{0,2}(?:>>?|<<?|&>>?)/.test(t)) continue
+    if (/^\d{0,2}$/.test(t)) continue
+    if (t === '&') continue
+    // The target of a redirection is a path, not a command.
+    if (/^[/~.][^\s;|&<>]*$/.test(t)) continue
+    return false
+  }
+  return tokens.length > 0
+}
+
+function stripShellStructure(segment: string): ShellStructure {
+  let s = segment.trim()
+  for (;;) {
+    if (s.length === 0) return { kind: 'pure', rest: '' }
+    // Group openers are glued to the payload: `(docker ps ...`, `{ ls; }`.
+    const opener = s[0]
+    if (opener === '(' || opener === '{') {
+      s = s.slice(1).trim()
+      if (s.length === 0) return { kind: 'pure', rest: '' }
+      continue
+    }
+    const word = s.split(/\s+/)[0]!
+    if (SHELL_PURE_PREFIX.has(word)) {
+      const rest = s.slice(word.length).trim()
+      if (rest.length === 0) return { kind: 'pure', rest: '' }
+      // `done < file` / `fi > file`: the keyword is still pure, only a
+      // REDIRECTION follows it. A redirection is not a command, so the
+      // segment stays a pure keyword.
+      if (isRedirectionOnly(rest)) return { kind: 'pure', rest: '' }
+      s = rest
+      continue
+    }
+    if (SHELL_COMMAND_PREFIX.has(word)) {
+      const rest = s.slice(word.length).trim()
+      if (rest.length === 0) return { kind: 'pure', rest: '' }
+      return { kind: 'command', rest }
+    }
+    if (SHELL_LIST_PREFIX.has(word)) return { kind: 'list', rest: '' }
+    break
+  }
+  const assign = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]+)$/.exec(s)
+  if (assign !== null && SHELL_ASSIGN_VALUE.test(assign[2]!.trim())) return { kind: 'list', rest: '' }
+  return { kind: 'none', rest: s }
+}
+
 // ---------------- wrapper stripping ----------------
 
-const WRAPPER_TOKENS = new Set(['env', 'timeout', 'nice'])
+const WRAPPER_TOKENS = new Set(['env', 'timeout', 'nice', 'time'])
 
 function isWrapperToken(token: string | undefined): boolean {
   return token !== undefined && WRAPPER_TOKENS.has(token)
@@ -596,6 +1099,36 @@ function stripWrapper(segment: string, wrapper: string): string {
 type SemanticVerdict = { risk: CommandRisk; ruleId: string; reason: string; confidence?: Confidence }
 const verdict = (risk: CommandRisk, ruleId: string, reason: string, confidence: Confidence = 'HIGH'): SemanticVerdict => ({ risk, ruleId, reason, confidence })
 const semanticRead = (ruleId: string, reason: string): SemanticVerdict => verdict('READ', ruleId, reason)
+
+/**
+ * True when every `>` in the awk program is a COMPARISON operator.
+ *
+ * In awk, `>` means "greater than" inside an expression
+ * (`if(index($0,"x")>0)`, `if(b>15)b=16`) and means "redirect to file" only in
+ * a print/printf statement (`print > "f"`).
+ *
+ * A comparison has an operand on BOTH sides of the operator; a redirect has
+ * the print statement before it and a bare filename after it. So a `>` is a
+ * comparison when the characters around it both end/start an operand.
+ *
+ * Anything that does not fit that shape (e.g. `print > f`) makes the function
+ * return false, and the caller then keeps the honest UNKNOWN verdict.
+ */
+function awkComparisonsOnly(segment: string): boolean {
+  const masked = maskQuoted(segment)
+  for (let i = 0; i < masked.length; i++) {
+    const ch = masked[i]!
+    if (ch !== '>') continue
+    if (masked[i + 1] === '=') continue // >= is always a comparison
+    const prev = masked[i - 1] ?? ''
+    const next = masked[i + 1] ?? ''
+    const prevEndsOperand = /[A-Za-z0-9_$)"'\]}]/.test(prev)
+    const nextStartsOperand = /[A-Za-z0-9_$"'(\[{.]/.test(next)
+    if (prevEndsOperand && nextStartsOperand) continue
+    return false
+  }
+  return true
+}
 
 function semanticV21(segment: string): SemanticVerdict | null {
   const tokens = tokensOf(segment)
@@ -635,10 +1168,10 @@ function semanticV21(segment: string): SemanticVerdict | null {
     const at = args.findIndex((t) => t === '-function' || t === '--function')
     const fn = at >= 0 ? (args[at + 1] ?? '').toLowerCase() : ''
     if (fn.length === 0) return null
-    if (['getprocesslist','getsysteminstancelist','getversioninfo','getalerttree','getqueuestatistic','getprocessparameter','parametervalue','getinstanceproperties','getstartprofiles','getenvironment'].includes(fn)) {
+    if (['getprocesslist','getsysteminstancelist','getversioninfo','getalerttree','getqueuestatistic','getprocessparameter','parametervalue','getinstanceproperties','getstartprofiles','getenvironment','enqgetstatistic','enqgetstatistics','getqueuestatistics'].includes(fn)) {
       return semanticRead('sap.sapcontrol.read.' + fn, 'sapcontrol -function ' + fn + ' only reports instance state')
     }
-    if (['start','stop','restart','instancesstart','instancesstop','instancestart','instancestop','restartinstance','startsystem','stopsystem','setprocessparameter','softshutdown'].includes(fn)) {
+    if (['start','stop','restart','instancesstart','instancesstop','instancestart','instancestop','startinstance','stopinstance','restartinstance','startsystem','stopsystem','setprocessparameter','softshutdown'].includes(fn)) {
       return verdict('MODIFY', 'sap.sapcontrol.mutate.' + fn, 'sapcontrol -function ' + fn + ' changes SAP instance state')
     }
     return null
@@ -693,7 +1226,11 @@ function semanticV21(segment: string): SemanticVerdict | null {
   if (command === 'awk') {
     if (/\bsystem\s*\(/.test(segment)) return verdict('MODIFY', 'awk.system', 'awk system() executes arbitrary commands')
     if (/[>]{1,2}\s*["']/.test(segment)) return verdict('MODIFY', 'awk.redirect', 'awk program redirects output to a file')
-    if (/[>]{1,2}/.test(segment) && !/(?:NR|NF|\$\d+)\s*>[=]?\s*\d/.test(segment)) return verdict('UNKNOWN', 'awk.redirect-ambiguous', 'awk output redirection cannot be excluded', 'LOW')
+    // A bare `>` is a COMPARISON in awk (`if(index($0,"x")>0)`), not a
+    // redirect. A redirect is `print > file` — the `>` follows a print
+    // statement. So the ambiguous case is narrowed to a `>` that appears
+    // OUTSIDE of a comparison context, i.e. not between two operands.
+    if (/[>]{1,2}/.test(segment) && !awkComparisonsOnly(segment)) return verdict('UNKNOWN', 'awk.redirect-ambiguous', 'awk output redirection cannot be excluded', 'LOW')
     return semanticRead('awk.stdout', 'awk program has no file-write construct')
   }
   if (command === 'systemctl') {
@@ -719,8 +1256,11 @@ function semanticV21(segment: string): SemanticVerdict | null {
     return null
   }
   if (command === 'kubectl') {
-    const verb = lower[0]
-    const sub = lower[1]
+    // The verb may sit behind global flags (`kubectl -n ns get pods`), so the
+    // verb index is resolved the same way as in kubectlSpecial.
+    const vi = kubectlVerbIndex(tokens)
+    const verb = vi >= 0 ? lower[vi - 1] : undefined
+    const sub = vi >= 0 ? lower[vi] : undefined
     if (verb === 'config') {
       if (['view','current-context','get-contexts','get-clusters','get-users'].includes(sub ?? '')) return semanticRead('kubectl.config.' + sub, 'kubectl config query is read-only')
       if (sub !== undefined && (sub === 'use-context' || sub === 'unset' || sub === 'rename-context' || sub.startsWith('set-') || sub.startsWith('delete-'))) return verdict('MODIFY', 'kubectl.config.' + sub, 'kubectl config ' + sub + ' writes kubeconfig')
@@ -731,6 +1271,41 @@ function semanticV21(segment: string): SemanticVerdict | null {
       if (sub === 'reconcile') return verdict('MODIFY', 'kubectl.auth.reconcile', 'kubectl auth reconcile changes RBAC resources')
     }
     return null
+  }
+  if (command === 'bash' || command === 'sh' || command === 'dash' || command === 'ksh' || command === 'zsh') {
+    // `bash -n script.sh` = SYNTAX CHECK ONLY, the script is never executed.
+    // `bash -c '...'` EXECUTES the string and stays in the opaque bucket.
+    // `bash script.sh` EXECUTES the script => not a reader.
+    if (lower.includes('-n') && !lower.some((t) => /^-[a-z]*c$/.test(t))) {
+      return semanticRead('shell.syntax-check', command + ' -n only parses the script, it does not run it')
+    }
+    return null
+  }
+  if (command === 'openssl') {
+    // `openssl x509 -in cert.pem -noout -subject -dates` only READS the
+    // certificate. The writing forms (`-out`, `-outform` to a file) must stay
+    // MODIFY, so the presence of an output flag decides.
+    const sub = lower.find((t) => !t.startsWith('-'))
+    if (sub === 'x509' || sub === 'req' || sub === 'crl' || sub === 'rsa' || sub === 'ec' || sub === 'pkey' || sub === 'dhparam' || sub === 'asn1parse' || sub === 'dgst' || sub === 'passwd') {
+      const writes = lower.some((t) => t === '-out' || t === '-outfile' || t === '-keyout' || t === '-signkey' || t === '-outform')
+      if (writes) return verdict('MODIFY', 'openssl.write', 'openssl ' + sub + ' writes a key or certificate file')
+      return semanticRead('openssl.read', 'openssl ' + sub + ' only reads and prints')
+    }
+    return null
+  }
+  if (command === 'crontab') {
+    // C-3: parse the FORM, do not match the word.
+    //   crontab -l            -> list the current user's crontab   (READ)
+    //   crontab -u USER -l    -> list another user's crontab        (READ)
+    //   crontab -e / -r       -> edit / remove the crontab           (MODIFY)
+    //   bare crontab          -> install a crontab from stdin       (MODIFY)
+    // The word `crontab` alone is therefore NOT a modifier verb: it is
+    // handled here and removed from the generic modifier-verb scan.
+    const listed = lower.some((t) => t === '-l' || t === '--list')
+    const edited = lower.some((t) => t === '-e' || t === '--edit' || t === '-r' || t === '--remove')
+    if (listed && !edited) return semanticRead('cron.list', 'crontab -l only lists the crontab')
+    if (edited) return verdict('MODIFY', 'cron.mutate', 'crontab -e/-r changes the crontab')
+    return verdict('MODIFY', 'cron.mutate.install', 'bare crontab installs a crontab from stdin')
   }
   if (command === 'ulimit') {
     if (args.some((t) => !t.startsWith('-')) || args.some((t) => /^-[A-Za-z]+\d/.test(t))) return verdict('MODIFY', 'ulimit.set', 'ulimit with a value changes the shell resource limit')
@@ -756,10 +1331,150 @@ function semanticV21(segment: string): SemanticVerdict | null {
     if (modify.has(cmd)) return verdict('MODIFY','redis-cli.mutate.' + cmd.toLowerCase(),'Redis ' + cmd + ' changes data or server state')
     return verdict('UNKNOWN','redis-cli.unknown','Redis command semantics are unknown','LOW')
   }
+  // ---- V0.7.0 (C-1): read-only tools that the audit corpus kept hitting as
+  // UNKNOWN. Every rule below is fail-closed: an unrecognised verb returns
+  // null, which keeps the UNKNOWN verdict instead of guessing READ.
+  if (command === 'ipmitool') {
+    // `ipmitool <cmd> <sub>`: only the query forms are read-only. The write
+    // forms (chassis power off, sel delete, mc reset, raw, flash, ...) change
+    // the BMC and MUST NOT be classified as a reader.
+    const readSubs = new Set(['elist', 'list', 'info', 'status', 'print', 'get', 'sensor', 'selinfo'])
+    const writeCmds = new Set(['power', 'poweroff', 'poweron', 'powercycle', 'reset', 'off', 'on', 'cycle', 'delete', 'set', 'raw', 'flash', 'upgrade', 'bridge', 'send', 'inject'])
+    const cmd = lower.find((t) => !t.startsWith('-'))
+    const sub = lower.filter((t) => !t.startsWith('-'))[1]
+    if (cmd === undefined) return null
+    if (writeCmds.has(cmd)) return verdict('MODIFY', 'ipmitool.mutate.' + cmd, 'ipmitool ' + cmd + ' changes the BMC state')
+    if (sub !== undefined && readSubs.has(sub)) return semanticRead('ipmitool.read.' + cmd + '.' + sub, 'ipmitool ' + cmd + ' ' + sub + ' only queries the BMC')
+    return null
+  }
+  if (command === 'crm_mon') {
+    // Pacemaker/Corosync monitor: query-only by construction.
+    return semanticRead('pacemaker.crm_mon', 'crm_mon only reports cluster state')
+  }
+  if (command === 'crm') {
+    const sub = lower.find((t) => !t.startsWith('-'))
+    const sub2 = lower.filter((t) => !t.startsWith('-'))[1]
+    if (sub === 'configure' && sub2 === 'show') return semanticRead('pacemaker.crm.configure-show', 'crm configure show only reads the configuration')
+    if (sub !== undefined && ['status', 'node', 'resource', 'cluster', 'options', 'history', 'shadow', 'health', 'do', 'pending', 'stack', 'verify', 'simulate'].includes(sub)) {
+      return semanticRead('pacemaker.crm.' + sub, 'crm ' + sub + ' only reports cluster state')
+    }
+    return null
+  }
+  if (command === 'systemd-tmpfiles') {
+    // --version is a query; --clean DELETES files (must never be READ).
+    if (lower.includes('--version') || lower.includes('-v')) return semanticRead('systemd.tmpfiles.version', 'systemd-tmpfiles --version only prints the version')
+    if (lower.some((t) => t === '--clean' || t === '--create' || t === '--remove' || t === '--boot')) {
+      return verdict('MODIFY', 'systemd.tmpfiles.mutate', 'systemd-tmpfiles --clean/--create/--remove writes or deletes files under /tmp and /var')
+    }
+    return null
+  }
+  if (command === 'ufw') {
+    const sub = lower.find((t) => !t.startsWith('-'))
+    if (sub === 'status' || sub === 'show' || sub === 'version' || sub === 'list') return semanticRead('ufw.' + sub, 'ufw ' + sub + ' only reports the firewall state')
+    if (sub !== undefined && ['enable', 'disable', 'allow', 'deny', 'reset', 'reload', 'delete', 'insert', 'append'].includes(sub)) {
+      return verdict('MODIFY', 'ufw.mutate.' + sub, 'ufw ' + sub + ' changes the firewall rules')
+    }
+    return null
+  }
+  if (command === 'auditctl') {
+    if (lower.some((t) => t === '-l' || t === '--list' || t === '-s' || t === '--status' || t === '-st')) {
+      return semanticRead('auditctl.read', 'auditctl list/status only reads the audit rules')
+    }
+    if (lower.some((t) => t === '-D' || t === '--delete-all' || t === '-d' || t === '--delete' || t === '-b' || t === '-R' || t === '-W')) {
+      return verdict('MODIFY', 'auditctl.mutate', 'auditctl delete/rule changes the audit configuration')
+    }
+    return null
+  }
+  if (command === 'mdadm') {
+    const verb = lower.find((t) => t.startsWith('--'))
+    if (verb !== undefined && ['--detail', '--examine', '--scan', '--query', '--brief'].includes(verb)) {
+      return semanticRead('mdadm.read' + verb, 'mdadm ' + verb + ' only reports array state')
+    }
+    if (verb !== undefined && ['--create', '--add', '--grow', '--stop', '--assemble', '--remove', '--update', '--zero-superblock', '--examine'].includes(verb)) {
+      return verdict('MODIFY', 'mdadm.mutate' + verb, 'mdadm ' + verb + ' changes the RAID array')
+    }
+    return null
+  }
+  if (command === 'exportfs') {
+    if (lower.includes('-v') || lower.includes('--verbose')) return semanticRead('nfs.exportfs.read', 'exportfs -v only lists the export table')
+    return verdict('MODIFY', 'nfs.exportfs.mutate', 'exportfs without -v modifies the NFS export table')
+  }
+  if (command === 'php' || command === 'php-fpm') {
+    // Only the display forms are read-only. `php -r`, `php script.php` and a
+    // bare `php-fpm` EXECUTE code / start the service.
+    const flags = lower.filter((t) => t.startsWith('-'))
+    if (command === 'php') {
+      if (flags.some((t) => ['-r', '-f', '-d'].includes(t))) return verdict('MODIFY', 'php.execute', 'php -r/-f executes arbitrary code')
+      if (flags.some((t) => ['-v', '--version', '-m', '--modules', '-i', '--info', '-h', '--help'].includes(t)) && args.every((t) => t.startsWith('-'))) {
+        return semanticRead('php.display', 'php display form only prints version/modules')
+      }
+      if (args.some((t) => !t.startsWith('-'))) return verdict('MODIFY', 'php.execute', 'php running a script executes arbitrary code')
+      return null
+    }
+    if (flags.some((t) => ['-v', '--version', '-t', '-tt'].includes(t))) return semanticRead('php-fpm.display', 'php-fpm display/test form only reports the configuration')
+    return verdict('MODIFY', 'php-fpm.start', 'php-fpm starts the FastCGI process pool')
+  }
+  if (command === 'mysqld') {
+    if (lower.includes('--version') || lower.includes('-V')) return semanticRead('mysql.mysqld.version', 'mysqld --version only prints the version')
+    return verdict('MODIFY', 'mysql.mysqld.start', 'mysqld starts the database server')
+  }
+  if (command === 'stty') {
+    // `stty` with no argument prints the terminal settings (read-only).
+    // `stty cols 300` SETS a terminal attribute: that is a session-level
+    // change, so it stays MODIFY.
+    if (args.length === 0) return semanticRead('term.stty.show', 'stty without arguments only prints the terminal settings')
+    return verdict('MODIFY', 'term.stty.set', 'stty with arguments changes the terminal settings')
+  }
+  if (command === 'hdbuserstore') {
+    // `hdbuserstore list` prints the user store — read-only.
+    // `create` / `delete` / `alter` / `modify` change the user store.
+    const verb = lower.find((t) => !t.startsWith('-'))
+    if (verb === 'list') return semanticRead('sap.hdbuserstore.list', 'hdbuserstore list only reports the user store')
+    if (verb !== undefined && ['create', 'delete', 'alter', 'modify', 'set', 'reset', 'disable', 'enable', 'import', 'export'].includes(verb)) {
+      return verdict('MODIFY', 'sap.hdbuserstore.mutate.' + verb, 'hdbuserstore ' + verb + ' changes the HANA user store')
+    }
+    return null
+  }
+  if (command === 'hdbnsutil') {
+    // HANA admin tool: only the read-only sub-commands are recognised.
+    if (lower.includes('-sr_state') || lower.includes('--version') || lower.includes('-h')) {
+      return semanticRead('sap.hdbnsutil.read', 'hdbnsutil ' + (lower.find((t) => t.startsWith('-')) ?? '') + ' only reports the instance state')
+    }
+    return null
+  }
+  if (command === 'saphostexec') {
+    if (lower.includes('-status')) return semanticRead('sap.saphostexec.status', 'saphostexec -status only reports the instance status')
+    if (lower.some((t) => t === '-start' || t === '-stop' || t === '-restart' || t === '-kill' || t === '-dummy')) {
+      return verdict('MODIFY', 'sap.saphostexec.mutate', 'saphostexec start/stop changes the SAP instance')
+    }
+    return null
+  }
+  if (command === 'saposcol') {
+    if (lower.includes('-s') || lower.includes('-h')) return semanticRead('sap.saposcol.read', 'saposcol -s only lists the collectors')
+    return verdict('MODIFY', 'sap.saposcol.mutate', 'saposcol -r/-l rewrites the collector configuration files')
+  }
+  if (command === 'command') {
+    // The `command` builtin: -v/-V only query the PATH.
+    if (lower.includes('-v') || lower.includes('-V') || lower.includes('--version')) return semanticRead('shell.command.lookup', 'command -v only looks up the PATH')
+    if (args.length === 0) return semanticRead('shell.command.list', 'bare command only lists the available builtins')
+    return null
+  }
+  if (command === 'nohup') {
+    // `nohup <cmd>` runs <cmd> in the background: the inner command decides.
+    const inner = args.join(' ')
+    if (inner.trim().length === 0) return null
+    const innerRisk = classifyInnerFully(inner)
+    if (innerRisk === 'READ') return semanticRead('nohup.inner.read', 'nohup runs a read-only inner command')
+    if (innerRisk === 'MODIFY') return verdict('MODIFY', 'nohup.inner.modify', 'nohup runs an inner command that changes state')
+    if (innerRisk === 'DANGEROUS') return verdict('DANGEROUS', 'nohup.inner.dangerous', 'nohup runs a host-destructive inner command')
+    return null
+  }
+  if (command === 'shuf' || command === 'jstat' || command === 'jinfo' || command === 'javap' || command === 'jq' || command === 'ipcs' || command === 'getenforce' || command === 'sleep') {
+    // Query-only tools (no write form at all).
+    return semanticRead('tool.readonly.' + command, command + ' has no state-changing form')
+  }
   return null
 }
-
-// ---------------- classification core ----------------
 
 function classificationOf(risk: CommandRisk, reason: string, ruleId: string, command: string, confidence: Confidence = 'HIGH'): Classification {
   return {
@@ -833,24 +1548,337 @@ function classifyPlainSegment(segment: string, whole: string): Classification {
  * have already run over the full command text.
  */
 function classifySegment(segment: string): Classification {
-  const token = firstToken(segment)
-  if (token === 'sudo') {
-    const rest = segment.replace(/^sudo\b\s*/u, '')
-    if (rest.trim().length === 0) return classificationOf('UNKNOWN', 'bare sudo', 'sudo.bare', segment)
-    const inner = classifySegment(rest)
-    if (inner.risk === 'READ') {
-      return classificationOf('PRIVILEGED_READ', 'privileged read (sudo): ' + inner.ruleId, 'sudo.privileged-read', segment)
-    }
-    // sudo never downgrades: MODIFY/DANGEROUS/UNKNOWN stay as classified
+  // ---- V0.7.0 (C-1): shell control structure normalization ------------
+  // `for x in a b`, `do <cmd>`, `then <cmd>`, `done`, `fi` are SHELL SYNTAX,
+  // not commands. Without this step the loop header was treated as an
+  // unknown command (UNKNOWN) and, worse, the destructive verb of
+  // `if shutdown -h now; then ... fi` hid behind the keyword.
+  const shell = stripShellStructure(segment)
+  if (shell.kind === 'pure') {
+    return classificationOf('READ', 'shell keyword only, runs no command', 'shell.keyword', segment)
+  }
+  if (shell.kind === 'list') {
+    return classificationOf('READ', 'shell word list, runs no command', 'shell.wordlist', segment)
+  }
+  if (shell.kind === 'command') {
+    const inner = classifySegment(shell.rest)
     return { ...inner, command: segment }
   }
+  // A group opener (`(docker ps ...`) was peeled off by stripShellStructure.
+  // The payload after it is the real command, so that is what gets
+  // classified — the original text is kept for the audit trail.
+  const body = shell.rest.trim().length > 0 ? shell.rest : segment
+
+  const token = firstToken(body)
+  if (token === 'sudo') {
+    const rest = body.replace(/^sudo\b\s*/u, '')
+    if (rest.trim().length === 0) return classificationOf('UNKNOWN', 'bare sudo', 'sudo.bare', segment)
+    // The inner command goes through the FULL pipeline (danger scan
+    // included): `sudo rm -rf /` must be DANGEROUS, not merely "some
+    // segment".
+    const inner = classifyInnerFully(rest)
+    if (inner === 'READ') {
+      return classificationOf('PRIVILEGED_READ', 'privileged read (sudo): the inner command is read-only', 'sudo.privileged-read', segment)
+    }
+    // sudo never downgrades: MODIFY/DANGEROUS/UNKNOWN stay as classified
+    return classificationOf(inner, 'inner command of sudo is ' + inner.toLowerCase(), 'sudo.inner.' + inner.toLowerCase(), segment)
+  }
+  if (token === 'su') {
+    // `su [-] [user] -c '<command>'` switches to another user and runs the
+    // command there. The inner command decides whether it reads or writes,
+    // but the result is a PRIVILEGED read: it runs as somebody else.
+    const inner = extractSuCommand(body)
+    if (inner === null) {
+      // A bare `su` opens an interactive shell: it can do anything.
+      return classificationOf('UNKNOWN', 'bare su opens an interactive shell as another user', 'su.interactive', segment, 'LOW')
+    }
+    // The inner command goes through the FULL pipeline (danger scan
+    // included): `su - root -c "rm -rf /"` must be DANGEROUS.
+    const innerRisk = classifyInnerFully(inner)
+    if (innerRisk === 'READ') {
+      return classificationOf('PRIVILEGED_READ', 'privileged read (su): the inner command is read-only', 'su.privileged-read', segment)
+    }
+    return classificationOf(innerRisk, 'inner command of su is ' + innerRisk.toLowerCase(), 'su.inner.' + innerRisk.toLowerCase(), segment)
+  }
   if (isWrapperToken(token)) {
-    const inner = stripWrapper(segment, token!)
+    const inner = stripWrapper(body, token!)
     if (inner.trim().length === 0) return classificationOf('READ', 'bare ' + token + ' only lists its environment', token + '.bare', segment)
     const innerClass = classifySegment(inner)
     return { ...innerClass, command: segment }
   }
-  return classifyPlainSegment(segment, segment)
+  // Exec wrappers (kubectl exec / docker exec): the semantics are decided by
+  // the INNER command, which goes through the SAME full pipeline. An inner
+  // read stays READ, an inner write stays MODIFY, an unanalyzable inner stays
+  // UNKNOWN (fail-closed).
+  const execInner = extractExecInner(body)
+  if (execInner !== null) {
+    const innerRisk = classifyExecInner(execInner)
+    const ruleId = 'exec.inner.' + innerRisk.toLowerCase()
+    if (innerRisk === 'READ') return classificationOf('READ', 'exec inner command is read-only', ruleId, segment)
+    if (innerRisk === 'PRIVILEGED_READ') return classificationOf('PRIVILEGED_READ', 'exec inner command is a privileged read', ruleId, segment)
+    if (innerRisk === 'MODIFY') return classificationOf('MODIFY', 'exec inner command modifies state', ruleId, segment)
+    if (innerRisk === 'DANGEROUS') return classificationOf('DANGEROUS', 'exec inner command is host-destructive', ruleId, segment)
+    return classificationOf('UNKNOWN', 'exec inner command cannot be verified as read-only', ruleId, segment, 'LOW')
+  }
+  return classifyPlainSegment(body, segment)
+}
+
+/**
+ * The executable of a segment (after skipping env assignments and the
+ * env/timeout/nice/sudo wrappers). Returns null when there is no executable.
+ *
+ * V0.7.0 (C-1): shell control keywords are peeled off FIRST, so
+ * `if shutdown -h now; then ... fi` reports `shutdown` as the command
+ * position — otherwise the destructive verb hid behind the keyword and the
+ * dangerous-command scan missed it.
+ */
+function segmentExecutable(segment: string): string | null {
+  const shell = stripShellStructure(segment)
+  if (shell.kind === 'pure' || shell.kind === 'list') return null
+  const tokens = rawTokens(shell.kind === 'command' ? shell.rest : segment)
+  if (tokens === null) return null
+  let i = 0
+  while (i < tokens.length) {
+    const v = tokens[i]!.value
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(v)) { i++; continue }
+    if (WRAPPER_TOKENS.has(v)) {
+      i++
+      const next = tokens[i]?.value
+      if (next !== undefined && /^\d+(?:\.\d+)?$/.test(next)) i++
+      continue
+    }
+    if (v === 'sudo') { i++; continue }
+    break
+  }
+  const raw = tokens[i]?.value
+  if (raw === undefined || raw.length === 0) return null
+  return raw.split('/').pop()!.toLowerCase()
+}
+
+/**
+ * Detect a destructive command anywhere in the given text.
+ *
+ * Three independent angles, all of them needed:
+ *  1. compound destructive patterns (`rm -rf /`, `chmod -R 777 /`, ...) — these
+ *     are matched on the RAW text, because the payload may be a quoted
+ *     argument of a wrapper (`bash -c "rm -rf /"`);
+ *  2. destructive VERBS (`shutdown`, `reboot`, `poweroff`, `halt`) — matched
+ *     only in the COMMAND POSITION (`shutdown -h now`) or as the verb of a
+ *     destructive host tool (`systemctl reboot`). A literal argument
+ *     (`grep -i 'shutdown' /var/log/messages`) is NOT destructive;
+ *  3. destructive executables (`dd`, `mkfs.*`, `wipefs`, ...) — matched only in
+ *     the COMMAND POSITION of a segment.
+ *
+ * Wrappers (`sh -c`, `bash -c`), exec wrappers (`kubectl exec`, `docker exec`)
+ * and command substitutions (`$(...)`, backticks) are recursed into: their
+ * content is EXECUTED, so a destructive command hidden there stays dangerous.
+ */
+function detectDangerous(command: string, depth = 0): { ruleId: string; reason: string } | null {
+  if (depth > 3) return null
+
+  for (const pattern of DANGEROUS_COMMANDS) {
+    if (pattern.test(command)) return { ruleId: 'dangerous.pattern', reason: DANGEROUS_REASON(pattern.source) }
+  }
+
+  for (const segment of splitSegments(command)) {
+    const tokens = rawTokens(segment)
+    if (tokens === null) continue
+    const exe = segmentExecutable(segment)
+    if (exe === null) continue
+    if (DANGEROUS_COMMAND_WORDS.includes(exe)) {
+      return { ruleId: 'dangerous.command', reason: 'destructive command in command position: ' + exe }
+    }
+    if (DANGEROUS_EXECUTABLES.has(exe) || DANGEROUS_EXECUTABLE_PREFIXES.some((p) => exe.startsWith(p))) {
+      return { ruleId: 'dangerous.command', reason: 'destructive command in command position: ' + exe }
+    }
+    if (DANGEROUS_VERB_HOSTS.has(exe)) {
+      for (const t of tokens.slice(1)) {
+        const verb = t.value.toLowerCase()
+        if (DANGEROUS_COMMAND_WORDS.includes(verb)) {
+          return { ruleId: 'dangerous.command', reason: exe + ' ' + verb + ' changes host power state' }
+        }
+      }
+    }
+  }
+
+  for (const segment of splitSegments(command)) {
+    const shellInner = extractShellCInner(segment)
+    if (shellInner !== null) {
+      const inner = detectDangerous(stripOuterQuotes(shellInner), depth + 1)
+      if (inner !== null) return inner
+    }
+    const execInner = extractExecInner(segment)
+    if (execInner !== null) {
+      const inner = detectDangerous(execInner, depth + 1)
+      if (inner !== null) return inner
+    }
+  }
+
+  for (const substitution of extractSubstitutions(command)) {
+    const inner = detectDangerous(substitution, depth + 1)
+    if (inner !== null) return inner
+  }
+
+  return null
+}
+
+/**
+ * Risk severity order used when several findings are merged.
+ *
+ * READ < PRIVILEGED_READ < UNKNOWN < MODIFY < DANGEROUS.
+ *
+ * NOTE: this is the "what does the command DO" order, not the "how
+ * restrictive is the gate" order. MODIFY and UNKNOWN are both gated in
+ * READ_ONLY and both need approval in AUTO; they differ only in FULL_ACCESS,
+ * where MODIFY is allowed and UNKNOWN still prompts. The order therefore
+ * answers "is a mutation confirmed", not "which gate is stricter".
+ */
+const RISK_ORDER: Record<CommandRisk, number> = { READ: 0, PRIVILEGED_READ: 1, UNKNOWN: 2, MODIFY: 3, DANGEROUS: 4 }
+
+/**
+ * Bodies of the command substitutions that the shell ACTUALLY EXECUTES.
+ *
+ * `$(...)` and backticks run a command — their content is a command, not
+ * data. Inside single quotes they are literal text and are ignored.
+ * `$((...))` is arithmetic and runs nothing.
+ *
+ * Returns null when a substitution is not balanced (=> not analysable, the
+ * caller must fail closed).
+ */
+function extractActiveSubstitutions(command: string): string[] | null {
+  const out: string[] = []
+  let quote: "'" | '"' | null = null
+  let i = 0
+  while (i < command.length) {
+    const ch = command[i]!
+    if (ch === '\\') {
+      i += 2
+      continue
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null
+      i++
+      continue
+    }
+    if (ch === "'") {
+      quote = "'"
+      i++
+      continue
+    }
+    if (ch === '"') {
+      quote = quote === '"' ? null : '"'
+      i++
+      continue
+    }
+    if (ch === '`') {
+      const end = command.indexOf('`', i + 1)
+      if (end < 0) return null
+      out.push(command.slice(i + 1, end))
+      i = end + 1
+      continue
+    }
+    if (ch === '$' && command[i + 1] === '(') {
+      // `$((...))` is ARITHMETIC, not a command: it runs nothing.
+      if (command[i + 2] === '(') {
+        let depth = 0
+        let j = i + 1
+        while (j < command.length) {
+          if (command[j] === '(') depth++
+          else if (command[j] === ')') {
+            depth--
+            if (depth === 0) break
+          }
+          j++
+        }
+        if (j >= command.length) return null
+        i = j + 1
+        continue
+      }
+      let depth = 1
+      let j = i + 2
+      while (j < command.length && depth > 0) {
+        if (command[j] === '(') depth++
+        else if (command[j] === ')') depth--
+        j++
+      }
+      if (depth !== 0) return null // unbalanced => not analysable
+      out.push(command.slice(i + 2, j - 1))
+      i = j
+      continue
+    }
+    i++
+  }
+  return out
+}
+
+/**
+ * The risk contributed by the command substitutions of `text`.
+ *
+ * Every substitution body goes through the SAME full pipeline, so an inner
+ * write stays MODIFY and an inner unanalysable command stays UNKNOWN. The
+ * OUTER command can never be more permissive than what it substitutes —
+ * that is exactly why `x=$(some-unknown-cli)` must not be a plain READ.
+ *
+ * Returns null when the text has no active substitution.
+ */
+function substitutionFloor(text: string, depth: number): { risk: CommandRisk; reason: string } | null {
+  const bodies = extractActiveSubstitutions(text)
+  if (bodies === null) {
+    return { risk: 'UNKNOWN', reason: 'command substitution is not balanced; read-only cannot be confirmed' }
+  }
+  if (bodies.length === 0) return null
+  let worst: CommandRisk = 'READ'
+  let reason = 'command substitutions are read-only'
+  for (const body of bodies) {
+    const risk = classifyInnerFully(body, depth + 1)
+    if (RISK_ORDER[risk] > RISK_ORDER[worst]) {
+      worst = risk
+      reason = 'command substitution body is ' + risk.toLowerCase()
+    }
+  }
+  return { risk: worst, reason }
+}
+
+function extractShellCInner(segment: string): string | null {
+  const tokens = rawTokens(segment)
+  if (tokens === null || tokens.length < 3) return null
+  if (!['sh', 'bash', 'dash', 'ksh', 'zsh'].includes(tokens[0]!.value)) return null
+  if (!/^-[a-z]*c$/.test(tokens[1]!.value)) return null
+  return tokens[2]!.raw
+}
+
+/**
+ * Bodies of command substitutions (`$(...)` and backticks). Their content is
+ * EXECUTED, so a destructive verb inside them is a real destructive command.
+ */
+function extractSubstitutions(command: string): string[] {
+  const out: string[] = []
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!
+    if (ch === '\\') {
+      i++
+      continue
+    }
+    if (ch === '`') {
+      const end = command.indexOf('`', i + 1)
+      if (end < 0) break
+      out.push(command.slice(i + 1, end))
+      i = end
+      continue
+    }
+    if (ch === '$' && command[i + 1] === '(') {
+      let depth = 1
+      let j = i + 2
+      while (j < command.length && depth > 0) {
+        if (command[j] === '(') depth++
+        else if (command[j] === ')') depth--
+        j++
+      }
+      out.push(command.slice(i + 2, Math.max(i + 2, j - 1)))
+      i = j - 1
+    }
+  }
+  return out
 }
 
 /**
@@ -864,17 +1892,24 @@ function scanWholeCommand(command: string): Classification | null {
   const trimmed = command.trim()
   if (trimmed.length === 0) return null
 
-  // 1) whole-command dangerous phrases (independent of segmentation)
-  for (const pattern of DANGEROUS_COMMANDS) {
-    if (pattern.test(trimmed)) return classificationOf('DANGEROUS', DANGEROUS_REASON(pattern.source), 'dangerous.pattern', trimmed)
-  }
+  // 1) whole-command dangerous detection (compound patterns + destructive
+  //    words in command position + destructive executables, recursing into
+  //    sh -c / exec wrappers / command substitutions)
+  const danger = detectDangerous(trimmed)
+  if (danger !== null) return classificationOf('DANGEROUS', danger.reason, danger.ruleId, trimmed)
 
   const masked = maskQuoted(trimmed)
 
   // 2) opaque shell syntax -> UNKNOWN (honest: cannot be verified as read-only,
-  //    and NOT claimed to modify)
-  if (OPAQUE_SYNTAX_PATTERN.test(masked)) {
-    return classificationOf('UNKNOWN', 'opaque shell syntax; read-only cannot be confirmed', 'syntax.opaque', trimmed, 'LOW')
+  //    and NOT claimed to modify).
+  //    Exec wrappers (kubectl exec / docker exec) are skipped here: their INNER
+  //    command is classified separately by the full pipeline, so the `sh -c`
+  //    inside them must not short-circuit the whole command to UNKNOWN.
+  for (const segment of splitSegments(trimmed)) {
+    if (extractExecInner(segment) !== null) continue
+    if (OPAQUE_SYNTAX_PATTERN.test(maskQuoted(segment))) {
+      return classificationOf('UNKNOWN', 'opaque shell syntax; read-only cannot be confirmed', 'syntax.opaque', trimmed, 'LOW')
+    }
   }
 
   // 3) confirmed mutation anywhere (verb-scoped + plain modifier verbs + write redirect)
@@ -905,18 +1940,28 @@ function scanWholeCommand(command: string): Classification | null {
   return null
 }
 
-/** Full classification of an inner command string (watch/strace specials). */
-function classifyInnerFully(text: string): CommandRisk {
+/**
+ * Full classification of an inner command string (watch/strace specials).
+ *
+ * `depth` bounds the recursion through wrappers and command substitutions: a
+ * pathological nesting must not blow the stack, and the depth limit makes the
+ * deepest level fail closed (UNKNOWN) instead of guessing.
+ */
+function classifyInnerFully(text: string, depth = 0): CommandRisk {
+  if (depth > 6) return 'UNKNOWN'
   const inner = text.replace(/^['"]([\s\S]*)['"]$/, '$1')
   const scanned = scanWholeCommand(inner)
   if (scanned !== null) return scanned.risk
+  // The substitution floor applies HERE too: an inner command that runs
+  // `x=$(unknown-cli)` must not be more permissive than the substitution.
+  const floor = substitutionFloor(inner, depth)
+  if (floor !== null && floor.risk !== 'READ') return floor.risk
   const segments = splitSegments(inner)
   if (segments.length === 0) return 'UNKNOWN'
-  const order: Record<CommandRisk, number> = { READ: 0, PRIVILEGED_READ: 1, UNKNOWN: 2, MODIFY: 3, DANGEROUS: 4 }
   let worst: CommandRisk = 'READ'
   for (const segment of segments) {
     const c = classifySegment(segment)
-    if (order[c.risk] > order[worst]) worst = c.risk
+    if (RISK_ORDER[c.risk] > RISK_ORDER[worst]) worst = c.risk
   }
   return worst
 }
@@ -931,16 +1976,24 @@ export function classifyCommand(command: string): Classification {
   const scanned = scanWholeCommand(trimmed)
   if (scanned !== null) return scanned
 
+  // 3) command substitutions are EXECUTED, so their bodies decide a floor:
+  // the outer command can never be more permissive than what it substitutes.
+  // This is what turns `T=$(grep -c . /var/log/app.log)` from UNKNOWN into
+  // READ while keeping `x=$(unknown-cli)` fail-closed.
+  const floor = substitutionFloor(trimmed, 0)
+  if (floor !== null && floor.risk !== 'READ') {
+    return classificationOf(floor.risk, floor.reason, 'substitution.' + floor.risk.toLowerCase(), trimmed, 'LOW')
+  }
+
   // 4) every segment must classify; take the worst result (never downgrade)
   const segments = splitSegments(trimmed)
   if (segments.length === 0) {
     return classificationOf('UNKNOWN', 'unparseable command', 'unknown.command', trimmed, 'LOW')
   }
   let worst: Classification | null = null
-  const order: Record<CommandRisk, number> = { READ: 0, PRIVILEGED_READ: 1, UNKNOWN: 2, MODIFY: 3, DANGEROUS: 4 }
   for (const segment of segments) {
     const c = classifySegment(segment)
-    if (worst === null || order[c.risk] > order[worst.risk]) worst = c
+    if (worst === null || RISK_ORDER[c.risk] > RISK_ORDER[worst.risk]) worst = c
   }
   if (worst === null) return classificationOf('UNKNOWN', 'unparseable command', 'unknown.command', trimmed, 'LOW')
   return worst

@@ -63,8 +63,19 @@ test('SAP HANA mutating verbs are never READ', () => {
   assert.equal(classifyCommand('sapcontrol -nr 00 -function DoSomethingNew').risk, 'UNKNOWN')
 })
 
-test('switching user through su is UNKNOWN (the inner command is opaque)', () => {
-  check([['UNKNOWN', 'su - lh00adm -c "HDB info"']])
+test('switching user through su runs the inner command as another user', () => {
+  // V0.7.0 (C-1): `su - <user> -c '<cmd>'` is parsed, not refused. The inner
+  // command decides read vs write; a read-only inner command becomes a
+  // PRIVILEGED read because it runs as somebody else.
+  check([
+    ['PRIVILEGED_READ', 'su - lh00adm -c "HDB info"'],
+    ['PRIVILEGED_READ', 'su - prdadm -c "hdbuserstore list"'],
+  ])
+  // A bare `su` opens an interactive shell: it can do anything.
+  assert.equal(classifyCommand('su').risk, 'UNKNOWN')
+  // The inner command still goes through the full danger scan.
+  assert.equal(classifyCommand('su - root -c "rm -rf /"').risk, 'DANGEROUS')
+  assert.equal(classifyCommand('su - root -c "some-unknown-cli"').risk, 'UNKNOWN')
 })
 
 test('Oracle host commands', () => {

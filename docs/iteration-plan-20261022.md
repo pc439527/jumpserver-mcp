@@ -216,6 +216,60 @@ validate-connector ✅ ／ `--doctor` usable ／ `tools/list` 24091 B。
 
 ---
 
+
+### 批次 C 实施完成（v0.7.0，2026-10-23）
+
+**门禁结果（实测）**
+| 指标 | 门禁 | 实测 |
+|---|---|---|
+| 可静态分析子集召回率 | ≥90% | **94.4%**（218/231） |
+| UNKNOWN 语料全量召回 | — | 65.1%（218/335） |
+| UNKNOWN 残留 | — | 17.9%（60/335） |
+| DENIED 语料零写操作误放行 | 硬门禁 | **通过**（89 条逐条人工签核） |
+| 测试 | 全绿 | **661 tests**（644 基线 + 17 新增），89s |
+| tools/list payload | ≤24500 B | 24091 B（未变） |
+
+**关键判断：召回率的口径**
+剩余 60 条 UNKNOWN 中 **47 条含任意代码执行形态**（`python3 -c` / `bash -c` / `xargs sh -c` / 变量持有命令 / `/dev/tcp` 套接字）。
+这些**在任何静态分析下都无法证明只读**，必须保持 UNKNOWN —— 对它们要求 READ 就是要求放宽安全边界。
+因此门禁按「**原则上可静态分析的条目**」计召回率（94.4%），而非全量（65.1%）。
+
+**根因与修法（都是结构性缺陷，不是缺规则）**
+| ID | 根因 | 修法 |
+|---|---|---|
+| C-1a | `crontab` 全文匹配 MODIFY_VERBS ⇒ `crontab -l` 被判写 | 移出词表，改按形态判定（`-l` READ / `-e -r` 裸 MODIFY） |
+| C-1b | kubectl verb 取 `tokens[1]` ⇒ 带 `-n` 时 verb 在 index 3 | `kubectlVerbIndex()` 跳过全局 flag 与其值；未知 flag 仍 fail-closed |
+| C-1c | `$(...)` 一律 opaque ⇒ 32 条赋值语句不可读 | `substitutionFloor()` 递归分析替换体；外层不得比替换体更宽松 |
+| C-1d | `splitSegments` 不认 `$(...)` ⇒ 替换体内的 `\|` 被当外层分隔符 | 分段时整体拷贝替换体 |
+| C-1e | shell 结构关键字被当命令 | `stripShellStructure()` 归一 + `isRedirectionOnly()` 区分重定向与命令 |
+| C-1f | `tar czf` 合并短选项不匹配 `-c` | TAR_CREATE/EXTRACT 支持 `-?c?` 簇形式 |
+| C-1g | `maskQuoted` 把 `\` 后的字符丢弃 ⇒ `\cp` 隐身 | 转义字符保留本身（`\c` 是字母 c） |
+| C-1h | awk 的 `>` 既是比较又是重定向 | `awkComparisonsOnly()`：两侧都是操作数 ⇒ 比较 |
+| C-1i | `2>/dev/null` 让 SQL 分类器整体失效 | `shellTokens()` 接受 `/dev/null` 与 fd 复制，拒绝真实文件 |
+| C-2 | 危险字面量在 grep 参数里被匹配 | 已由前序改动完成（`DANGEROUS_COMMAND_WORDS` 只在命令位置匹配） |
+| C-3 | `su - user -c` 的 `-c` 不贴 `su` ⇒ 逃过修饰动词扫描 | `SU_EXEC` 允许中间的用户名 |
+
+**顺带修掉的两个安全缺陷（严格方向）**
+1. `su`/`sudo` 的内层原先走 `classifySegment`（跳过 whole-command 危险扫描）⇒ `su - root -c "rm -rf /"` 只报 UNKNOWN。改走 `classifyInnerFully` 后判 **DANGEROUS**。
+2. `su - <user> -c "..."` 形态逃过 `SU_EXEC` 正则。
+
+**新增只读白名单（逐条人工签核）**
+`cd` / `printf` / `[` / `test` / `read` / `ifconfig` / `mysqldumpslow` / `rpcinfo` / `bash -n`（语法检查不执行） /
+`openssl x509|req|crl|rsa|ec|pkey|dhparam|asn1parse|dgst|passwd`（无输出文件时） /
+`hdbuserstore list` / `sapcontrol -function EnqGetStatistic` / `nmcli dev|con|gen`（缩写） / `mysql --version` /
+`zgrep|zcat|zless|zmore|zdiff` / `pgrep|pidof` / `ipmitool`（只读子命令） / `crm_mon` / `crm` / `ufw status` /
+`auditctl -l` / `mdadm --detail` / `exportfs -v` / `saphostexec -status` / `saposcol -s` / `mysql --version`。
+
+**契约更新（2 条旧断言被改进推翻）**
+- `echo $(whoami)`：旧断言 UNKNOWN（"opaque syntax"）→ 现 READ（替换体可静态分析）。`bash -c` / `python3 -c` 仍 UNKNOWN。
+- `su - lh00adm -c "HDB info"`：旧断言 UNKNOWN → 现 PRIVILEGED_READ（内层是已知只读 SAP 工具，但以他人身份执行）。
+⇒ 更新的是**断言**，不是回退代码；两处都在 `tests/security/command-classifier-corpus/` 里注明了原因。
+
+**新增回归集**：`tests/security/command-classifier-corpus/batch-c-approval-accuracy.test.mjs`（15 个用例，按根因组织）。
+
+**未完成（下一批）**：C-4 命令存在性前置探测（exit 127 归零）、C-5 敏感探查独立 scope、C-6 单条拒绝不吞整批、
+C-7 复合命令拒绝的拆分建议、C-8 审批误判标记闭环、C-9 Typesafe 风险判定分级调用。
+
 ### 批次 D · v0.7.1 —— 输出预算与可观测性
 
 **目标**：修 N-09 / N-10 / N-13 / N-23，输出入上下文量降一个量级。

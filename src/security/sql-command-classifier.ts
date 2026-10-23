@@ -44,10 +44,29 @@ function result(command: string, risk: CommandRisk, ruleId: string, reason: stri
   }
 }
 
-/** Tokenize enough shell syntax to preserve quoted SQL after -e/--execute.
+/**
+ * Redirection targets that cannot write anything: the null device and the
+ * standard streams. `2>/dev/null` is the overwhelmingly common form in real
+ * diagnostic commands, and rejecting it made EVERY `mysql ... 2>/dev/null`
+ * fall out of the SQL classifier and land on the generic one (UNKNOWN).
+ *
+ * A redirection to a REAL file (`> out.txt`, `< in.sql`) is NOT in this list:
+ * that writes (or feeds the client from an unknown script), so it must stay
+ * unanalysable.
+ */
+const SAFE_REDIRECT_TARGET = /^\/dev\/(?:null|zero|stdin|stdout|stderr|fd\/[0-9]+)$/
+
+/** `>&N` / `<&N` — file-descriptor duplication, no file is touched. */
+const FD_DUPLICATE = /^[<>]&[0-9]+$/
+
+/**
+ * Tokenize enough shell syntax to preserve quoted SQL after -e/--execute.
  * Returns null if an unquoted shell control operator is seen: SQL semicolons
  * inside the quoted -e argument are fine, but `mysql ... ; rm ...` must never
  * be interpreted as one safe database command.
+ *
+ * A redirection is accepted ONLY when it targets /dev/null or duplicates a
+ * file descriptor; every other redirection returns null (fail closed).
  */
 function shellTokens(command: string): string[] | null {
   const out: string[] = []
@@ -74,7 +93,28 @@ function shellTokens(command: string): string[] | null {
       quote = ch
       continue
     }
-    if (ch === ';' || ch === '|' || ch === '&' || ch === '<' || ch === '>' || ch === '`') return null
+    if (ch === '>' || ch === '<') {
+      // Consume the redirection operator and its target, then decide.
+      // A file-descriptor prefix ("2>") is part of the redirection, not a
+      // separate token, so it is removed from the pending token.
+      if (/^\d+$/.test(current)) current = ''
+      let j = i + 1
+      let target = ''
+      if (j < command.length && command[j] === '&') {
+        target = command.slice(i, j + 1) + (command[j + 1] ?? '')
+        j += 2
+      } else {
+        while (j < command.length && !/\s/.test(command[j]!)) {
+          target += command[j]!
+          j++
+        }
+      }
+      if (!FD_DUPLICATE.test(target) && !SAFE_REDIRECT_TARGET.test(target)) return null
+      if (current.length > 0) { out.push(current); current = '' }
+      i = j - 1
+      continue
+    }
+    if (ch === ';' || ch === '|' || ch === '&' || ch === '`') return null
     if (ch === '$' && command[i + 1] === '(') return null
     if (/\s/.test(ch)) {
       if (current.length > 0) { out.push(current); current = '' }
@@ -165,6 +205,13 @@ function classifyStatement(statement: string): { risk: CommandRisk; ruleId: stri
     return { risk: 'READ', ruleId: 'mysql.sql.explain', reason: 'MySQL EXPLAIN without ANALYZE does not modify data' }
   }
 
+  // ANALYZE / OPTIMIZE / REPAIR rewrite table statistics or rebuild the
+  // table: they are not "reads" of the data even though they do not change
+  // rows.
+  if (first === 'ANALYZE' || first === 'OPTIMIZE' || first === 'REPAIR' || first === 'CHECKSUM') {
+    return { risk: 'MODIFY', ruleId: 'mysql.sql.' + first.toLowerCase(), reason: 'MySQL ' + first + ' rewrites table statistics or storage' }
+  }
+
   if (first === 'DROP' || first === 'TRUNCATE') {
     return { risk: 'DANGEROUS', ruleId: 'mysql.sql.' + first.toLowerCase(), reason: 'MySQL ' + first + ' is destructive' }
   }
@@ -200,13 +247,18 @@ export function classifyMysqlCli(command: string): Classification | null {
   const tokens = shellTokens(trimmed)
   if (tokens === null || tokens.length === 0) return null
   let executableIndex = 0
-  while (['env','sudo','timeout','nice'].includes(tokens[executableIndex] ?? '')) executableIndex++
+  while (['env','sudo','timeout','nice','time'].includes(tokens[executableIndex] ?? '')) executableIndex++
   const executable = (tokens[executableIndex] ?? '').split('/').at(-1)?.toLowerCase()
   if (executable !== 'mysql' && executable !== 'mariadb') return null
 
   const cliTokens = tokens.slice(executableIndex)
   const sql = extractExecute(cliTokens)
   if (sql === null || sql.trim().length === 0) {
+    // `mysql --version` / `mysql -V` only print the version banner: no
+    // connection, no statement, no side effect.
+    if (cliTokens.some((t) => t === '--version' || t === '-V')) {
+      return result(trimmed, 'READ', 'mysql.cli.version', 'mysql --version only prints the version banner')
+    }
     return result(trimmed, 'UNKNOWN', 'mysql.cli.interactive', 'mysql/mariadb without -e/--execute is interactive or script-driven; read-only cannot be confirmed', 'LOW')
   }
 

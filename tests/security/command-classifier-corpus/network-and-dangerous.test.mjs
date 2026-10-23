@@ -66,9 +66,32 @@ test('recursive deletion is MODIFY even when the path is not the root', () => {
 test('opaque shell syntax is UNKNOWN, never READ', () => {
   check([
     ['UNKNOWN', 'bash -c "systemctl status nginx"'],
-    ['UNKNOWN', 'echo $(whoami)'],
     ['UNKNOWN', 'python3 -c "import os"'],
   ])
+})
+
+test('a command substitution is analysed, not treated as opaque syntax', () => {
+  // V0.7.0 (C-1): `$(...)` RUNS its body, so the body is classified with the
+  // same pipeline. A read-only body therefore makes the whole command
+  // read-only — this is the whole point of the C batch (the read-only audit
+  // corpus was dominated by `T=$(grep -c ...)` style commands).
+  check([
+    ['READ', 'echo $(whoami)'],
+    ['READ', 'T=$(grep -c . /var/log/app.log); echo "T=$T"'],
+    ['READ', 'for f in $(ls /tmp); do echo "$f"; done'],
+  ])
+})
+
+test('a command substitution never launders an unanalysable or writing body', () => {
+  for (const command of [
+    'x=$(some-unknown-cli)',
+    'x=$(rm -f /tmp/a)',
+    'kubectl exec pod -- sh -c "x=$(some-unknown-cli)"',
+    'kubectl exec pod -- sh -c "x=$(rm -f /tmp/a)"',
+  ]) {
+    const risk = classifyCommand(command).risk
+    assert.notEqual(risk, 'READ', command + ' must never be read-only')
+  }
 })
 
 test('an opaque wrapper can never launder a dangerous command into READ', () => {

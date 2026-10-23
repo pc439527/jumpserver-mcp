@@ -11,3 +11,6 @@ data/
 
 # Local workspace state (agent memory / scratch)
 .workbuddy/
+
+# Scratch analysis scripts (audit-corpus mining helpers)
+.tmpwork/

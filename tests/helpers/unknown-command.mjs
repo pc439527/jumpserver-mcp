@@ -27,7 +27,7 @@ import { classifyCommand } from '../../lib/security/permission.js'
  * command a real operator might type on a bastion — not an invented string —
  * so the fixture keeps representing reality.
  */
-export const UNKNOWN_COMMANDS = ['pcs status', 'ceph -s', 'crm_mon -1']
+export const UNKNOWN_COMMANDS = ['pcs status', 'ceph -s', 'sapctl status']
 
 /** The default sample; use when a test needs only one unclassified command. */
 export const UNKNOWN_COMMAND = UNKNOWN_COMMANDS[0]
