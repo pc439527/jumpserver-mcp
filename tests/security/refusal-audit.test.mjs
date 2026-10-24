@@ -91,15 +91,14 @@ test('run gate: a blocked command is recorded as BLOCKED', async () => {
   assert.equal(denied[0].kind, 'blocked')
 })
 
-test('batch gate: one blocked command blocks the batch AND is recorded', async () => {
+test('batch gate: one blocked command is isolated AND recorded', async () => {
   const { services: svc, denied } = services('READ_ONLY')
-  await assert.rejects(
-    () => gateCommandsForNavigation(svc, exec(), ['uptime', 'rm -rf /tmp/x', 'df -h']),
-    (error) => error.code === 'COMMAND_BLOCKED',
-  )
-  assert.equal(denied.length, 1, 'only the offending command, not the whole batch')
-  assert.equal(denied[0].operation, 'run-batch')
-  assert.equal(denied[0].command, 'rm -rf /tmp/x')
+  const gated = await gateCommandsForNavigation(svc, exec(), ['uptime', 'rm -rf /tmp/x', 'df -h'])
+  assert.equal(gated.length, 3)
+  assert.equal(gated[0].blocked, undefined)
+  assert.equal(gated[1].blocked.code, 'COMMAND_BLOCKED')
+  assert.equal(gated[2].blocked, undefined)
+  assert.equal(denied.length, 0, 'batch拒绝由manager统一记录，gate不得重复写入')
 })
 
 test('a permitted command writes nothing to the refusal trail', async () => {
@@ -128,6 +127,20 @@ test('exec gate: an APPROVED command is not a refusal', async () => {
   const gated = await gateCommand(svc, exec(true), UNKNOWN_CMD)
   assert.equal(gated.approvalRequired, true)
   assert.equal(denied.length, 0, 'confirm:true is agreement, not a refusal')
+})
+
+test('C7：审批detail提供脱敏拆分建议，复合依赖语法不建议', async () => {
+  const { services: svc } = services('AUTO')
+  await assert.rejects(() => gateCommand(svc, exec(), 'touch /tmp/a; uptime'), (error) => {
+    assert.equal(error.code, 'COMMAND_APPROVAL_REQUIRED')
+    assert.match(error.detail, /拆分诊断建议/)
+    assert.match(error.detail, /重新提交完整门禁/)
+    return true
+  })
+  await assert.rejects(() => gateCommand(svc, exec(), 'touch /tmp/a && uptime'), (error) => {
+    assert.equal(error.detail, undefined)
+    return true
+  })
 })
 
 // ---------------- the record survives storage ----------------
@@ -199,7 +212,10 @@ class FakeWire {
     const m = /__DSH_JS_PROBE_([0-9a-fA-F]+)/.exec(text)
     if (m !== null) {
       this._emit('\n__DSH_JS_PROBE_' + m[1] + '\nH=app01\nU=root\nP=/root\n__DSH_JS_PROBE_END_' + m[1] + '\n[root@app01 ~]# ')
+      return
     }
+    const done = /__DSH_JS_DONE_([0-9a-fA-F]+)/.exec(text)
+    if (done !== null) this._emit('\n__DSH_JS_DONE_' + done[1] + (text.includes("command -v 'missingtool'") ? ':1' : ':0') + '\n[root@app01 ~]# ')
   }
   onData(cb) {
     this.cbs.push(cb)
@@ -279,6 +295,53 @@ test('run: a refused beforeExec leaves a DENIED record and still fails', async (
   // …and nothing was executed: the PTY never received the command.
   assert.equal(audits.some((a) => a.result === 'SUCCESS' && a.command === UNKNOWN_CMD), false)
   await manager.close()
+})
+
+test('混合批次：前后只读均落线，被拒条不落线且逐条审计一次', async () => {
+  const audits = []
+  const { manager, wire } = await connectedManager(audits)
+  const { services: svc, denied } = services('READ_ONLY')
+  const commands = ['hostname', 'rm -rf /tmp/never-run', 'uptime']
+  try {
+    const gated = await gateCommandsForNavigation(svc, exec(), commands)
+    const result = await manager.runTargetBatch({
+      target: '192.168.148.36',
+      commands: gated.map((g, i) => ({ command: commands[i], risk: g.risk, classification: g.classification,
+        blocked: g.blocked, approvalRequired: g.approvalRequired, beforeExec: g.beforeExec })),
+    })
+    assert.equal(result.commands.length, 3)
+    assert.equal(result.commands[0].commandStatus, 'SUCCESS')
+    assert.equal(result.commands[1].error.code, 'COMMAND_BLOCKED')
+    assert.equal(result.commands[2].commandStatus, 'SUCCESS')
+    const writes = wire.written.join('\n')
+    assert.ok(writes.includes('hostname'))
+    assert.ok(writes.includes('uptime'))
+    assert.equal(writes.includes('never-run'), false)
+    assert.equal(denied.length, 0, 'gate不重复记录manager拥有的逐条审计')
+    const perCommand = audits.filter((a) => a.operation === 'run-batch-cmd')
+    assert.equal(perCommand.length, 3)
+    assert.equal(perCommand.filter((a) => a.command === commands[1]).length, 1)
+    assert.equal(perCommand[1].result, 'BLOCKED')
+    assert.equal(perCommand[1].errorCode, 'COMMAND_BLOCKED')
+    assert.ok(perCommand[1].refusalReason)
+  } finally { await manager.close() }
+})
+
+test('C4：不存在命令不请求审批且不执行，后续命令继续', async () => {
+  const audits = []
+  const { manager, wire } = await connectedManager(audits)
+  let approvals = 0
+  try {
+    const result = await manager.runTargetBatch({ target: '192.168.148.36', commands: [
+      { command: 'missingtool -v', risk: 'UNKNOWN', beforeExec: async () => { approvals++ } },
+      { command: 'uptime', risk: 'READ' },
+    ] })
+    assert.equal(result.commands[0].error.code, 'COMMAND_NOT_FOUND')
+    assert.equal(result.commands[1].commandStatus, 'SUCCESS')
+    assert.equal(approvals, 0)
+    assert.equal(wire.written.some((text) => text.includes('missingtool -v')), false)
+    assert.equal(audits.filter((a) => a.command === 'missingtool -v').length, 1)
+  } finally { await manager.close() }
 })
 
 test('batch: a refused command is DENIED in the audit, not a generic error', async () => {

@@ -77,6 +77,13 @@ export const JUMP_ERROR_CODES = [
   // the shell answered `k8s-192-168-30-3`. No command may run in that state:
   // this is the "假成功" (silent wrong-machine) defect.
   'TARGET_VERIFICATION_FAILED',
+  // V0.7.3 (C-4): the command's executable does not exist on the target.
+  // Shell exit 127 means "command not found" — without this code the caller
+  // only sees a bare exit code and cannot tell "the tool is missing" from
+  // "the tool ran and failed". Measured on the real audit trail: 92 records
+  // with exit 127 (48x `nginx -T`, 35x `jps -lv`) — a missing binary, not a
+  // server fault.
+  'COMMAND_NOT_FOUND',
 ] as const
 
 export type JumpServerErrorCode = (typeof JUMP_ERROR_CODES)[number]

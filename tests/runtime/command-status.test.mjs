@@ -12,6 +12,15 @@ import assert from 'node:assert/strict'
 import { execOutcomeToValue } from '../../lib/runtime/tools-common.js'
 import { renderBatchResult } from '../../lib/runtime/tools-common.js'
 
+import { commandExistenceProbe } from '../../lib/jumpserver/command-status.js'
+
+test('C4：只为简单命令生成无执行副作用的存在性探测', () => {
+  assert.equal(commandExistenceProbe('jps -lv'), "command -v 'jps' >/dev/null 2>&1")
+  for (const command of ['echo $(id)', 'echo `id`', 'ls; id', 'ls && id', 'ls | id', 'ls > out', 'X=1 ls', '/bin/ls', "echo 'x'"]) {
+    assert.equal(commandExistenceProbe(command), null, command)
+  }
+})
+
 const STATUS = {
   configured: true,
   permissionMode: 'AUTO',

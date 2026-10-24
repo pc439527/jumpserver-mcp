@@ -9,7 +9,7 @@ import { JumpServerSession, type ExecOutcome, type SessionRuntimeConfig, type Se
 import { SessionState } from './state-machine.js'
 import { sleep } from './timing.js'
 import { normalizedRedactedCommand, redactCommandSecrets } from '../security/command-redaction.js'
-import { commandStatusToError } from './command-status.js'
+import { commandExistenceProbe, commandStatusToError } from './command-status.js'
 
 export interface AuditRecord {
   timestamp: string
@@ -159,6 +159,7 @@ export interface RunRequest {
 
 /** One command inside a target-affinity batch turn. */
 export interface BatchCommandRequest {
+  blocked?: { code: string; reason: string; detail?: string }
   command: string
   timeoutMs?: number
   risk: string
@@ -244,7 +245,9 @@ export function toRuntimeConfig(cfg: JumpServerConfig, password: string, wireFac
     connectTimeoutMs: cfg.connectTimeout * 1000,
     hostFingerprint: cfg.hostFingerprint,
     knownHostsPath: cfg.knownHostsPath,
-    enterAssetMs: DEFAULT_TIMEOUTS.enterAsset,
+    // Tests and older configs may not carry enterTimeout; a NaN budget would
+    // make the enter deadline never expire, so fall back to the default.
+    enterAssetMs: (Number.isFinite(cfg.enterTimeout) ? cfg.enterTimeout : DEFAULT_TIMEOUTS.enterAsset / 1000) * 1000,
     probeMs: DEFAULT_TIMEOUTS.probe,
     commandMs: cfg.commandTimeout * 1000,
     leaveMs: DEFAULT_TIMEOUTS.leave,
@@ -511,7 +514,25 @@ export class SessionManager {
 
   async enter(target: string, accountIndex?: number, signal?: AbortSignal): Promise<ManagerStatus> {
     return this.queue(async () => {
-      const session = this.requireLiveSession()
+      let session = this.requireLiveSession()
+      const current = session.status()
+      // V0.7.3: re-entering the asset we are ALREADY on is a no-op, not an
+      // error. It used to fall through to session.enter() and come back as
+      // NOT_AT_MENU ("enter(target) requires the JumpServer menu") for the one
+      // asset the session demonstrably was inside — the worst possible message
+      // for a caller that had just proved the asset shell exists.
+      if (current.state === SessionState.ASSET_SHELL && current.target === target) {
+        return this.status()
+      }
+      // V0.7.3: standing INSIDE another asset is a normal starting point for a
+      // switch, not a precondition failure. Leave first, with the same
+      // self-healing the run/batch navigation uses, instead of telling the
+      // caller to go back to the menu by hand. Every other state keeps the
+      // fail-closed answer: only a menu (or an answerable `ID>` prompt) may be
+      // typed into, and anything unknown has to reconnect.
+      if (current.state === SessionState.ASSET_SHELL) {
+        session = await this.leaveAndRecover(session, signal)
+      }
       await session.enter(target, accountIndex, signal)
       await this.audit({ operation: 'enter', target, hostname: session.currentHostname, command: null, risk: 'READ', result: 'ok', exitCode: null, durationMs: null })
       return this.status()
@@ -1025,6 +1046,18 @@ export class SessionManager {
           break
         }
         try {
+          if (item.blocked !== undefined) throw new JumpServerError('COMMAND_BLOCKED', item.blocked.reason, item.blocked.detail)
+          const probe = commandExistenceProbe(item.command)
+          if (probe !== null) {
+            let missing = false
+            try {
+              const existence = await session.exec(probe, { timeoutMs: 3000, signal: request.signal })
+              missing = existence.kind === 'completed' && existence.exitCode === 1
+            } catch {
+              // 探测异常不放宽原审批门禁，继续按原流程处理。
+            }
+            if (missing) throw new JumpServerError('COMMAND_NOT_FOUND', '命令不存在，未请求审批或执行原命令')
+          }
           if (item.beforeExec !== undefined) await item.beforeExec()
           const started = Date.now()
           const outcome = await session.exec(item.command, {
@@ -1068,6 +1101,7 @@ export class SessionManager {
           // V0.5.9: a refusal must be distinguishable from a failure — "was it
           // stopped, or did it break?" has to be answerable from the audit.
           const denied = error instanceof JumpServerError && error.code === 'COMMAND_APPROVAL_REQUIRED'
+          const blocked = error instanceof JumpServerError && error.code === 'COMMAND_BLOCKED'
           results.push({
             command: item.command,
             executionState: 'ERROR',
@@ -1089,11 +1123,11 @@ export class SessionManager {
             approvalRequired: denied ? true : item.approvalRequired,
             approvalResult: denied ? 'denied' : item.approvalResult,
             riskJudge: item.riskJudge,
-            refusalReason: denied ? APPROVAL_DENIED_REASON : undefined,
+            refusalReason: denied ? APPROVAL_DENIED_REASON : blocked ? item.blocked?.reason : undefined,
             toolCallId: item.toolCallId ?? request.toolCallId,
             batchId: item.batchId ?? request.batchId,
             batchIndex: item.batchIndex,
-            result: denied ? 'DENIED' : 'error',
+            result: denied ? 'DENIED' : blocked ? 'BLOCKED' : 'error',
             // V0.7.1 (D-6): the thrown error's own code — a refusal and a
             // runtime failure must be distinguishable in the trail.
             errorCode: denied

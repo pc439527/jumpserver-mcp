@@ -369,7 +369,7 @@ test('gate: an UNKNOWN command gets the advisory note appended', async () => {
   }
 })
 
-test('gate: a MODIFY command is not sent to the judge', async () => {
+test('C9：MODIFY可获取模型参考但仍要求人工审批', async () => {
   const mock = await startMock()
   try {
     resetRiskJudgeCache()
@@ -378,11 +378,11 @@ test('gate: a MODIFY command is not sent to the judge', async () => {
       () => gateCommand(services, exec(), 'rm -rf /tmp/x'),
       (error) => {
         assert.equal(error.code, 'COMMAND_APPROVAL_REQUIRED')
-        assert.ok(!error.message.includes('语义副驾'))
+        assert.match(error.message, /仅供参考，不参与放行判定/)
         return true
       },
     )
-    assert.equal(mock.state.hits, 0, 'only UNKNOWN commands may leave the process')
+    assert.equal(mock.state.hits, 1, 'MODIFY模型意见仅用于审批参考')
   } finally {
     await mock.close()
   }

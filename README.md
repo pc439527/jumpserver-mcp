@@ -31,7 +31,7 @@ JumpServer (KoKo) bastion connector for WorkBuddy as an MCP stdio server. Ported
 | `jumpserver_status` | Session state / gateway / current target / permission mode / runtime version / conversation scope; live console URL + token expiry. Strictly read-only |
 | `jumpserver_console_rotate_token` | Invalidate the console access token. In stable mode (default) the address is unchanged — the open page picks up a fresh token on its next reload; set `auditViewer.stableUrl: false` to get the old "new URL, old link dies" behaviour. Side-effecting, so it is its own tool |
 | `jumpserver_connect` | Establish the persistent SSH/PTY session, wait for the KoKo menu |
-| `jumpserver_enter` | Enter an asset through the KoKo menu (verified by probe). Pass `accountIndex` for multi-user assets |
+| `jumpserver_enter` | Enter an asset through the KoKo menu (verified by probe). Callable from any navigable state — standing inside another asset is left first, and re-entering the current one is a no-op. Pass `accountIndex` for multi-user assets |
 | `jumpserver_assets` | List authorized assets (`p` only — read-only, footer-verified, cached) |
 | `jumpserver_exec` | Execute one simple command on the currently-entered asset |
 | `jumpserver_run` | Auto-navigate + verify + execute (one target, one command) |

@@ -22,6 +22,15 @@ export interface CommandFailure {
   message: string
 }
 
+/** 只接受无替换、重定向或复合语法的简单命令，探测不执行原命令。 */
+export function commandExistenceProbe(command: string): string | null {
+  const simple = command.trim()
+  if (!/^[A-Za-z0-9_./-]+(?:[ \t]+[A-Za-z0-9_./:=,@%+-]+)*$/.test(simple)) return null
+  const name = simple.split(/[ \t]+/, 1)[0]!
+  if (name.startsWith('-') || name.includes('/')) return null
+  return `command -v '${name}' >/dev/null 2>&1`
+}
+
 /** True when the status means "the command did not succeed". */
 export function isCommandFailure(commandStatus: string): boolean {
   return commandStatus !== 'SUCCESS'

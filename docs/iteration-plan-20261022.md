@@ -267,8 +267,7 @@ validate-connector ✅ ／ `--doctor` usable ／ `tools/list` 24091 B。
 
 **新增回归集**：`tests/security/command-classifier-corpus/batch-c-approval-accuracy.test.mjs`（15 个用例，按根因组织）。
 
-**未完成（下一批）**：C-4 命令存在性前置探测（exit 127 归零）、C-5 敏感探查独立 scope、C-6 单条拒绝不吞整批、
-C-7 复合命令拒绝的拆分建议、C-8 审批误判标记闭环、C-9 Typesafe 风险判定分级调用。
+**未完成（下一批）**：C-5 敏感探查独立 scope。C-4 / C-6 / C-7 / C-8 / C-9 已在 v0.7.3 完成（见「批次 F 实施完成」）。
 
 ### 批次 D · v0.7.1 —— 输出预算与可观测性
 
@@ -296,6 +295,28 @@ C-7 复合命令拒绝的拆分建议、C-8 审批误判标记闭环、C-9 Types
 **风险**
 - 截断可能丢关键行 → 必须保留首尾 + 明确标注 `truncated` + 支持按需取全
 - ⚠️ **`renderResult()` 是白名单渲染**，加字段不会进模型文本，除非显式加一行（V0.5.12 教训）
+
+---
+
+### 批次 F 实施完成（v0.7.3，2026-10-24）
+
+**已完成**：C-4 / C-6 / C-7 / C-8 / C-9。
+
+| ID | 落点 | 实际做法 |
+|---|---|---|
+| C-4 | `command-status.ts` `commandExistenceProbe` + `session-manager.ts` exec 前置 | 仅对**无替换/重定向/复合语法**的简单命令生成 `command -v '<name>'`；探测只在 exec 前跑 3s，exit 1 判 `COMMAND_NOT_FOUND` 并跳过审批与原命令。探测自身异常不改变原门禁 |
+| C-6 | `permission-gate.ts` `gateCommandsForNavigation` + `session-manager.ts` 批次循环 | gate 不再抛错中断整批，改为该条 `blocked` 标记下传；manager 逐条审计一次（`result:'BLOCKED'` + `refusalReason`），前后命令照常执行 |
+| C-7 | 新增 `security/split-suggestion.ts` | 拒绝/待审批时 `detail` 附脱敏拆分候选并**显式声明不等价**；含管道/条件/替换/`$(...)`/shell 结构时不给建议，避免伪等价复制 |
+| C-8 | 新增 `runtime/audit-feedback.ts` + `audit-viewer.ts` `/api/audit/feedback` | 控制台「人工标记为误判」闭环：`recordId` = 记录内容 sha256，落 `audit-feedback.jsonl`（0o600）；仅人工标签，`policyChanged:false`，不参与任何放行判定 |
+| C-9 | `permission-gate.ts` `judgeUnknown` / `applyJudge` | 模型意见扩到 UNKNOWN/MODIFY/DANGEROUS，但**只作参考**：非 UNKNOWN 一律 `auto:false`，审批文案固定追加「仅供参考，不参与放行判定」 |
+
+**顺带修掉的两个真缺陷**
+1. `jumpserver_enter` 可在任意可导航状态调用：已在目标资产内 → no-op 返回现状；在别的资产内 → 先 `leaveAndRecover` 再进，不再回 `NOT_AT_MENU`。旧行为等于「刚证明自己在机器上，却被要求回菜单」。
+2. 进入超时可配置：新增 `enterTimeout`（默认 40s，上限 300s，`toRuntimeConfig` 对 NaN 兜底）。同时区分 `ASSET_ENTER_TIMEOUT`（`exit=deadline|failure-banner`，tail 扩到 1600B）与 `CONNECTION_LOST`（`exit=wire-closed`，PTY 中途断开），因为「主机慢」和「堡垒机断线」要的处置完全相反。
+
+**门禁**：803 tests / 0 fail；`tools/list` 24254 B（上限 24500 B）。
+
+**仍待办**：C-5 敏感探查独立 scope。
 
 ---
 

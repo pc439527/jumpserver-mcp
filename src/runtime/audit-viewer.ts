@@ -25,6 +25,7 @@
  *     and render in the configured timezone (storage stays UTC).
  */
 import http from 'node:http'
+import { AuditFeedbackStore, auditFeedbackId } from './audit-feedback.js'
 import { randomBytes } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
@@ -1408,6 +1409,24 @@ $('jobs-refresh').addEventListener('click',pollJobs);
 every(1000, pollJobs);
 
 /* ---- audit ---- */
+var auditFeedback = {}, auditFeedbackCount = 0;
+function pollAuditFeedback(){
+  if(tab!=='audit') return;
+  F('/api/audit/feedback').then(function(r){return r.json();}).then(function(j){
+    if(!j.ok) return;
+    auditFeedback={}; (j.items||[]).forEach(function(item){auditFeedback[item.recordId]=item.falsePositive;});
+    auditFeedbackCount=j.falsePositiveCount||0; renderAudit();
+  }).catch(function(){});
+}
+$('rows').addEventListener('click',function(event){
+  var button=event.target.closest('[data-feedback-id]'); if(!button) return;
+  var id=button.getAttribute('data-feedback-id'); button.disabled=true;
+  POST('/api/audit/feedback',{recordId:id,falsePositive:!auditFeedback[id]}).then(function(r){return r.json();}).then(function(j){
+    if(!j.ok) { auditNotice='人工反馈保存失败'; renderAudit(); return; }
+    auditNotice='人工标签已保存（不改变安全策略）'; pollAuditFeedback();
+  }).catch(function(){auditNotice='人工反馈保存失败';renderAudit();});
+});
+every(2000,pollAuditFeedback);
 function renderAudit(){
   var q=$('filter').value.toLowerCase();
   var list=q?auditAll.filter(function(e){return JSON.stringify(e).toLowerCase().indexOf(q)>=0;}):auditAll;
@@ -1437,11 +1456,11 @@ function renderAudit(){
       +'<td class="op">'+esc(e.operation)+'</td>'
       +'<td class="tgt" title="'+esc(tgt)+'">'+esc(tgt)+'</td>'
       +'<td class="risk risk-'+risk+'">'+risk+' / '+esc(status)+(bad?' <span class="bad">exit '+esc(String(exitN!=null?exitN:'?'))+'</span>':'')+refusedTag+judgeTag+'</td>'
-      +'<td class="cmd">'+esc(cmd)+'</td></tr>';
+      +'<td class="cmd">'+esc(cmd)+(e.feedbackRecordId?' <button data-feedback-id="'+esc(e.feedbackRecordId)+'">'+(auditFeedback[e.feedbackRecordId]?'撤销人工误判标记':'人工标记为误判')+'</button>':'')+'</td></tr>';
   }).join('');
   $('rows').innerHTML=rows;
   $('empty').style.display=list.length?'none':'block';
-  var stat='审计：匹配 '+list.length+' 条 / 显示最近 '+shown.length+' 条 / 共 '+auditTotal+' 条';
+  var stat='审计：匹配 '+list.length+' 条 / 显示最近 '+shown.length+' 条 / 共 '+auditTotal+' 条 · 人工误判标记 '+auditFeedbackCount+' 条（仅人工标签，不改变安全策略）';
   if (auditWindowed) stat+=' · 更早记录已淘汰或归档';
   if (auditNotice) stat+=' · '+auditNotice;
   $('stat').textContent=stat;
@@ -1579,7 +1598,7 @@ $('interrupt-all').addEventListener('click',function(){
 }
 
 function sendJson(res: import('node:http').ServerResponse, data: unknown): void {
-  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.writeHead(res.statusCode, { 'Content-Type': 'application/json; charset=utf-8' })
   res.end(JSON.stringify(data))
 }
 
@@ -1738,6 +1757,7 @@ export function startAuditViewer(
   const assets = services.assets ?? null
   const baselines = services.baselines ?? null
   const timeZone = services.timeZone ?? 'Asia/Shanghai'
+  const feedback = new AuditFeedbackStore(join(dirname(auditPath), 'audit-feedback.jsonl'))
   // V0.5.4: one request handler, shared by the public (stable-address) listener
   // and — when we lose the port race — the follower's private loopback listener.
   // Both serve the identical page; only the advertised address differs.
@@ -1798,6 +1818,39 @@ export function startAuditViewer(
         return
       }
       const entries = (): Record<string, unknown>[] => (audit !== null ? audit.list() : readAuditEntries(auditPath))
+      if (href === '/api/audit/feedback') {
+        if (req.method === 'POST') {
+          const body = await readBody(req)
+          if (typeof body.recordId !== 'string' || !/^[a-f0-9]{64}$/.test(body.recordId) || typeof body.falsePositive !== 'boolean' || Object.keys(body).some((key) => key !== 'recordId' && key !== 'falsePositive')) {
+            res.statusCode = 400
+            sendJson(res, { ok: false, error: 'INVALID_FEEDBACK' })
+            return
+          }
+          if (!entries().some((record) => auditFeedbackId(record) === body.recordId)) {
+            res.statusCode = 404
+            sendJson(res, { ok: false, error: 'RECORD_NOT_AVAILABLE' })
+            return
+          }
+          try { feedback.set(body.recordId, body.falsePositive) } catch {
+            res.statusCode = 503
+            sendJson(res, { ok: false, error: 'FEEDBACK_UNAVAILABLE' })
+            return
+          }
+        } else if (req.method !== 'GET') {
+          res.statusCode = 405
+          sendJson(res, { ok: false, error: 'METHOD_NOT_ALLOWED' })
+          return
+        }
+        try {
+          const items = feedback.list()
+          sendJson(res, { ok: true, items, falsePositiveCount: items.filter((item) => item.falsePositive).length, humanOnly: true, policyChanged: false })
+        } catch {
+          res.statusCode = 503
+          sendJson(res, { ok: false, error: 'FEEDBACK_UNAVAILABLE' })
+        }
+        return
+      }
+      const withFeedbackId = (items: Record<string, unknown>[]): Record<string, unknown>[] => items.map((record) => ({ ...record, feedbackRecordId: auditFeedbackId(record) }))
       if (href === '/api/entries') {
         // V0.5.10: opt-in pagination. Passing no query at all keeps the
         // historical "return the whole array" contract other callers rely on.
@@ -1810,10 +1863,11 @@ export function startAuditViewer(
           const limit = Number.isFinite(limitRaw) && limitRaw > 0
             ? Math.min(AUDIT_PAGE_MAX, Math.floor(limitRaw))
             : DEFAULT_AUDIT_RING_SIZE
-          sendJson(res, audit !== null ? audit.page(since, limit) : paginateArray(entries(), since, limit))
+          const page = audit !== null ? audit.page(since, limit) : paginateArray(entries(), since, limit)
+          sendJson(res, { ...page, items: withFeedbackId(page.items) })
           return
         }
-        sendJson(res, entries())
+        sendJson(res, withFeedbackId(entries()))
         return
       }
       // V0.5.10: rotate the live audit file. This branch sits AFTER the token

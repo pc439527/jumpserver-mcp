@@ -488,10 +488,17 @@ export class JumpServerSession {
       let shellSeen = false
       let failureText: string | undefined
       let accountChoiceWritten = accountIndex === undefined ? true : false
+      // V0.7.3: WHY the wait ended, carried into the error detail. Without it a
+      // slow asset and a dropped PTY both surfaced as the same
+      // ASSET_ENTER_TIMEOUT with a tail full of progress ticks, and there was
+      // no way to tell "the host needed 20 s" from "the bastion closed us at
+      // 13 s" — the two need opposite responses (wait longer vs reconnect).
+      let exitReason: 'shell' | 'failure-banner' | 'wire-closed' | 'deadline' = 'deadline'
       for (;;) {
         const screen = this.detector.detect()
         if (screen === 'ASSET_SHELL') {
           shellSeen = true
+          exitReason = 'shell'
           break
         }
         // Multi-username selection — detect before the failure pattern so we
@@ -546,9 +553,13 @@ export class JumpServerSession {
         const failure = ENTER_FAILURE_PATTERN.exec(failureTail)
         if (failure !== null) {
           failureText = failure[0]
+          exitReason = 'failure-banner'
           break
         }
-        if (this.wireClosed || this.wire === null) break
+        if (this.wireClosed || this.wire === null) {
+          exitReason = 'wire-closed'
+          break
+        }
         if (signal?.aborted === true) throw new AbortRequestedError()
         if (Date.now() >= deadline) break
         await sleep(120)
@@ -609,10 +620,23 @@ export class JumpServerSession {
             'koko=' + banner,
           )
         }
+        // V0.7.3: a PTY that died mid-dial is NOT a slow asset — say so, and
+        // bound the wait by the deadline rather than reporting the dial as
+        // "still going". The state is already gone, so CONNECTION_LOST is the
+        // only answer that leads the caller to reconnect instead of waiting.
+        if (exitReason === 'wire-closed') {
+          throw new JumpServerError(
+            'CONNECTION_LOST',
+            'the JumpServer session closed while entering ' + target + ' (after ' +
+              Math.max(0, Math.round((Date.now() - (deadline - this.cfg.enterAssetMs)) / 1000)) +
+              's) — the asset was never reached. Reconnect and retry; a slow asset that stays under the enter timeout is not the cause.',
+            'exit=wire-closed detected=' + sel.detected + ' tail=' + tail.slice(-200),
+          )
+        }
         throw new JumpServerError(
           'ASSET_ENTER_TIMEOUT',
-          'asset shell for ' + target + ' was not detected within the enter timeout',
-          'detected=' + sel.detected + ' options=' + (sel.preview.join(' | ') || 'none') + ' tail=' + tail.slice(-500),
+          'asset shell for ' + target + ' was not detected within the enter timeout (' + Math.round(this.cfg.enterAssetMs / 1000) + 's)',
+          'exit=' + exitReason + ' budgetMs=' + this.cfg.enterAssetMs + ' detected=' + sel.detected + ' options=' + (sel.preview.join(' | ') || 'none') + ' tail=' + tail.slice(-1600),
         )
       }
       const marker = randomHex(6)

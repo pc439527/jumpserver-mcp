@@ -7,6 +7,7 @@ import {
   DEFAULT_PASSWORD_ENV,
   DEFAULT_RISK_JUDGE,
   DEFAULT_TERMINAL_SCROLLBACK,
+  DEFAULT_TIMEOUTS,
   MAX_BATCH_CONCURRENCY,
   MAX_SESSIONS_CEILING,
   type ConsoleTabId,
@@ -134,6 +135,12 @@ const configSchema = z.object({
   knownHostsPath: z.string().optional(),
   connectTimeout: z.number().optional(),
   commandTimeout: z.number().optional(),
+  /**
+   * V0.7.3: how long to wait for the asset shell after KoKo starts dialling.
+   * Some assets (heavily loaded DB/app hosts, cross-site links) legitimately
+   * need 20-40 s, and the old fixed 40 s was not adjustable at all.
+   */
+  enterTimeout: z.number().min(1).max(300).optional(),
   idleTimeout: z.number().optional(),
   permissionMode: z.enum(permissionModes).optional(),
   privilegedReadInReadOnly: z.boolean().optional(),
@@ -307,6 +314,7 @@ function buildConfig(input: unknown, env: EnvConnection): McpConfig {
     knownHostsPath: raw.knownHostsPath,
     connectTimeout: raw.connectTimeout ?? 15,
     commandTimeout: raw.commandTimeout ?? 60,
+    enterTimeout: raw.enterTimeout ?? DEFAULT_TIMEOUTS.enterAsset / 1000,
     idleTimeout: raw.idleTimeout ?? 30,
     permissionMode: (raw.permissionMode ?? 'READ_ONLY') as PermissionMode,
     privilegedReadInReadOnly: raw.privilegedReadInReadOnly,

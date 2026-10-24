@@ -292,7 +292,7 @@ async function main(): Promise<void> {
     'jumpserver_enter',
     {
       description:
-        'Enter a target asset THROUGH the JumpServer menu by its IP or name. Requires the session to be at the menu. A probe (hostname/whoami/pwd) runs internally and the asset is reported as entered only after it verifies. When the target has multiple authorised bastion users, KoKo shows a numbered list ending in `ID>`; pass `accountIndex` (the displayed ID, usually 1 or 2) to pick one, or omit to fail with ACCOUNT_SELECTION_REQUIRED and the parsed list in `detail`. An asset the bastion cannot reach (`网络不通（连接超时）`) fails fast as ASSET_UNREACHABLE and is then refused for 2 minutes — report it to the user instead of retrying.',
+        'Enter a target asset THROUGH the JumpServer menu by its IP or name. Safe to call from any navigable state: if the session is already inside another asset it leaves that asset first, and re-entering the asset you are already on is a no-op that returns the current status. A probe (hostname/whoami/pwd) runs internally and the asset is reported as entered only after it verifies. When the target has multiple authorised bastion users, KoKo shows a numbered list ending in `ID>`; pass `accountIndex` (the displayed ID, usually 1 or 2) to pick one, or omit to fail with ACCOUNT_SELECTION_REQUIRED and the parsed list in `detail`. An asset the bastion cannot reach (`网络不通（连接超时）`) fails fast as ASSET_UNREACHABLE and is then refused for 2 minutes — report it to the user instead of retrying.',
       inputSchema: {
         target: z.string().describe('Target asset IP or name, e.g. 203.0.113.101'),
         accountIndex: z.number().int().min(0).optional().describe('The account ID shown by KoKo at the `ID>` prompt (usually 1 or 2; matches the number on the screen).'),
@@ -537,6 +537,7 @@ async function main(): Promise<void> {
                 command: commands[i]!,
                 timeoutMs,
                 risk: g.risk,
+                blocked: g.blocked,
                 classification: g.classification,
                 approvalRequired: g.approvalRequired,
                 approvalResult: g.approvalRequired ? 'pending' : 'none',

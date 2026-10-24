@@ -19,6 +19,7 @@ import {
   type RiskJudgeVerdict,
 } from './risk-judge.js'
 import type { ToolRunContext } from '../runtime/context.js'
+import { splitSuggestion } from './split-suggestion.js'
 
 export interface GateServices {
   getConfig: () => {
@@ -43,6 +44,12 @@ export interface GatedCommand {
   judgeAutoAllowed?: boolean
   /** V0.5.8: one-line record of the judge decision (audit + tool result). */
   judgeNote?: string
+  /**
+   * V0.7.3 (C-6): the rule gate refused THIS command. The command must not
+   * run, but the rest of the batch still may — a refusal stops one command,
+   * not the whole request.
+   */
+  blocked?: { code: string; reason: string; detail?: string }
 }
 
 /** Approval text never exposes command-line secrets. */
@@ -84,6 +91,7 @@ function approvalReason(
       lines.push('风险：' + classification.risk + '（规则 ' + classification.ruleId + '）')
       lines.push('原因：' + (classification.reason || '') + '。是否执行？')
   }
+  if (classification.risk !== 'UNKNOWN' && judgeLines.length > 0) lines.push('', ...judgeLines, '以上模型意见仅供参考，不参与放行判定。')
   return lines.join('\n')
 }
 
@@ -106,18 +114,19 @@ function batchApprovalReason(
   return lines.join('\n')
 }
 
-function approvalDenied(exec: ToolRunContext, reason: string): JumpServerError {
+function approvalDenied(exec: ToolRunContext, reason: string, detail?: string): JumpServerError {
   return new JumpServerError(
     'COMMAND_APPROVAL_REQUIRED',
     reason +
       '\n\n[NOT EXECUTED] Ask the user to review the command(s) above. Only retry the SAME call with confirm:true after the user explicitly agrees.',
+    detail,
   )
 }
 
-async function requestApproval(services: GateServices, exec: ToolRunContext, reason: string): Promise<void> {
+async function requestApproval(services: GateServices, exec: ToolRunContext, reason: string, detail?: string): Promise<void> {
   void services
   if (exec.confirm) return
-  throw approvalDenied(exec, reason)
+  throw approvalDenied(exec, reason, detail)
 }
 
 async function askApproval(
@@ -133,6 +142,7 @@ async function askApproval(
     services,
     exec,
     approvalReason(status, command, classification, riskJudgeNote(verdict, noteOptions)),
+    splitSuggestion(command),
   )
 }
 
@@ -146,7 +156,7 @@ async function askApproval(
  * the text it has today and the gate never depends on a remote service.
  */
 async function judgeUnknown(services: GateServices, classification: Classification): Promise<RiskJudgeVerdict | null> {
-  if (classification.risk !== 'UNKNOWN') return null
+  if (!['UNKNOWN', 'MODIFY', 'DANGEROUS'].includes(classification.risk)) return null
   try {
     return await judgeCommandRisk(classification.command, services.getConfig().riskJudge)
   } catch {
@@ -171,6 +181,10 @@ function applyJudge(
   classification: Classification,
   verdict: RiskJudgeVerdict | null,
 ): { auto: boolean; reason: string; note?: string } {
+  if (classification.risk !== 'UNKNOWN') return {
+    auto: false, reason: '规则风险保持不变；模型仅供参考，不参与放行判定',
+    note: verdict === null ? undefined : riskJudgeAuditLine(verdict, false, '仅供参考，不参与放行判定'),
+  }
   const config = autoAllowConfig(services)
   const decision = decideAutoAllow(verdict, { command: classification.command, ruleId: classification.ruleId }, config)
   if (decision.allow) {
@@ -299,7 +313,7 @@ export async function gateCommand(services: GateServices, exec: ToolRunContext, 
     reason: decision.reason,
     kind: 'blocked',
   })
-  throw new JumpServerError('COMMAND_BLOCKED', command + ' -- ' + decision.reason)
+  throw new JumpServerError('COMMAND_BLOCKED', redactCommandSecrets(command) + ' -- ' + decision.reason, splitSuggestion(command))
 }
 
 /**
@@ -319,7 +333,7 @@ export async function gateCommandForNavigation(services: GateServices, exec: Too
       reason: decision.reason,
       kind: 'blocked',
     })
-    throw new JumpServerError('COMMAND_BLOCKED', command + ' -- ' + decision.reason)
+    throw new JumpServerError('COMMAND_BLOCKED', redactCommandSecrets(command) + ' -- ' + decision.reason, splitSuggestion(command))
   }
   const verdict = await judgeUnknown(services, classification)
   const judge = applyJudge(services, classification, verdict)
@@ -377,14 +391,9 @@ export async function gateCommandsForNavigation(
       continue
     }
     if (decision.code === 'COMMAND_BLOCKED') {
-      await recordRefusal(services, exec, {
-        operation: 'run-batch',
-        command,
-        classification,
-        reason: decision.reason,
-        kind: 'blocked',
-      })
-      throw new JumpServerError('COMMAND_BLOCKED', command + ' -- ' + decision.reason)
+      gated.push({ command, gated: { risk: classification.risk, classification, approvalRequired: false,
+        blocked: { code: 'COMMAND_BLOCKED', reason: decision.reason, detail: splitSuggestion(command) } } })
+      continue
     }
     gated.push({ command, gated: { risk: classification.risk, classification, approvalRequired: true } })
   }
@@ -470,6 +479,7 @@ export async function gateCommandsForNavigation(
             judgeLines: judgeLinesFor(item),
           })),
         ),
+        stillPending.map((item) => splitSuggestion(item.command)).filter(Boolean).join('\n') || undefined,
       )
       state = 'approved'
     } catch (error) {

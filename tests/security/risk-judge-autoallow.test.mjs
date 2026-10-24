@@ -270,7 +270,7 @@ test('gate: auto-allow still cannot run a command against an unverified target',
   }
 })
 
-test('gate: MODIFY and DANGEROUS never reach the judge, auto-allow or not', async () => {
+test('C9：MODIFY和DANGEROUS即使模型允许仍不能自动放行', async () => {
   const mock = await mockJudge()
   try {
     resetRiskJudgeCache()
@@ -279,12 +279,12 @@ test('gate: MODIFY and DANGEROUS never reach the judge, auto-allow or not', asyn
         () => gateCommand(services(judgeCfg(mock.endpoint)), exec(), command),
         (error) => {
           assert.equal(error.code, 'COMMAND_APPROVAL_REQUIRED', command)
-          assert.ok(!error.message.includes('自动放行'))
+          assert.match(error.message, /仅供参考，不参与放行判定/)
           return true
         },
       )
     }
-    assert.equal(mock.state.hits, 0, 'a MODIFY/DANGEROUS command must never leave the process')
+    assert.equal(mock.state.hits, 2, '两条命令的模型意见都不能代替人工审批')
   } finally {
     await mock.close()
   }

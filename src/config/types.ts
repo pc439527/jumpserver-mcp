@@ -53,6 +53,12 @@ export interface JumpServerConfig {
   connectTimeout: number
   /** Per-command default timeout in seconds (default 60) */
   commandTimeout: number
+  /**
+   * V0.7.3: seconds to wait for the asset shell after KoKo starts dialling
+   * (default 40, max 300). Raise it for slow assets — a cross-site link or a
+   * loaded host can spend 20-40 s in the dial alone.
+   */
+  enterTimeout: number
   /** Idle close timeout in minutes (default 30) */
   idleTimeout: number
   /** Command permission mode (default READ_ONLY) */
